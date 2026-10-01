@@ -15,6 +15,17 @@ iPhone 0.5× 相机
   ├─ sessions/<时间>/capture.jsonl
   ├─ sessions/<时间>/raw.mp4
   └─ sessions/<时间>/processed-live.mp4（实时模式）
+
+同一路采集也能完全脱离电脑，直接录在手机上：
+iPhone 本地录制（App 内“开始录制”）
+  └─ MaiLensSessions/<时间>/
+       ├─ video.mp4（原始 60 fps H.264）
+       ├─ capture.jsonl（每帧时间戳 + 最近姿态）
+       ├─ pose.jsonl（120 Hz 四元数/重力/角速度/用户加速度）
+       └─ session.json（清单）
+             │ 爱思助手 / “文件”App / 分享
+             ▼
+电脑 pc/import_phone_session.py → sessions/<时间>-phone/ → pc/process_session.py
 ```
 
 视频和姿态被放在同一个 TCP 数据包里，电脑端不需要猜测两条流的对应关系。发送端使用有限缓冲，只保留最新待发送帧；电脑或网络变慢时会丢弃旧帧，不会把延迟越积越大。
@@ -71,7 +82,7 @@ sessions/20261001-153012
 
 如果要使用 `.pt` 等非 ONNX 模型，才需要额外安装 `ultralytics` 和对应的 PyTorch 运行环境。
 
-实时检测默认每 12 帧运行一次，模型在原始鱼眼帧上检测，再映射到鱼眼矫正后的输出坐标。首次得到有效 `inner_screen` 后，处理器会在内屏纹理内取特征点，用 LK 光流和 RANSAC `findHomography` 估计每帧的平面运动，把当前内屏反向映射到一个固定的中央矩形；这个变换同时补偿横移、横滚、倾斜和中等幅度的前后移动，不再把检测框中心和面积当作唯一稳定信号。特征点暂时不足时保持上一张可靠的单应矩阵，超过丢失时限才回到搜索状态。外框仍用于验证和调试，不会把锁定锚点拉到机台上沿。
+实时检测默认每 12 帧运行一次，模型在原始鱼眼帧上检测，再映射到鱼眼矫正后的输出坐标。首次同时得到有效 `outer_buttons` 和 `inner_screen` 后，处理器会在外圈按键与内屏组成的机台区域内取特征点，用 LK 光流和 RANSAC `findHomography` 估计每帧的平面运动，把整台机台平面反向映射到一个固定的中央目标；这个变换同时补偿横移、横滚、倾斜和中等幅度的前后移动，八个按键与内屏保持同一相对位置，不再把检测框中心和面积当作唯一稳定信号。特征点暂时不足时保持上一张可靠的单应矩阵，超过丢失时限才回到搜索状态。
 
 调试画面用黄色框标外圈按键区域、绿色框标内屏，白色十字是输出中心；`processed.jsonl` / `debug.jsonl` 会额外记录 `plane_lock`、内点数、内点比例和重投影误差。`--lock-fill 0.64` 调整首次锁定时内屏在画面中的大小。当前版本仍需要内屏在鱼眼有效视野内且保留可跟踪纹理；完全无纹理或被遮挡时会安全保持上一帧，不会用错误框跳走。
 
@@ -141,6 +152,27 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
 
 检测器锁定只使用几何模型的 `outer_buttons` 和 `inner_screen`；按键模型的结果不会把机台锁到某个谱面元素。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
 
+## 手机端本地录制
+
+App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑Fi 也能录。它复用预览那一路 0.5× 采集，但直接写原始文件，不经 JPEG、不经网络，所以网络丢帧和压缩都不会污染素材：
+
+- `video.mp4`：H.264，默认 720×1280@60，约 11 Mbps。
+- `capture.jsonl`：每帧的 `frame_id`、`timestamp`（mach 时间）、宽高、该帧匹配到的姿态和 `sensor_delta_ms`。
+- `pose.jsonl`：120 Hz 姿态全量日志，字段和推流协议里的 `pose` 完全一致，另带 `user_acceleration`（去掉重力后的加速度，做前后移动补偿用）。
+- `session.json`：帧数、姿态样本数、时长、丢帧、时钟说明。
+
+每次录制按时间写进手机上的 `MaiLensSessions/<yyyyMMdd-HHmmss>/`。导出有三条路：每条会话右侧的“导出”按钮（存到“文件”或分享出去）、手机“文件 → 我的 iPhone → MaiLensRemoteCapture”、或者用爱思助手直接拷整个文件夹到电脑。
+
+拷到电脑后先转成和实时会话同构的目录，再跑离线处理：
+
+```powershell
+.\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"
+.\.venv\Scripts\python.exe pc\process_session.py sessions\20261002-153000-phone `
+  --model models\frame-geometry-yolo11n-v2.onnx --output processed-phone.mp4 --debug
+```
+
+`import_phone_session.py` 把 `video.mp4` 解码成 `frames/*.jpg`，给 `capture.jsonl` 补上 `frame_path`，并带上 `pose.jsonl` 和 `session.json`，所以下游 `process_session.py` 和标注工具都不用改。手机录的帧数和日志条数对不上时（比如录制中途被杀掉），导入会以视频长度为准，缺的那几帧只少姿态，不会中断整段。
+
 ## iPhone 端构建
 
 这是一个独立的最小采集 App。电脑上安装 XcodeGen 后：
@@ -155,7 +187,7 @@ xcodebuild -project MaiLensRemoteCapture.xcodeproj \
   CODE_SIGNING_ALLOWED=NO archive
 ```
 
-App 内填写电脑 IPv4 和端口，点“连接电脑”，再点“开始发送”。连接状态、发送帧率、丢帧数和最近一次姿态时间戳都会显示出来。这个实验版本先用 JPEG/TCP 确认算法和同步关系；链路稳定后再把视频编码替换为 VideoToolbox H.264/HEVC。
+App 内填写电脑 IPv4 和端口，点“连接电脑”，再点“开始发送”。连接状态、发送帧率、丢帧数和最近一次姿态时间戳都会显示出来。想直接录素材就点“开始录制”，它会自己开相机，不依赖电脑。推流仍然是 JPEG/TCP（为了低延迟调试），本地录制走 VideoToolbox H.264 全质量落盘。
 
 仓库还附带 `codemagic.yaml`，会生成 `MaiLensRemoteCapture-unsigned.ipa`。它不签名，拿到 IPA 后可以继续用你的第三方工具签名。
 
@@ -173,4 +205,4 @@ N bytes  UTF-8 metadata JSON
 M bytes  JPEG bytes
 ```
 
-帧 metadata 至少包含 `frame_id`、`timestamp`、`width`、`height` 和 `pose`。`pose` 里有 `timestamp`、`quaternion(x,y,z,w)`、`gravity`、`rotation_rate`。接收端按包内时间戳写入 `capture.jsonl`，所以后续处理可以复现每帧的姿态补偿。
+帧 metadata 至少包含 `frame_id`、`timestamp`、`width`、`height` 和 `pose`。`pose` 里有 `timestamp`、`quaternion(x,y,z,w)`、`gravity`、`rotation_rate`、`user_acceleration`（去掉重力后的加速度，做前后移动补偿时用）。接收端按包内时间戳写入 `capture.jsonl`，所以后续处理可以复现每帧的姿态补偿。

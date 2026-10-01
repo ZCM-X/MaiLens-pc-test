@@ -11,6 +11,10 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var framesPerSecond = 0.0
     @Published private(set) var droppedFrames: UInt64 = 0
     @Published private(set) var errorMessage: String?
+    @Published private(set) var isRecording = false
+    @Published private(set) var recordingStatus = SessionRecorder.Status()
+    /// Bumped whenever a finished session becomes visible on disk.
+    @Published private(set) var libraryRevision = 0
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.mailens.pc-test.camera")
@@ -18,6 +22,7 @@ final class CaptureController: NSObject, ObservableObject {
     private let output = AVCaptureVideoDataOutput()
     private let sender = RemoteFrameSender()
     private let motion = MotionPoseProvider()
+    private let recorder = SessionRecorder()
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let targetFrameRate: Int32 = 60
     private var configured = false
@@ -30,6 +35,12 @@ final class CaptureController: NSObject, ObservableObject {
         sender.onState = { [weak self] in self?.connectionState = $0 }
         sender.onStatistics = { [weak self] _, dropped in
             DispatchQueue.main.async { [weak self] in self?.droppedFrames = dropped }
+        }
+        motion.onSample = { [weak self] pose in self?.recorder.log(pose: pose) }
+        recorder.onStatus = { [weak self] status in self?.recordingStatus = status }
+        recorder.onFinished = { [weak self] _ in
+            self?.isRecording = false
+            self?.libraryRevision += 1
         }
     }
 
@@ -45,12 +56,34 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        stopRecording()
         stopCamera()
         motion.stop()
         sender.disconnect()
         DispatchQueue.main.async { [weak self] in
             self?.framesPerSecond = 0
         }
+    }
+
+    /// Records the raw camera without needing the PC.  Starting it also starts
+    /// the camera when the stream is off, so a take can be captured anywhere.
+    func startRecording() {
+        guard !isRecording else { return }
+        errorMessage = nil
+        motion.start()
+        guard recorder.start(nominalFPS: Double(targetFrameRate)) != nil else {
+            errorMessage = "无法创建录制会话，请检查手机剩余存储空间。"
+            return
+        }
+        recordingStatus = SessionRecorder.Status()
+        isRecording = true
+        startCamera()
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        recorder.stop()
     }
 
     private func startCamera() {
@@ -125,8 +158,12 @@ final class CaptureController: NSObject, ObservableObject {
     private func handle(_ sampleBuffer: CMSampleBuffer) {
         let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timestamp = presentation.seconds
-        guard timestamp.isFinite, timestamp - lastSentTimestamp >= 1.0 / Double(targetFrameRate),
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard timestamp.isFinite, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        let pose = motion.nearest(to: timestamp)
+        recorder.append(sampleBuffer: sampleBuffer, pose: pose)
+
+        guard timestamp - lastSentTimestamp >= 1.0 / Double(targetFrameRate) else { return }
         lastSentTimestamp = timestamp
 
         let inputImage = CIImage(cvPixelBuffer: pixelBuffer)
@@ -138,7 +175,6 @@ final class CaptureController: NSObject, ObservableObject {
         guard let jpeg = ciContext.jpegRepresentation(of: scaled,
                                                       colorSpace: CGColorSpaceCreateDeviceRGB(),
                                                       options: [compressionKey: 0.84]) else { return }
-        let pose = motion.nearest(to: timestamp)
         let width = Int(scaled.extent.width.rounded())
         let height = Int(scaled.extent.height.rounded())
         sender.send(jpeg: jpeg, timestamp: timestamp, width: width, height: height, pose: pose)

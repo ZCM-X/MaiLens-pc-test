@@ -19,10 +19,15 @@ struct PoseSnapshot: Codable {
     let quaternion: Quaternion
     let gravity: Vector3
     let rotationRate: Vector3
+    /// Gravity already removed, so this is the movement the hand actually
+    /// added.  Double integration drifts, but it is the only translation
+    /// signal a single phone can give the front/back part of the lock.
+    let userAcceleration: Vector3
 
     enum CodingKeys: String, CodingKey {
         case timestamp, quaternion, gravity
         case rotationRate = "rotation_rate"
+        case userAcceleration = "user_acceleration"
     }
 
     init(_ motion: CMDeviceMotion) {
@@ -33,6 +38,9 @@ struct PoseSnapshot: Codable {
         rotationRate = Vector3(x: motion.rotationRate.x,
                               y: motion.rotationRate.y,
                               z: motion.rotationRate.z)
+        userAcceleration = Vector3(x: motion.userAcceleration.x,
+                                   y: motion.userAcceleration.y,
+                                   z: motion.userAcceleration.z)
     }
 }
 
@@ -52,12 +60,19 @@ final class MotionPoseProvider {
 
     var isAvailable: Bool { manager.isDeviceMotionAvailable }
 
+    /// Fired for every sample on the motion queue.  Frames only need
+    /// `nearest(to:)`, but the offline session log wants the full 120 Hz stream
+    /// so the PC can re-match it against a recorded video.
+    var onSample: ((PoseSnapshot) -> Void)?
+
     func start() {
         guard manager.isDeviceMotionAvailable, !manager.isDeviceMotionActive else { return }
         manager.deviceMotionUpdateInterval = 1.0 / 120.0
         manager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: queue) { [weak self] motion, _ in
-            guard let motion else { return }
-            self?.append(PoseSnapshot(motion))
+            guard let self, let motion else { return }
+            let snapshot = PoseSnapshot(motion)
+            self.append(snapshot)
+            self.onSample?(snapshot)
         }
     }
 
