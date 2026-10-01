@@ -86,6 +86,131 @@ def build_remap(
     return map_x, map_y
 
 
+def map_fisheye_points_to_output(
+    points: np.ndarray,
+    width: int,
+    height: int,
+    rotation: np.ndarray,
+    crop: float,
+    fov_deg: float,
+    k1: float,
+    k2: float,
+    center_x: float,
+    center_y: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map raw fisheye pixels into the current pose-stabilized output.
+
+    ``build_remap`` maps output pixels back into the raw camera. The detector
+    is more reliable on the raw training geometry, so machine boxes are
+    mapped in the opposite direction here before the lock is updated.
+    """
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    source_focal = max(width, height) * 772.4089 / 4032.0
+    virtual_focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+    offset = np.array([center_x * width, center_y * height], dtype=np.float32)
+    normalized = (points - offset) / max(source_focal, 1e-6)
+    radius = np.linalg.norm(normalized, axis=1)
+
+    # The radial polynomial is monotonic over the forward hemisphere used by
+    # the rectilinear output. A lookup table is stable at the lens centre and
+    # avoids Newton iterations diverging on the outermost fisheye pixels.
+    theta_grid = np.linspace(0.0, math.pi * 0.5 - 1e-4, 2048, dtype=np.float32)
+    distorted_grid = theta_grid * (1.0 + k1 * theta_grid ** 2 + k2 * theta_grid ** 4)
+    valid = radius <= float(distorted_grid[-1])
+    theta = np.interp(
+        np.minimum(radius, float(distorted_grid[-1])),
+        distorted_grid,
+        theta_grid,
+    ).astype(np.float32)
+    safe_radius = np.maximum(radius, 1e-6)
+    sine_scale = np.sin(theta) / safe_radius
+    sine_scale[radius < 1e-6] = 1.0
+    source_rays = np.stack((
+        normalized[:, 0] * sine_scale,
+        normalized[:, 1] * sine_scale,
+        np.cos(theta),
+    ), axis=1)
+    output_rays = source_rays @ rotation
+    valid &= output_rays[:, 2] > 0.12
+    safe_z = np.maximum(output_rays[:, 2], 0.12)
+    output = np.stack((
+        width * 0.5 + output_rays[:, 0] / safe_z * virtual_focal * crop,
+        height * 0.5 + output_rays[:, 1] / safe_z * virtual_focal * crop,
+    ), axis=1)
+    valid &= (
+        (output[:, 0] >= -width * 0.25) & (output[:, 0] <= width * 1.25) &
+        (output[:, 1] >= -height * 0.25) & (output[:, 1] <= height * 1.25)
+    )
+    return output.astype(np.float32), valid
+
+
+def map_fisheye_box_to_output(
+    box: tuple[int, int, int, int] | None,
+    width: int,
+    height: int,
+    rotation: np.ndarray,
+    crop: float,
+    fov_deg: float,
+    k1: float,
+    k2: float,
+    center_x: float,
+    center_y: float,
+) -> tuple[int, int, int, int] | None:
+    """Convert a raw detector box to output coordinates.
+
+    Fisheye corners can lie outside the forward hemisphere even when the
+    machine centre is visible. In that case, estimate the box size from a
+    small local Jacobian around its centre instead of using invalid corners.
+    """
+    if box is None:
+        return None
+    x0, y0, x1, y1 = (float(value) for value in box)
+    center = np.array([[(x0 + x1) * 0.5, (y0 + y1) * 0.5]], dtype=np.float32)
+    mapped_center, center_valid = map_fisheye_points_to_output(
+        center, width, height, rotation, crop, fov_deg, k1, k2, center_x, center_y,
+    )
+    if not bool(center_valid[0]) or not np.isfinite(mapped_center[0]).all():
+        return None
+    output_center = mapped_center[0]
+    corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+    mapped_corners, corners_valid = map_fisheye_points_to_output(
+        corners, width, height, rotation, crop, fov_deg, k1, k2, center_x, center_y,
+    )
+    if bool(np.all(corners_valid)) and np.isfinite(mapped_corners).all():
+        output_min = mapped_corners.min(axis=0)
+        output_max = mapped_corners.max(axis=0)
+        return tuple(int(round(value)) for value in (*output_min, *output_max))
+
+    raw_width = max(x1 - x0, 1.0)
+    raw_height = max(y1 - y0, 1.0)
+    local_width = local_height = None
+    for fraction in (0.25, 0.12, 0.06, 0.03):
+        half_step = np.array([raw_width * fraction, raw_height * fraction], dtype=np.float32)
+        raw_samples = np.array([
+            [center[0, 0] - half_step[0], center[0, 1]],
+            [center[0, 0] + half_step[0], center[0, 1]],
+            [center[0, 0], center[0, 1] - half_step[1]],
+            [center[0, 0], center[0, 1] + half_step[1]],
+        ], dtype=np.float32)
+        mapped_samples, samples_valid = map_fisheye_points_to_output(
+            raw_samples, width, height, rotation, crop, fov_deg, k1, k2, center_x, center_y,
+        )
+        if bool(np.all(samples_valid)) and np.isfinite(mapped_samples).all():
+            local_width = float(np.linalg.norm(mapped_samples[1] - mapped_samples[0]) / (2.0 * fraction))
+            local_height = float(np.linalg.norm(mapped_samples[3] - mapped_samples[2]) / (2.0 * fraction))
+            break
+    if local_width is None or local_height is None:
+        local_width, local_height = raw_width, raw_height
+    local_width = max(8.0, min(width * 2.0, local_width))
+    local_height = max(8.0, min(height * 2.0, local_height))
+    return (
+        int(round(output_center[0] - local_width * 0.5)),
+        int(round(output_center[1] - local_height * 0.5)),
+        int(round(output_center[0] + local_width * 0.5)),
+        int(round(output_center[1] + local_height * 0.5)),
+    )
+
+
 class GeometryDetector:
     def __init__(self, model_path: Path | None):
         self.model = None
@@ -285,6 +410,7 @@ def update_geometry_lock_state(
     width: int,
     height: int,
     lock_fill: float = 0.64,
+    snap: bool = False,
 ) -> tuple[np.ndarray, float, str]:
     """Smooth a detected machine target into a center/zoom lock state."""
     center = previous_center.copy()
@@ -296,7 +422,6 @@ def update_geometry_lock_state(
             (target[0] + target[2]) / (2 * width),
             (target[1] + target[3]) / (2 * height),
         ], dtype=np.float32)
-        center = previous_center * 0.82 + center_target * 0.18
         target_width = max(target[2] - target[0], 1)
         target_height = max(target[3] - target[1], 1)
         lock_fill = float(min(max(lock_fill, 0.35), 0.90))
@@ -304,9 +429,184 @@ def update_geometry_lock_state(
         zoom_target = min(target_fill * width / target_width,
                           target_fill * height / target_height)
         zoom_target = max(0.70, min(1.35, zoom_target))
-        zoom = previous_zoom * 0.93 + zoom_target * 0.07
+        if snap:
+            center = center_target
+            zoom = zoom_target
+        else:
+            # The target box is already filtered by GeometryLockTracker. Use
+            # its current centre directly so the output does not visibly lag
+            # behind a real phone translation; smooth only the scale change.
+            center = center_target
+            zoom = previous_zoom * 0.85 + zoom_target * 0.15
         source = "inner_screen" if inner else "outer_frame"
     return center, zoom, source
+
+
+class GeometryLockTracker:
+    """Reject detector jumps and carry a machine box between detections."""
+
+    def __init__(self, detect_every: int = 4, max_age_frames: int | None = None):
+        self.detect_every = max(1, int(detect_every))
+        self.max_age_frames = max_age_frames or max(18, self.detect_every * 8)
+        self.box: tuple[int, int, int, int] | None = None
+        self.source = "none"
+        self.age_frames = 0
+        self.preferred_miss_frames = 0
+        self.pending_source = "none"
+        self.pending_count = 0
+
+    @staticmethod
+    def _center_size(box: tuple[int, int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+        center = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float32)
+        size = np.array([max(box[2] - box[0], 1), max(box[3] - box[1], 1)], dtype=np.float32)
+        return center, size
+
+    @classmethod
+    def _compatible(
+        cls,
+        previous: tuple[int, int, int, int],
+        candidate: tuple[int, int, int, int],
+        width: int,
+        height: int,
+    ) -> bool:
+        previous_center, previous_size = cls._center_size(previous)
+        candidate_center, candidate_size = cls._center_size(candidate)
+        normalized_delta = (candidate_center - previous_center) / np.array([width, height], dtype=np.float32)
+        if float(np.linalg.norm(normalized_delta)) > 0.30:
+            return False
+        ratio = candidate_size / np.maximum(previous_size, 1.0)
+        return bool(np.all(ratio > 0.42) and np.all(ratio < 2.4))
+
+    @staticmethod
+    def _blend_box(
+        previous: tuple[int, int, int, int],
+        candidate: tuple[int, int, int, int],
+        alpha: float,
+    ) -> tuple[int, int, int, int]:
+        values = np.asarray(previous, dtype=np.float32) * (1.0 - alpha) + np.asarray(candidate, dtype=np.float32) * alpha
+        return tuple(int(round(value)) for value in values)
+
+    def update_flow(self, previous_gray: np.ndarray | None, current_gray: np.ndarray | None) -> None:
+        """Follow the locked machine with sparse optical flow between detections."""
+        if self.box is None or previous_gray is None or current_gray is None:
+            return
+        height, width = current_gray.shape[:2]
+        x0, y0, x1, y1 = self.box
+        pad_x = max(4, int((x1 - x0) * 0.08))
+        pad_y = max(4, int((y1 - y0) * 0.08))
+        roi = np.zeros_like(previous_gray, dtype=np.uint8)
+        roi[max(0, y0 - pad_y):min(height, y1 + pad_y), max(0, x0 - pad_x):min(width, x1 + pad_x)] = 255
+        points = cv2.goodFeaturesToTrack(
+            previous_gray,
+            maxCorners=80,
+            qualityLevel=0.01,
+            minDistance=5,
+            blockSize=7,
+            mask=roi,
+        )
+        if points is None or len(points) < 6:
+            return
+        next_points, status, errors = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if next_points is None or status is None:
+            return
+        valid = status.reshape(-1).astype(bool)
+        if errors is not None:
+            valid &= errors.reshape(-1) < 30.0
+        previous_points = points.reshape(-1, 2)[valid]
+        current_points = next_points.reshape(-1, 2)[valid]
+        if len(previous_points) < 6:
+            return
+        median_shift = np.median(current_points - previous_points, axis=0)
+        if float(np.linalg.norm(median_shift)) < 1.0:
+            # Optical-flow pixel noise on a static target must not slowly
+            # walk the lock across the frame.
+            return
+        matrix, inliers = cv2.estimateAffinePartial2D(
+            previous_points, current_points,
+            method=cv2.RANSAC, ransacReprojThreshold=3.0,
+        )
+        if matrix is None or inliers is None or int(inliers.sum()) < 4:
+            return
+        transformed = transform_box(self.box, matrix)
+        if transformed is None:
+            return
+        tx0, ty0, tx1, ty1 = transformed
+        if tx1 <= tx0 or ty1 <= ty0:
+            return
+        if not self._compatible(self.box, transformed, width, height):
+            return
+        self.box = self._blend_box(self.box, transformed, 0.80)
+
+    def ingest(
+        self,
+        outer: tuple[int, int, int, int] | None,
+        inner: tuple[int, int, int, int] | None,
+        width: int,
+        height: int,
+    ) -> None:
+        """Accept a detector result after source and jump consistency checks."""
+        candidate = inner or outer
+        candidate_source = "inner_screen" if inner is not None else ("outer_frame" if outer is not None else "none")
+        if candidate is None:
+            self.age_frames += self.detect_every
+            self.preferred_miss_frames += self.detect_every
+        elif self.box is None:
+            self.box = candidate
+            self.source = candidate_source
+            self.age_frames = 0
+            self.preferred_miss_frames = 0
+            self.pending_source = "none"
+            self.pending_count = 0
+        elif self.source == "inner_screen" and candidate_source == "outer_frame":
+            # Keep the better inner-screen lock while its detector briefly
+            # misses; the flow tracker carries it through these frames.
+            self.age_frames = 0
+            self.preferred_miss_frames += self.detect_every
+            if self.preferred_miss_frames > self.max_age_frames:
+                self.box = candidate
+                self.source = candidate_source
+                self.preferred_miss_frames = 0
+        elif candidate_source != self.source:
+            if candidate_source == self.pending_source:
+                self.pending_count += 1
+            else:
+                self.pending_source = candidate_source
+                self.pending_count = 1
+            if self.pending_count >= 2 and self._compatible(self.box, candidate, width, height):
+                self.box = self._blend_box(self.box, candidate, 0.35)
+                self.source = candidate_source
+                self.age_frames = 0
+                self.preferred_miss_frames = 0
+                self.pending_source = "none"
+                self.pending_count = 0
+        elif self._compatible(self.box, candidate, width, height):
+            self.box = self._blend_box(self.box, candidate, 0.22)
+            self.age_frames = 0
+            self.preferred_miss_frames = 0
+            self.pending_source = "none"
+            self.pending_count = 0
+        else:
+            self.age_frames += self.detect_every
+
+        if self.age_frames > self.max_age_frames:
+            self.box = None
+            self.source = "none"
+            self.preferred_miss_frames = 0
+            self.pending_source = "none"
+            self.pending_count = 0
+
+    def boxes(self) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+        if self.box is None:
+            return None, None
+        if self.source == "inner_screen":
+            return None, self.box
+        if self.source == "outer_frame":
+            return self.box, None
+        return None, None
 
 
 def process(args: argparse.Namespace) -> Path:
@@ -333,8 +633,9 @@ def process(args: argparse.Namespace) -> Path:
     reference = None
     previous_center = np.array([0.5, 0.5], dtype=np.float32)
     previous_zoom = 1.0
-    previous_outer = None
-    previous_inner = None
+    lock_tracker = GeometryLockTracker(args.detect_every)
+    previous_gray = None
+    previous_lock_source = "none"
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
             for index, row in enumerate(rows):
@@ -347,12 +648,20 @@ def process(args: argparse.Namespace) -> Path:
                     args.k1, args.k2, args.center_x, args.center_y,
                 )
                 stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
-                if args.model and (
-                    index % args.detect_every == 0
-                    or (previous_outer is None and previous_inner is None)
-                ):
-                    previous_outer, previous_inner = detector.detect(stabilized)
-                outer, inner = previous_outer, previous_inner
+                current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
+                lock_tracker.update_flow(previous_gray, current_gray)
+                if args.model and (index % args.detect_every == 0 or lock_tracker.box is None):
+                    detected_outer_raw, detected_inner_raw = detector.detect(frame)
+                    detected_outer = map_fisheye_box_to_output(
+                        detected_outer_raw, width, height, rotation, args.crop, args.fov,
+                        args.k1, args.k2, args.center_x, args.center_y,
+                    )
+                    detected_inner = map_fisheye_box_to_output(
+                        detected_inner_raw, width, height, rotation, args.crop, args.fov,
+                        args.k1, args.k2, args.center_x, args.center_y,
+                    )
+                    lock_tracker.ingest(detected_outer, detected_inner, width, height)
+                outer, inner = lock_tracker.boxes()
                 center, zoom, lock_source = update_geometry_lock_state(
                     previous_center,
                     previous_zoom,
@@ -361,12 +670,15 @@ def process(args: argparse.Namespace) -> Path:
                     width,
                     height,
                     getattr(args, "lock_fill", 0.64),
+                    snap=previous_lock_source in ("none", "searching") and lock_tracker.box is not None,
                 )
                 if lock_source != "none":
                     previous_center, previous_zoom = center, zoom
+                    previous_lock_source = lock_source
                 stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                 outer = transform_box(outer, geometry_matrix)
                 inner = transform_box(inner, geometry_matrix)
+                previous_gray = current_gray
                 if args.debug:
                     shown = draw_debug(stabilized, outer, inner, f"{index + 1}/{len(rows)}  crop={args.crop:.2f}  zoom={zoom:.2f}")
                     if args.preview:
@@ -410,8 +722,8 @@ def main() -> None:
     parser.add_argument("--fps", type=float)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--detect-every", type=int, default=3,
-                        help="模型每隔多少帧检测一次，默认 3；中间帧沿用平滑结果")
+    parser.add_argument("--detect-every", type=int, default=4,
+                        help="模型每隔多少帧检测一次，默认 4；中间帧使用光流跟踪")
     parser.add_argument("--lock-fill", type=float, default=0.64,
                         help="内屏锁定后占画面短边的比例，默认 0.64")
     args = parser.parse_args()

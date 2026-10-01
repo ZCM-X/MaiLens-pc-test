@@ -11,9 +11,11 @@ import numpy as np
 try:
     from .process_session import (
         GeometryDetector,
+        GeometryLockTracker,
         apply_geometry_lock,
         build_remap,
         draw_debug,
+        map_fisheye_box_to_output,
         make_output_rays,
         rotation_for_row,
         transform_box,
@@ -22,9 +24,11 @@ try:
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
         GeometryDetector,
+        GeometryLockTracker,
         apply_geometry_lock,
         build_remap,
         draw_debug,
+        map_fisheye_box_to_output,
         make_output_rays,
         rotation_for_row,
         transform_box,
@@ -45,7 +49,7 @@ class LiveProcessor:
         k1: float = 0.0893163,
         k2: float = -0.0174637,
         model: Path | None = None,
-        detect_every: int = 3,
+        detect_every: int = 4,
         lock_fill: float = 0.64,
         debug: bool = False,
     ) -> None:
@@ -65,10 +69,9 @@ class LiveProcessor:
         self.output_rays: np.ndarray | None = None
         self.previous_center = np.array([0.5, 0.5], dtype=np.float32)
         self.previous_zoom = 1.0
-        self.previous_outer = None
-        self.previous_inner = None
+        self.lock_tracker = GeometryLockTracker(self.detect_every)
+        self.previous_gray: np.ndarray | None = None
         self.detection_age = 0
-        self.max_detection_age = max(12, self.detect_every * 8)
         self.lock_source = "none"
 
     def process(self, frame: np.ndarray, metadata: dict) -> tuple[np.ndarray, dict]:
@@ -78,37 +81,46 @@ class LiveProcessor:
             self.output_rays = make_output_rays(width, height, self.crop, self.fov)
 
         rotation, self.reference = rotation_for_row(metadata, self.reference)
+
         map_x, map_y = build_remap(
             width, height, rotation, self.crop, self.fov,
             self.k1, self.k2, self.center_x, self.center_y,
             output_rays=self.output_rays,
         )
         stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+        current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
+        self.lock_tracker.update_flow(self.previous_gray, current_gray)
 
         detector_ran = False
         if self.detector.enabled and (
             self.frame_index % self.detect_every == 0
-            or (self.previous_inner is None and self.previous_outer is None)
+            or self.lock_tracker.box is None
         ):
             detector_ran = True
-            detected_outer, detected_inner = self.detector.detect(stabilized)
-            if detected_outer is not None or detected_inner is not None:
-                self.previous_outer, self.previous_inner = detected_outer, detected_inner
-                self.detection_age = 0
-            else:
-                self.detection_age += self.detect_every
-        elif self.detector.enabled:
-            self.detection_age += 1
+            # The model was trained on the raw clip-on-lens geometry. Detect
+            # there, then map the resulting boxes through the same fisheye
+            # inverse used by the output renderer.
+            detected_outer_raw, detected_inner_raw = self.detector.detect(frame)
+            detected_outer = map_fisheye_box_to_output(
+                detected_outer_raw, width, height, rotation, self.crop, self.fov,
+                self.k1, self.k2, self.center_x, self.center_y,
+            )
+            detected_inner = map_fisheye_box_to_output(
+                detected_inner_raw, width, height, rotation, self.crop, self.fov,
+                self.k1, self.k2, self.center_x, self.center_y,
+            )
+            self.lock_tracker.ingest(detected_outer, detected_inner, width, height)
 
         if not self.detector.enabled:
-            self.detection_age = 0
-        elif self.detection_age > self.max_detection_age:
-            self.previous_outer, self.previous_inner = None, None
+            self.lock_tracker.box = None
+            self.lock_tracker.source = "none"
 
-        outer, inner = self.previous_outer, self.previous_inner
+        outer, inner = self.lock_tracker.boxes()
+        self.detection_age = self.lock_tracker.age_frames
 
         center = self.previous_center.copy()
         zoom = self.previous_zoom
+        acquiring = self.lock_source in ("none", "searching") and self.lock_tracker.box is not None
         center, zoom, lock_source = update_geometry_lock_state(
             self.previous_center,
             self.previous_zoom,
@@ -117,16 +129,18 @@ class LiveProcessor:
             width,
             height,
             self.lock_fill,
+            snap=acquiring,
         )
         if lock_source != "none":
             self.previous_center, self.previous_zoom = center, zoom
             self.lock_source = lock_source
-        elif detector_ran:
+        elif detector_ran or self.lock_tracker.box is None:
             self.lock_source = "searching"
 
         stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
         outer = transform_box(outer, geometry_matrix)
         inner = transform_box(inner, geometry_matrix)
+        self.previous_gray = current_gray
         self.frame_index += 1
 
         debug = {

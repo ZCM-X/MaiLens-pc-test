@@ -39,7 +39,7 @@ class LiveProcessorTests(unittest.TestCase):
 
         processor = LiveProcessor(detect_every=1)
         processor.detector = SequenceDetector()
-        processor.max_detection_age = 2
+        processor.lock_tracker.max_age_frames = 2
         frame = np.zeros((180, 320, 3), dtype=np.uint8)
         metadata = {
             "timestamp": 10.0,
@@ -57,7 +57,7 @@ class LiveProcessorTests(unittest.TestCase):
             _output, last = processor.process(frame, metadata)
         self.assertEqual(last["lock_source"], "searching")
         self.assertIsNone(last["detected_outer"])
-        self.assertGreater(last["detection_age_frames"], processor.max_detection_age)
+        self.assertGreater(last["detection_age_frames"], processor.lock_tracker.max_age_frames)
 
 
 if __name__ == "__main__":

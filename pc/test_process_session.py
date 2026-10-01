@@ -8,7 +8,10 @@ import numpy as np
 
 from .process_session import (
     GeometryDetector,
+    GeometryLockTracker,
     apply_geometry_lock,
+    build_remap,
+    map_fisheye_points_to_output,
     process,
     quat_to_matrix,
     rotation_for_row,
@@ -37,6 +40,61 @@ class RotationMappingTests(unittest.TestCase):
 
 
 class ProcessSessionTests(unittest.TestCase):
+    def test_raw_fisheye_box_mapping_round_trips_the_remap_grid(self):
+        width, height = 640, 360
+        angle = np.deg2rad(12.0)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        map_x, map_y = build_remap(
+            width, height, rotation, 0.74, 106.4583,
+            0.0893163, -0.0174637, 0.501753869, 0.499423644,
+        )
+        output_point = np.array([width * 0.58, height * 0.44], dtype=np.float32)
+        raw_point = np.array([[map_x[int(output_point[1]), int(output_point[0])],
+                               map_y[int(output_point[1]), int(output_point[0])]]], dtype=np.float32)
+        mapped, valid = map_fisheye_points_to_output(
+            raw_point, width, height, rotation, 0.74, 106.4583,
+            0.0893163, -0.0174637, 0.501753869, 0.499423644,
+        )
+        self.assertTrue(bool(valid[0]))
+        np.testing.assert_allclose(mapped[0], output_point, atol=2.0)
+
+    def test_geometry_tracker_rejects_a_far_detector_jump(self):
+        tracker = GeometryLockTracker(detect_every=3)
+        tracker.ingest((80, 60, 280, 220), None, 400, 300)
+        tracker.ingest((300, 10, 395, 100), None, 400, 300)
+        outer, inner = tracker.boxes()
+        self.assertEqual(outer, (80, 60, 280, 220))
+        self.assertIsNone(inner)
+
+    def test_geometry_tracker_prefers_existing_inner_screen_over_outer_fallback(self):
+        tracker = GeometryLockTracker(detect_every=3)
+        tracker.ingest((40, 30, 360, 270), (100, 80, 300, 220), 400, 300)
+        tracker.ingest((45, 35, 355, 265), None, 400, 300)
+        outer, inner = tracker.boxes()
+        self.assertIsNone(outer)
+        self.assertIsNotNone(inner)
+
+    def test_geometry_tracker_follows_translation_between_detector_frames(self):
+        width, height = 320, 240
+        previous = np.zeros((height, width), dtype=np.uint8)
+        cv2.rectangle(previous, (70, 60), (240, 190), 255, 3)
+        for x in range(80, 230, 15):
+            cv2.circle(previous, (x, 100 + (x % 30)), 3, 180, -1)
+        current = cv2.warpAffine(
+            previous, np.float32([[1, 0, 8], [0, 1, 4]]), (width, height),
+            borderMode=cv2.BORDER_REFLECT101,
+        )
+        tracker = GeometryLockTracker(detect_every=3)
+        tracker.ingest((70, 60, 240, 190), None, width, height)
+        tracker.update_flow(previous, current)
+        self.assertIsNotNone(tracker.box)
+        self.assertGreaterEqual(tracker.box[0], 74)
+        self.assertGreaterEqual(tracker.box[1], 62)
+
     def test_geometry_transform_maps_target_center_to_output_center(self):
         frame = np.zeros((300, 400, 3), dtype=np.uint8)
         target = np.array([0.28, 0.62], dtype=np.float32)
