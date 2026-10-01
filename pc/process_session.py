@@ -505,10 +505,11 @@ def update_geometry_lock_state(
     """
     center = previous_center.copy()
     zoom = float(previous_zoom)
-    # The cabinet is the lock anchor.  The inner screen is only used to set
-    # the crop scale; using its centre as the anchor makes the output drift
-    # whenever the bezel is asymmetric or the screen is mounted high/low.
-    anchor = outer or inner
+    # The visible game plane is the lock anchor.  The outer ring is a
+    # validation/ROI signal; its detector box often includes the top display
+    # and cabinet body, so anchoring the transform to it makes the actual
+    # screen wander when that box expands or contracts.
+    anchor = inner or outer
     source = "none"
     if anchor:
         center_target = np.array([

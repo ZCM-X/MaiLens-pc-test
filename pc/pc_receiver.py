@@ -215,7 +215,7 @@ def main() -> None:
                         help="实时鱼眼处理比例，默认 0.5 以接近 60 fps；原始帧仍保存全分辨率")
     parser.add_argument("--model", type=Path, help="可选外框/内屏模型；与 --process-live 一起使用")
     parser.add_argument("--machine-lock", action="store_true",
-                        help="启用机台检测居中；默认使用 models/frame-geometry-yolo11n-v3.onnx")
+                        help="启用机台检测居中；默认使用 models/frame-geometry-yolo11n-v2.onnx")
     parser.add_argument("--lock-fill", type=float, default=0.64,
                         help="内屏锁定后占画面短边的比例，默认 0.64")
     parser.add_argument("--debug", action="store_true", help="实时画面叠加检测框、中心和缩放")
@@ -229,7 +229,10 @@ def main() -> None:
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
     args = parser.parse_args()
     if args.machine_lock and args.model is None:
-        args.model = Path("models/frame-geometry-yolo11n-v3.onnx")
+        # v2 has a stable inner-screen head on the current live footage.  v3
+        # is kept in the repository for retraining experiments, but it often
+        # drops the inner screen and cannot drive the plane lock continuously.
+        args.model = Path("models/frame-geometry-yolo11n-v2.onnx")
     if not (0 < args.port < 65536):
         parser.error("--port 必须在 1 到 65535 之间")
     if args.fps <= 0:

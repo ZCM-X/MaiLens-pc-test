@@ -152,7 +152,7 @@ class ProcessSessionTests(unittest.TestCase):
         self.assertLess(float(center[0]), 0.5)
         self.assertGreater(zoom, 0.70)
 
-    def test_geometry_lock_uses_outer_center_and_inner_size(self):
+    def test_geometry_lock_uses_inner_center_and_inner_size(self):
         center, _zoom, source = update_geometry_lock_state(
             np.array([0.5, 0.5], dtype=np.float32),
             1.0,
@@ -162,7 +162,7 @@ class ProcessSessionTests(unittest.TestCase):
             300,
         )
         self.assertEqual(source, "inner_screen")
-        np.testing.assert_allclose(center, [0.35, 0.46666667], atol=1e-6)
+        np.testing.assert_allclose(center, [0.575, 0.4], atol=1e-6)
 
     def test_geometry_tracker_rejects_far_outer_jump_but_keeps_inner_box(self):
         tracker = GeometryLockTracker(detect_every=3)
