@@ -217,7 +217,11 @@ class GeometryDetector:
         self.cv_net = None
         self.backend = "none"
         self.input_size = 640
-        self.confidence = 0.30
+        # The trained MaiMoller model has a few valid outer-box predictions
+        # around 0.29 on oblique frames.  Keeping the threshold at 0.25 lets
+        # those frames contribute the cabinet anchor without accepting the
+        # low-confidence duplicate boxes below it.
+        self.confidence = 0.25
         self.names = {0: "outer_buttons", 1: "inner_screen", 2: "button"}
         if model_path:
             model_path = Path(model_path)

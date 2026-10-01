@@ -10,5 +10,8 @@ __pycache__/
 .venv/
 sessions/
 datasets/
+runs/
+work/
+yolo*.pt
 *.mp4
 *.mov

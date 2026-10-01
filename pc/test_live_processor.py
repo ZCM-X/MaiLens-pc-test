@@ -59,6 +59,23 @@ class LiveProcessorTests(unittest.TestCase):
         self.assertIsNone(last["detected_outer"])
         self.assertGreater(last["detection_age_frames"], processor.lock_tracker.max_age_frames)
 
+    def test_resolution_change_reacquires_without_optical_flow_shape_error(self):
+        class SequenceDetector:
+            enabled = True
+
+            def detect(self, frame):
+                height, width = frame.shape[:2]
+                return (20, 20, width - 20, height - 20), None
+
+        processor = LiveProcessor(detect_every=1)
+        processor.detector = SequenceDetector()
+        metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}
+        first, _ = processor.process(np.zeros((180, 320, 3), dtype=np.uint8), metadata)
+        second, debug = processor.process(np.zeros((240, 400, 3), dtype=np.uint8), metadata)
+        self.assertEqual(first.shape, (180, 320, 3))
+        self.assertEqual(second.shape, (240, 400, 3))
+        self.assertEqual(debug["lock_source"], "outer_buttons")
+
 
 if __name__ == "__main__":
     unittest.main()

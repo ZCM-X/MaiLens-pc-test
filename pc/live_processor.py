@@ -91,6 +91,16 @@ class LiveProcessor:
         )
         stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
         current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
+        # A phone can change capture dimensions when the camera rotates or a
+        # sender renegotiates its stream.  Sparse LK flow cannot compare
+        # pyramids with different shapes; discard the old flow/lock state and
+        # reacquire the cabinet on the new geometry instead.
+        if self.previous_gray is not None and self.previous_gray.shape != current_gray.shape:
+            self.previous_gray = None
+            self.lock_tracker.reset()
+            self.previous_center = np.array([0.5, 0.5], dtype=np.float32)
+            self.previous_zoom = 1.0
+            self.lock_source = "searching"
         self.lock_tracker.update_flow(self.previous_gray, current_gray)
 
         detector_ran = False

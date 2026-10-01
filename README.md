@@ -106,6 +106,18 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
 
 不要为了每张图都凑两个框而猜测。某个目标被遮挡或出画时，只标清楚可见的那个；两类都看不清就跳过样本。工具输出标准 YOLO `images/{train,val}`、`labels/{train,val}` 和 `dataset.yaml`。建议先标至少 100 张，覆盖远近、左右偏移、倾斜、遮挡和曝光变化，再按 Ultralytics YOLO 文档训练并导出 ONNX。
 
+本仓库提供了一个可复现的训练包装器。它会先检查 YOLO 标注，再为 Windows 生成绝对数据根目录的运行时 YAML，避免 Ultralytics 把 `path: .` 误解为当前终端目录：
+
+```powershell
+.\.venv\Scripts\python.exe tools\train_detector.py `
+  --dataset datasets\maimoller-geometry\dataset.yaml `
+  --weights ..\..\yolo11n.pt --device 0 `
+  --project runs --name geometry-yolo11n `
+  --export onnx
+```
+
+当前 `models/frame-geometry-yolo11n-v3.onnx` 就是用 `maimoller-geometry` 数据集训练并导出的版本。验证集只有 5 张图，指标只能说明标注闭环和推理类别正常，后续还要用不同距离、角度和遮挡的手机视频验收。
+
 如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在离线处理上：
 
 ```powershell
