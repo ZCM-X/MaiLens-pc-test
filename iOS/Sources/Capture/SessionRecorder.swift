@@ -125,6 +125,10 @@ final class SessionRecorder {
     private var lastTimestamp: Double?
     private var nominalFPS: Double = 60
     private var lastPublish = Date.distantPast
+    /// Frames waiting for the writer queue.  Bounded so a saturated encoder
+    /// cannot grow the queue until iOS kills the app mid-take.
+    private var pendingFrames = 0
+    private var backlogDrops = 0
 
     var isRecording: Bool {
         stateLock.lock()
@@ -155,8 +159,21 @@ final class SessionRecorder {
     /// throttled down or the Wi-Fi link is not connected at all.
     func append(sampleBuffer: CMSampleBuffer, pose: PoseSnapshot?) {
         guard isRecording else { return }
+        stateLock.lock()
+        let accepted = pendingFrames < Self.maxPendingFrames
+        if accepted {
+            pendingFrames += 1
+        } else {
+            backlogDrops += 1
+        }
+        stateLock.unlock()
+        guard accepted else { return }
         queue.async { [weak self] in
-            self?.appendLocked(sampleBuffer: sampleBuffer, pose: pose)
+            guard let self else { return }
+            self.appendLocked(sampleBuffer: sampleBuffer, pose: pose)
+            self.stateLock.lock()
+            self.pendingFrames -= 1
+            self.stateLock.unlock()
         }
     }
 
@@ -214,6 +231,8 @@ final class SessionRecorder {
         firstTimestamp = nil
         lastTimestamp = nil
         lastPublish = .distantPast
+        pendingFrames = 0
+        backlogDrops = 0
         setRecording(true)
         return directory
     }
@@ -260,13 +279,17 @@ final class SessionRecorder {
         let directory = sessionDirectory
         let frames = status.frameCount
         let poses = status.poseSampleCount
-        let dropped = status.droppedFrames
+        stateLock.lock()
+        let dropped = status.droppedFrames + backlogDrops
+        stateLock.unlock()
         let width = status.width
         let height = status.height
         let duration = durationLocked()
         let wallClock = Date().timeIntervalSince(startedAt)
         let started = startedAt
         let fps = nominalFPS
+        pendingFrames = 0
+        backlogDrops = 0
 
         try? captureHandle?.close()
         try? poseHandle?.close()
@@ -358,6 +381,9 @@ final class SessionRecorder {
         lastPublish = now
         var snapshot = status
         snapshot.duration = durationLocked()
+        stateLock.lock()
+        snapshot.droppedFrames += backlogDrops
+        stateLock.unlock()
         if let videoURL {
             snapshot.bytes = Self.size(of: videoURL)
         }
@@ -443,6 +469,8 @@ final class SessionRecorder {
             ],
         ]
     }
+
+    private static let maxPendingFrames = 4
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
