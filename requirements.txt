@@ -1,6 +1,7 @@
 numpy>=1.26
 opencv-python>=4.9
+Pillow>=10.0
+pillow-heif>=1.8.0
 
 # Optional, only needed when running the detector-backed processor:
 # ultralytics>=8.3
-

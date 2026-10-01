@@ -73,6 +73,14 @@ sessions/20261001-153012
 
 `--input` 可以是实时会话目录、视频、单张图或图片目录。视频默认每 6 帧取一帧，避免连续相似帧占满数据；`--max-frames 120` 可限制本次数量。窗口里拖动矩形，按 `1` 标完整机台可见外框，按 `2` 标实际游戏内屏；按 `s` 保存，`n`/空格下一张，`p` 上一张，`x` 删除当前类别框，`r` 清除此图，`q` 退出。下一次以相同 `--output` 打开会继续已有标注。
 
+iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张都看，所以把 `--every` 设为 `1`，例如：
+
+```powershell
+.\.venv\Scripts\python.exe tools\annotate_geometry.py `
+  --input "C:\Users\93543\Downloads\maimoller训练" `
+  --output datasets\maimoller-buttons --every 1 --with-buttons
+```
+
 如果要同时标谱面的八个按键，打开第三类：
 
 ```powershell

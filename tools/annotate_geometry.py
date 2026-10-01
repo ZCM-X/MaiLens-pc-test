@@ -21,12 +21,37 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
+
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:  # Keep non-HEIC use working when the optional codec is absent.
+    register_heif_opener = None
+
+if register_heif_opener is not None:
+    register_heif_opener()
 
 
 CLASSES = ("outer_frame", "inner_screen", "button")
 COLORS = ((0, 220, 255), (80, 255, 170), (255, 150, 60))  # BGR: yellow, green, orange
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+
+
+def read_image(path: Path) -> np.ndarray:
+    """Read regular images with OpenCV and iPhone HEIC images through Pillow."""
+    if path.suffix.lower() in {".heic", ".heif"}:
+        if register_heif_opener is None:
+            raise RuntimeError(
+                "读取 HEIC 需要 pillow-heif；请运行 .venv\\Scripts\\python.exe -m pip install pillow-heif"
+            )
+        with Image.open(path) as image:
+            rgb = np.asarray(image.convert("RGB"))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"无法读取图像：{path}")
+    return image
 
 
 def normalize_box(box: tuple[int, int, int, int], width: int, height: int) -> str:
@@ -82,7 +107,7 @@ class FrameSource:
         if index < 0 or index >= self.count:
             raise IndexError(index)
         if self.image_paths is not None:
-            image = cv2.imread(str(self.image_paths[index]), cv2.IMREAD_COLOR)
+            image = read_image(self.image_paths[index])
             source_frame = index
         else:
             assert self._capture is not None
@@ -91,8 +116,6 @@ class FrameSource:
             ok, image = self._capture.read()
             if not ok:
                 raise RuntimeError(f"无法读取视频第 {source_frame} 帧：{self.path}")
-        if image is None:
-            raise RuntimeError(f"无法读取图像：{self.path}")
         return image, source_frame
 
     def close(self) -> None:
@@ -177,9 +200,9 @@ class GeometryAnnotator:
             try:
                 lines = label_path.read_text(encoding="utf-8").splitlines()
                 image_path = self.output / "images" / split / f"{self.current_base}.jpg"
-                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-                if image is None:
+                if not image_path.exists():
                     continue
+                image = read_image(image_path)
                 height, width = image.shape[:2]
                 for line in lines:
                     fields = line.split()
