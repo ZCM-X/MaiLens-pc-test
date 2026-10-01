@@ -34,11 +34,14 @@ def rotation_for_row(row: dict, reference: np.ndarray | None) -> tuple[np.ndarra
     current = quat_to_matrix(quaternion)
     if reference is None:
         reference = current.copy()
-    # The ray is expressed in the locked camera. Rotate it into the current
-    # sensor camera using the relative attitude. The transpose is the inverse
-    # of the latched reference orientation.
-    relative = current @ reference.T
-    return relative, reference
+    # Core Motion attitude is expressed in device coordinates, while remap
+    # rays are expressed in the rear-camera image coordinates (+X right,
+    # +Y down, +Z out through the lens). Convert between those bases before
+    # applying q_current^-1 * q_locked. This matches the live iOS renderer.
+    camera_to_device = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    relative_device = current.T @ reference
+    camera_from_locked = camera_to_device @ relative_device @ camera_to_device
+    return camera_from_locked, reference
 
 
 def make_output_rays(width: int, height: int, crop: float, fov_deg: float) -> np.ndarray:

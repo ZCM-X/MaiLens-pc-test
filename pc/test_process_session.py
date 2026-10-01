@@ -6,7 +6,27 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .process_session import process
+from .process_session import process, quat_to_matrix, rotation_for_row
+
+
+class RotationMappingTests(unittest.TestCase):
+    def test_relative_rotation_maps_current_camera_back_to_latched_camera(self):
+        reference = quat_to_matrix({"x": 0, "y": 0, "z": 0, "w": 1})
+        row = {"pose": {"quaternion": {
+            "x": 0,
+            "y": 0,
+            "z": 0.3826834324,
+            "w": 0.9238795325,
+        }}}
+        relative, returned_reference = rotation_for_row(row, reference)
+        current = quat_to_matrix(row["pose"]["quaternion"])
+        camera_to_device = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+        np.testing.assert_allclose(returned_reference, reference)
+        np.testing.assert_allclose(
+            relative,
+            camera_to_device @ current.T @ reference @ camera_to_device,
+            atol=1e-6,
+        )
 
 
 class ProcessSessionTests(unittest.TestCase):
