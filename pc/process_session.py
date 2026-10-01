@@ -379,6 +379,18 @@ def draw_debug(frame: np.ndarray, outer, inner, text: str) -> np.ndarray:
     return result
 
 
+def geometry_margins(outer, inner) -> dict[str, int] | None:
+    """Return the four pixel gaps between the outer and inner geometry boxes."""
+    if outer is None or inner is None:
+        return None
+    return {
+        "left": int(inner[0] - outer[0]),
+        "top": int(inner[1] - outer[1]),
+        "right": int(outer[2] - inner[2]),
+        "bottom": int(outer[3] - inner[3]),
+    }
+
+
 def transform_box(box, matrix: np.ndarray):
     if box is None:
         return None
@@ -713,6 +725,7 @@ def process(args: argparse.Namespace) -> Path:
                     "zoom": zoom,
                     "detected_outer": outer,
                     "detected_inner": inner,
+                    "geometry_margins": geometry_margins(outer, inner),
                     "lock_source": lock_source,
                     "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")

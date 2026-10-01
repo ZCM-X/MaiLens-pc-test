@@ -11,6 +11,7 @@ from .process_session import (
     GeometryLockTracker,
     apply_geometry_lock,
     build_remap,
+    geometry_margins,
     map_fisheye_points_to_output,
     process,
     quat_to_matrix,
@@ -40,6 +41,12 @@ class RotationMappingTests(unittest.TestCase):
 
 
 class ProcessSessionTests(unittest.TestCase):
+    def test_geometry_margins_are_derived_from_two_boxes(self):
+        self.assertEqual(
+            geometry_margins((10, 20, 390, 280), (85, 95, 315, 205)),
+            {"left": 75, "top": 75, "right": 75, "bottom": 75},
+        )
+
     def test_raw_fisheye_box_mapping_round_trips_the_remap_grid(self):
         width, height = 640, 360
         angle = np.deg2rad(12.0)
