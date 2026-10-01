@@ -19,6 +19,7 @@ final class CaptureController: NSObject, ObservableObject {
     private let sender = RemoteFrameSender()
     private let motion = MotionPoseProvider()
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let targetFrameRate: Int32 = 60
     private var configured = false
     private var lastSentTimestamp: Double = 0
     private var lastStatsTimestamp = Date.timeIntervalSinceReferenceDate
@@ -87,6 +88,7 @@ final class CaptureController: NSObject, ObservableObject {
         let input = try AVCaptureDeviceInput(device: camera)
         guard session.canAddInput(input), session.canAddOutput(output) else { throw CaptureError.cannotConfigure }
         session.addInput(input)
+        configureFrameRate(for: camera)
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: outputQueue)
@@ -97,10 +99,33 @@ final class CaptureController: NSObject, ObservableObject {
         configured = true
     }
 
+    private func configureFrameRate(for camera: AVCaptureDevice) {
+        let candidates = camera.formats.filter { format in
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let is720p = dimensions.width == 1280 && dimensions.height == 720
+            let supportsTarget = format.videoSupportedFrameRateRanges.contains {
+                $0.minFrameRate <= Double(targetFrameRate) && $0.maxFrameRate >= Double(targetFrameRate)
+            }
+            return is720p && supportsTarget
+        }
+        guard let format = candidates.first else { return }
+
+        do {
+            try camera.lockForConfiguration()
+            defer { camera.unlockForConfiguration() }
+            camera.activeFormat = format
+            let duration = CMTime(value: 1, timescale: targetFrameRate)
+            camera.activeVideoMinFrameDuration = duration
+            camera.activeVideoMaxFrameDuration = duration
+        } catch {
+            // Keep the camera's default frame rate if this format cannot be locked.
+        }
+    }
+
     private func handle(_ sampleBuffer: CMSampleBuffer) {
         let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timestamp = presentation.seconds
-        guard timestamp.isFinite, timestamp - lastSentTimestamp >= 1.0 / 15.0,
+        guard timestamp.isFinite, timestamp - lastSentTimestamp >= 1.0 / Double(targetFrameRate),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastSentTimestamp = timestamp
 

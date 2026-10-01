@@ -6,7 +6,7 @@ MaiLens-pc-test 是一个独立的“手机采集 → Wi‑Fi → 电脑处理�
 
 ```text
 iPhone 0.5× 相机
-  ├─ JPEG 视频帧（默认 1280×720，约 15 fps）
+  ├─ JPEG 视频帧（默认 1280×720，目标 60 fps）
   └─ 同帧姿态（四元数、重力、角速度、时间戳）
              │ TCP / 局域网
              ▼
@@ -25,10 +25,12 @@ iPhone 0.5× 相机
 
 ```powershell
 py -m venv .venv
-\.venv\Scripts\python.exe -m pip install -r requirements.txt
-\.venv\Scripts\python.exe pc\pc_receiver.py --host 0.0.0.0 --port 8765 `
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe pc\pc_receiver.py --host 0.0.0.0 --port 8765 `
   --process-live --preview
 ```
+
+采集端会尝试让 0.5× 摄像头以 60 fps 输出；App 界面显示的是实际发送帧率。JPEG 编码、Wi‑Fi 或电脑处理跟不上时，发送端会丢弃旧帧保持低延迟，实际值可能低于 60。
 
 电脑防火墙允许 Python 监听 TCP 8765。手机和电脑必须在同一个局域网，手机端填写电脑的局域网 IPv4 地址（例如 `192.168.1.23`），不能填写 `127.0.0.1`。
 
@@ -41,7 +43,7 @@ sessions/20261001-153012
 实时模式会同时保存 `raw.mp4` 和 `processed-live.mp4`。如果先只采集原始数据，之后再离线调参，可以用：
 
 ```powershell
-\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 --output processed.mp4 --preview
+.\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 --output processed.mp4 --preview
 ```
 
 默认处理使用姿态四元数建立数字云台变换；它会把第一帧姿态作为锁定方向，并通过边缘反射填补裁切后的空白。`--crop 0.74` 控制保留中心视场，值越小预留的稳定余量越大。
@@ -52,7 +54,7 @@ sessions/20261001-153012
 
 ```powershell
 py -m pip install ultralytics
-\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
+.\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
   --process-live --preview --model models\frame-geometry-yolo11n-v2.onnx
 ```
 
@@ -62,7 +64,7 @@ py -m pip install ultralytics
 
 ```powershell
 py -m pip install ultralytics
-\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
+.\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
 ```
 

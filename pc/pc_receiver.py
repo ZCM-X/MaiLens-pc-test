@@ -171,7 +171,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认允许局域网连接")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--fps", type=float, default=15.0, help="raw.mp4 标称帧率")
+    parser.add_argument("--fps", type=float, default=60.0, help="raw.mp4 标称帧率")
     parser.add_argument("--output-dir", type=Path, default=Path("sessions"))
     parser.add_argument("--preview", action="store_true", help="显示接收画面，按 q 结束")
     parser.add_argument("--process-live", action="store_true",
