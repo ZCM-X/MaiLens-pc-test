@@ -41,17 +41,34 @@ def rotation_for_row(row: dict, reference: np.ndarray | None) -> tuple[np.ndarra
     return relative, reference
 
 
-def build_remap(width: int, height: int, rotation: np.ndarray, crop: float, fov_deg: float) -> tuple[np.ndarray, np.ndarray]:
-    focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+def build_remap(
+    width: int,
+    height: int,
+    rotation: np.ndarray,
+    crop: float,
+    fov_deg: float,
+    k1: float,
+    k2: float,
+    center_x: float,
+    center_y: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map a stabilized rectilinear output ray into the raw clip-on fisheye."""
+    virtual_focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+    source_focal = max(width, height) * 772.4089 / 4032.0
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    x = (xx - width * 0.5) / max(focal, 1.0)
-    y = (yy - height * 0.5) / max(focal, 1.0)
+    x = (xx - width * 0.5) / max(virtual_focal * crop, 1.0)
+    y = (yy - height * 0.5) / max(virtual_focal * crop, 1.0)
     rays = np.stack((x, y, np.ones_like(x)), axis=-1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
     source = rays @ rotation.T
-    z = np.maximum(source[..., 2], 0.05)
-    map_x = (source[..., 0] / z * focal / max(crop, 0.2) + width * 0.5).astype(np.float32)
-    map_y = (source[..., 1] / z * focal / max(crop, 0.2) + height * 0.5).astype(np.float32)
+    radial = np.linalg.norm(source[..., :2], axis=-1)
+    theta = np.arccos(np.clip(source[..., 2], -1.0, 1.0))
+    theta2 = theta * theta
+    theta_distorted = theta * (1.0 + k1 * theta2 + k2 * theta2 * theta2)
+    direction_x = np.divide(source[..., 0], radial, out=np.zeros_like(radial), where=radial > 1e-6)
+    direction_y = np.divide(source[..., 1], radial, out=np.zeros_like(radial), where=radial > 1e-6)
+    map_x = (center_x * width + source_focal * direction_x * theta_distorted).astype(np.float32)
+    map_y = (center_y * height + source_focal * direction_y * theta_distorted).astype(np.float32)
     return map_x, map_y
 
 
@@ -74,7 +91,8 @@ class GeometryDetector:
         for box in result.boxes:
             xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
             cls = int(box.cls[0].item())
-            label = str(names.get(cls, cls)).lower()
+            label_value = names[cls] if isinstance(names, (list, tuple)) else names.get(cls, cls)
+            label = str(label_value).lower()
             boxes.append((label, tuple(xyxy)))
         outer = next((box for label, box in boxes if "outer" in label or "frame" in label), None)
         inner = next((box for label, box in boxes if "inner" in label or "screen" in label), None)
@@ -157,7 +175,10 @@ def process(args: argparse.Namespace) -> Path:
                 if frame is None:
                     continue
                 rotation, reference = rotation_for_row(row, reference)
-                map_x, map_y = build_remap(width, height, rotation, args.crop, args.fov)
+                map_x, map_y = build_remap(
+                    width, height, rotation, args.crop, args.fov,
+                    args.k1, args.k2, args.center_x, args.center_y,
+                )
                 stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
                 if args.model and (index % args.detect_every == 0 or previous_inner is None):
                     previous_outer, previous_inner = detector.detect(stabilized)
@@ -209,6 +230,10 @@ def main() -> None:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
+    parser.add_argument("--center-x", type=float, default=0.501753869)
+    parser.add_argument("--center-y", type=float, default=0.499423644)
+    parser.add_argument("--k1", type=float, default=0.0893163)
+    parser.add_argument("--k2", type=float, default=-0.0174637)
     parser.add_argument("--fps", type=float)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--preview", action="store_true")
