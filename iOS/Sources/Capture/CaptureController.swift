@@ -27,7 +27,7 @@ final class CaptureController: NSObject, ObservableObject {
     override init() {
         super.init()
         sender.onState = { [weak self] in self?.connectionState = $0 }
-        sender.onStatistics = { dropped in
+        sender.onStatistics = { [weak self] _, dropped in
             DispatchQueue.main.async { [weak self] in self?.droppedFrames = dropped }
         }
     }
@@ -107,9 +107,12 @@ final class CaptureController: NSObject, ObservableObject {
         let inputImage = CIImage(cvPixelBuffer: pixelBuffer)
         let scale = min(1.0, 1280.0 / Double(max(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer))))
         let scaled = scale < 1 ? inputImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) : inputImage
+        let compressionKey = CIImageRepresentationOption(
+            rawValue: kCGImageDestinationLossyCompressionQuality as String
+        )
         guard let jpeg = ciContext.jpegRepresentation(of: scaled,
                                                       colorSpace: CGColorSpaceCreateDeviceRGB(),
-                                                      options: [.lossyCompressionQuality: 0.84]) else { return }
+                                                      options: [compressionKey: 0.84]) else { return }
         let pose = motion.nearest(to: timestamp)
         let width = Int(scaled.extent.width.rounded())
         let height = Int(scaled.extent.height.rounded())
