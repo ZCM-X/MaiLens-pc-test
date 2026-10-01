@@ -33,7 +33,7 @@ iPhone 本地录制（App 内“开始录制”）
 
 ## 电脑端启动
 
-在 Windows PowerShell 中：
+在 Windows PowerShell 中（先 `cd` 到项目根目录，也就是放着 `.venv`、`pc`、`models` 的那一层；不在这一层会直接报「无法将`.\.venv\Scripts\python.exe`项识别为...」）：
 
 ```powershell
 py -m venv .venv
@@ -172,6 +172,8 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 拷到电脑后先转成和实时会话同构的目录，再跑离线处理：
 
 ```powershell
+# 所有命令都在项目根目录运行
+
 # 电脑端接收（另开一个终端，手机点“发到电脑”之前先跑起来）
 .\.venv\Scripts\python.exe pc\session_server.py --import
 
@@ -182,6 +184,8 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261002-153000-phone `
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-phone.mp4 --debug
 ```
+
+没有 `.venv` 时，把 `.\.venv\Scripts\python.exe` 换成 `py` 也能跑（只要本机 Python 装了 `opencv-python` 和 `numpy`）。
 
 `import_phone_session.py` 把 `video.mp4` 解码成 `frames/*.jpg`，给 `capture.jsonl` 补上 `frame_path`，并带上 `pose.jsonl` 和 `session.json`，所以下游 `process_session.py` 和标注工具都不用改。手机录的帧数和日志条数对不上时（比如录制中途被杀掉），导入会以视频长度为准，缺的那几帧只少姿态，不会中断整段。
 
