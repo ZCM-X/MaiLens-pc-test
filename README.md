@@ -63,7 +63,7 @@ sessions/20261001-153012
 
 ## 标注自己的机台数据
 
-当前内置模型经常框到内屏而不是机台主体，因此建议先用自己的鱼眼画面标一些真实样本，再训练新的双类别检测模型。运行标注工具：
+当前内置模型经常框到内屏而不是机台主体，因此建议先用自己的鱼眼画面标一些真实样本，再训练新的模型。运行标注工具：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
@@ -73,10 +73,21 @@ sessions/20261001-153012
 
 `--input` 可以是实时会话目录、视频、单张图或图片目录。视频默认每 6 帧取一帧，避免连续相似帧占满数据；`--max-frames 120` 可限制本次数量。窗口里拖动矩形，按 `1` 标完整机台可见外框，按 `2` 标实际游戏内屏；按 `s` 保存，`n`/空格下一张，`p` 上一张，`x` 删除当前类别框，`r` 清除此图，`q` 退出。下一次以相同 `--output` 打开会继续已有标注。
 
+如果要同时标谱面的八个按键，打开第三类：
+
+```powershell
+.\.venv\Scripts\python.exe tools\annotate_geometry.py `
+  --input sessions\你的会话目录 --output datasets\geometry-buttons `
+  --every 6 --val-every 10 --with-buttons
+```
+
+启用后按 `3`，在同一帧依次框出最多 8 个按键；按 `z` 撤销最后一个按键，`x` 清空全部按键。按键少于 8 个时只标清楚可见的按键，不要为了凑数乱框。
+
 训练时只标这两个目标：
 
 - `outer_frame`：整台机台/机柜在画面里可见的完整外轮廓，包括屏幕外的边框和机身；不要把地面、背景或旁边设备框进去。
 - `inner_screen`：显示游戏内容的屏幕矩形，沿屏幕玻璃/显示区域的边缘框；不要标八个判定星星、按钮、反光或 UI 元素。
+- `button`：每个谱面按键的可见区域，一个按键一个框，最多 8 个；它只用于后续按键/谱面识别，不参与机台居中或裁切缩放。
 
 不要为了每张图都凑两个框而猜测。某个目标被遮挡或出画时，只标清楚可见的那个；两类都看不清就跳过样本。工具输出标准 YOLO `images/{train,val}`、`labels/{train,val}` 和 `dataset.yaml`。建议先标至少 100 张，覆盖远近、左右偏移、倾斜、遮挡和曝光变化，再按 Ultralytics YOLO 文档训练并导出 ONNX。
 
@@ -87,7 +98,7 @@ sessions/20261001-153012
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
 ```
 
-检测器只使用 `outer_frame` 和 `inner_screen` 两类几何，不会把谱面的 8 个判定点当成机台锁定目标。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
+检测器锁定只使用 `outer_frame` 和 `inner_screen` 两类几何；即使模型还输出 `button`，也不会把按键当成机台外框。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
 
 ## iPhone 端构建
 

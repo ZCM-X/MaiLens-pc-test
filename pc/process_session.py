@@ -218,7 +218,7 @@ class GeometryDetector:
         self.backend = "none"
         self.input_size = 640
         self.confidence = 0.30
-        self.names = {0: "outer_frame", 1: "inner_screen"}
+        self.names = {0: "outer_frame", 1: "inner_screen", 2: "button"}
         if model_path:
             model_path = Path(model_path)
             opencv_error = None
@@ -342,9 +342,14 @@ class GeometryDetector:
         inner = max(inner_candidates, key=lambda item: (item[0], area(item[1])))[1] if inner_candidates else None
         if outer is None and boxes:
             # Keep the detector usable with a one-class machine model while
-            # avoiding the old behaviour of treating a second outer box as an
-            # inner screen.
-            outer = max((box for _, _, box in boxes), key=area)
+            # avoiding the old behaviour of treating a button class as the
+            # cabinet when a multi-task model detects only gameplay buttons.
+            non_button_boxes = [
+                box for label, _, box in boxes
+                if not any(token in label for token in ("button", "key", "star", "marker"))
+            ]
+            if non_button_boxes:
+                outer = max(non_button_boxes, key=area)
         if inner is not None and outer is not None:
             ix0, iy0, ix1, iy1 = inner
             ox0, oy0, ox1, oy1 = outer
