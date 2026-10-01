@@ -164,30 +164,30 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 
 每次录制按时间写进手机上的 `MaiLensSessions/<yyyyMMdd-HHmmss>/`，拿到电脑上有四种办法，前两种就在 App 里：
 
-- “发到电脑”（推荐）：走局域网直接推到电脑，不用线、不用第三方工具。电脑上先起接收端，端口固定是推流端口 +1（默认 8766），加 `--import` 就收到即抽帧成 `sessions/<名字>-phone/`，不加则只把原始文件收进 `phone_sessions/`。只要手机正连着电脑推流，录完会自动发送这一段；没在推流就手动点“发到电脑”。
+- “发到电脑”（推荐）：走局域网直接推到电脑，不用线、不用第三方工具。电脑上先起接收端，端口固定是推流端口 +1（默认 8766）。`--process` 收到就用保存的 `video.mp4` 加姿态日志直接出稳定结果（`phone_sessions/<名字>/processed.mp4`），中间不需要抽帧；`--import` 是给标注准备的，会额外生成 `sessions/<名字>-phone/frames/`；两个都不加就只收原始文件。只要手机正连着电脑推流，录完会自动发送这一段；没在推流就手动点“发到电脑”。
 - “导出”：存到“文件”或分享出去。
 - 手机“文件 → 我的 iPhone → MaiLensRemoteCapture”里按时间找文件夹。
 - 用爱思助手直接拷整个文件夹。
 
-拷到电脑后先转成和实时会话同构的目录，再跑离线处理：
+电脑这边三种用法，按需要挑：
 
 ```powershell
 # 所有命令都在项目根目录运行
 
-# 电脑端接收（另开一个终端，手机点“发到电脑”之前先跑起来）
-.\.venv\Scripts\python.exe pc\session_server.py --import
+# 电脑端接收 + 直接处理（另开一个终端，手机点“发到电脑”之前先跑起来）
+.\.venv\Scripts\python.exe pc\session_server.py --process --model models\frame-geometry-yolo11n-v2.onnx
 
-# 手动导入（用了上面的 --import 就不用跑这条）
-.\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"
-
-# 离线稳定 / 机台锁定
-.\.venv\Scripts\python.exe pc\process_session.py sessions\20261002-153000-phone `
+# 也可以事后处理收到的会话：直接读 video.mp4 + pose.jsonl，不抽帧
+.\.venv\Scripts\python.exe pc\process_session.py phone_sessions\20261002-153000 `
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-phone.mp4 --debug
+
+# 只有要标注 JPEG 帧时才抽帧
+.\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"
 ```
 
 没有 `.venv` 时，把 `.\.venv\Scripts\python.exe` 换成 `py` 也能跑（只要本机 Python 装了 `opencv-python` 和 `numpy`）。
 
-`import_phone_session.py` 把 `video.mp4` 解码成 `frames/*.jpg`，给 `capture.jsonl` 补上 `frame_path`，并带上 `pose.jsonl` 和 `session.json`，所以下游 `process_session.py` 和标注工具都不用改。手机录的帧数和日志条数对不上时（比如录制中途被杀掉），导入会以视频长度为准，缺的那几帧只少姿态，不会中断整段。
+`process_session.py` 两种输入都吃：有 `frames/*.jpg` 的老会话照旧逐张读；手机上只有 `video.mp4` 时就直接解码视频，按帧号和 `capture.jsonl` 对齐，缺姿态的帧再从 120 Hz 的 `pose.jsonl` 里就近取；录像比日志长（中途被杀掉）就按最后一帧的时钟外推，整段照样跑完。`import_phone_session.py` 只在需要 JPEG 帧做标注时才用，它把视频解成 `frames/*.jpg` 并给 `capture.jsonl` 补上 `frame_path`。
 
 ## iPhone 端构建
 

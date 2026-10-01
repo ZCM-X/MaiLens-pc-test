@@ -1318,7 +1318,25 @@ class PlaneLockTracker:
         return self.locked
 
 
-def resolve_fps(session: Path, rows: list[dict], override: float | None) -> float:
+SESSION_VIDEO_NAMES = ("video.mp4", "phone.mp4", "video.mov", "video.m4v", "raw.mp4")
+
+
+def load_manifest(session: Path) -> dict:
+    """Session manifest, or an empty dict when the session never wrote one."""
+    path = session / "session.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_fps(session: Path,
+                rows: list[dict],
+                override: float | None,
+                container_fps: float | None = None) -> float:
     """Nominal frame rate without requiring a manifest.
 
     A session stopped with Ctrl+C never got its ``session.json``, so fall back
@@ -1326,13 +1344,11 @@ def resolve_fps(session: Path, rows: list[dict], override: float | None) -> floa
     """
     if override:
         return float(override)
-    manifest_path = session / "session.json"
-    if manifest_path.exists():
+    value = load_manifest(session).get("nominal_fps")
+    if value:
         try:
-            value = json.loads(manifest_path.read_text(encoding="utf-8")).get("nominal_fps")
-            if value:
-                return float(value)
-        except (OSError, TypeError, ValueError):
+            return float(value)
+        except (TypeError, ValueError):
             pass
     timestamps = [float(row["timestamp"]) for row in rows
                   if isinstance(row.get("timestamp"), (int, float))]
@@ -1343,7 +1359,140 @@ def resolve_fps(session: Path, rows: list[dict], override: float | None) -> floa
         median = deltas[len(deltas) // 2]
         if median > 0:
             return max(1.0, min(240.0, 1.0 / median))
+    if container_fps:
+        return max(1.0, min(240.0, float(container_fps)))
     return 60.0
+
+
+def find_session_video(session: Path, manifest: dict) -> Path:
+    """Locate the recorded movie for sessions that kept no JPEG frames."""
+    candidates: list[Path] = []
+    recorded = manifest.get("video")
+    if recorded:
+        candidates.append(session / str(recorded))
+    candidates.extend(session / name for name in SESSION_VIDEO_NAMES)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    for suffix in ("*.mp4", "*.mov", "*.m4v"):
+        matches = sorted(session.glob(suffix))
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"{session} 里既没有 frames/ 也没有录像，无法处理"
+    )
+
+
+def load_pose_track(session: Path) -> list[tuple[float, dict]]:
+    """Read the full-rate pose log the phone recorded next to the movie."""
+    path = session / "pose.jsonl"
+    if not path.exists():
+        return []
+    track: list[tuple[float, dict]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            sample = json.loads(line)
+        except ValueError:
+            continue
+        timestamp = sample.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            track.append((float(timestamp), sample))
+    track.sort(key=lambda item: item[0])
+    return track
+
+
+def pose_for_row(row: dict, track: list[tuple[float, dict]]) -> dict:
+    """Pose for one frame: the frame's own sample, else the saved log.
+
+    Phone recordings ship ``pose.jsonl`` at 120 Hz while the frame log only
+    carries the sample nearest to each written frame.  Re-matching from the log
+    keeps rotation compensation working for frames the log never covered.
+    """
+    if row.get("pose") or not track:
+        return row
+    stamp = row.get("timestamp")
+    if not isinstance(stamp, (int, float)):
+        return row
+    sample = min(track, key=lambda item: abs(item[0] - float(stamp)))[1]
+    merged = dict(row)
+    merged["pose"] = sample
+    return merged
+
+
+class SessionFrames:
+    """Frame access for a session, from extracted JPEGs or from the movie.
+
+    ``import_phone_session.py`` still exists for annotation work, but the
+    offline stabiliser can read a phone session straight from ``video.mp4`` and
+    skip the extra JPEG copy entirely.
+    """
+
+    def __init__(self, session: Path, rows: list[dict], manifest: dict):
+        self.session = session
+        self.rows = rows
+        self.uses_frames = any(row.get("frame_path") for row in rows)
+        self.video: Path | None = None
+        self.capture: cv2.VideoCapture | None = None
+        self.container_fps: float | None = None
+        if not self.uses_frames:
+            self.video = find_session_video(session, manifest)
+            capture = cv2.VideoCapture(str(self.video))
+            if not capture.isOpened():
+                raise RuntimeError(f"无法打开录像：{self.video}")
+            container = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            self.container_fps = container if 0.5 < container < 1000 else None
+            self.capture = capture
+
+    def first_frame(self):
+        if self.uses_frames:
+            for row in self.rows:
+                path = row.get("frame_path")
+                if not path:
+                    continue
+                image = cv2.imread(str(self.session / path))
+                if image is not None:
+                    return image
+            return None
+        ok, frame = self.capture.read()
+        if not ok or frame is None:
+            return None
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return frame
+
+    def __iter__(self):
+        if self.uses_frames:
+            for index, row in enumerate(self.rows):
+                path = row.get("frame_path")
+                image = cv2.imread(str(self.session / path)) if path else None
+                yield index, image, row
+            return
+        step = 1.0 / (self.container_fps or 60.0)
+        index = 0
+        while True:
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                break
+            yield index, frame, self.row_for(index, step)
+            index += 1
+
+    def row_for(self, index: int, step: float) -> dict:
+        if index < len(self.rows):
+            return self.rows[index]
+        # The movie kept recording after the log stopped, which happens when a
+        # take is killed mid-write.  Extrapolate the clock so pose matching
+        # still lands on the right samples.
+        stamps = [float(row["timestamp"]) for row in self.rows
+                  if isinstance(row.get("timestamp"), (int, float))]
+        timestamp = stamps[-1] + (index - len(self.rows) + 1) * step if stamps else None
+        return {"frame_id": index + 1, "timestamp": timestamp}
+
+    def close(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
 
 
 def process(args: argparse.Namespace) -> Path:
@@ -1355,11 +1504,14 @@ def process(args: argparse.Namespace) -> Path:
     if not rows:
         raise RuntimeError("会话没有视频帧")
 
-    first_image = cv2.imread(str(session / rows[0]["frame_path"]))
+    manifest = load_manifest(session)
+    source = SessionFrames(session, rows, manifest)
+    first_image = source.first_frame()
     if first_image is None:
-        raise RuntimeError("无法读取会话第一帧")
+        source.close()
+        raise RuntimeError("无法读取会话第一帧：frames/ 和录像都打不开")
     height, width = first_image.shape[:2]
-    fps = resolve_fps(session, rows, args.fps)
+    fps = resolve_fps(session, rows, args.fps, container_fps=source.container_fps)
     output = args.output or session / "processed.mp4"
     output.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -1376,12 +1528,13 @@ def process(args: argparse.Namespace) -> Path:
     plane_tracker = PlaneLockTracker(args.detect_every)
     previous_gray = None
     previous_lock_source = "none"
+    pose_track = load_pose_track(session)
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
-            for index, row in enumerate(rows):
-                frame = cv2.imread(str(session / row["frame_path"]))
+            for index, frame, row in source:
                 if frame is None:
                     continue
+                row = pose_for_row(row, pose_track)
                 rotation, reference = rotation_for_row(row, reference)
                 map_x, map_y = build_remap(
                     width, height, rotation, args.crop, args.fov,
@@ -1495,6 +1648,7 @@ def process(args: argparse.Namespace) -> Path:
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
     finally:
         writer.release()
+        source.close()
         if args.preview:
             cv2.destroyAllWindows()
     print(f"处理完成：{output}")
@@ -1502,7 +1656,7 @@ def process(args: argparse.Namespace) -> Path:
     return output
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session", type=Path)
     parser.add_argument("--output", type=Path)
@@ -1520,13 +1674,23 @@ def main() -> None:
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
     parser.add_argument("--lock-fill", type=float, default=0.64,
                         help="内屏锁定后占画面短边的比例，默认 0.64")
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if not 0.2 <= args.crop <= 1.0:
         parser.error("--crop 应在 0.2 到 1.0 之间")
     if args.detect_every < 1:
         parser.error("--detect-every 必须大于 0")
     if not 0.35 <= args.lock_fill <= 0.90:
         parser.error("--lock-fill 应在 0.35 到 0.90 之间")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
     process(args)
 
 

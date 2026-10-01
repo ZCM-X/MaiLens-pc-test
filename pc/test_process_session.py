@@ -14,8 +14,11 @@ from .process_session import (
     build_remap,
     geometry_margins,
     geometry_reference,
+    load_pose_track,
     map_fisheye_points_to_output,
+    parse_args,
     plausible_geometry_pair,
+    pose_for_row,
     _project_points,
     process,
     quat_to_matrix,
@@ -23,6 +26,7 @@ from .process_session import (
     rotation_for_row,
     update_geometry_lock_state,
 )
+from .test_import_phone_session import write_phone_session
 
 
 class RotationMappingTests(unittest.TestCase):
@@ -325,6 +329,59 @@ class ResolveFpsTests(unittest.TestCase):
             (session / "session.json").write_text("{not json", encoding="utf-8")
             rows = [{"timestamp": 1.0}, {"timestamp": 2.0}]
             self.assertEqual(resolve_fps(session, rows, None), 1.0)
+
+
+class VideoBackedSessionTests(unittest.TestCase):
+    def test_processes_a_phone_session_straight_from_its_movie(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = write_phone_session(Path(workspace) / "20261002-150000")
+            # A phone session has no frames/ directory at all.
+            self.assertFalse((session / "frames").exists())
+
+            output = process(parse_args([str(session)]))
+
+            self.assertEqual(output, session / "processed.mp4")
+            self.assertGreater(output.stat().st_size, 0)
+            debug = [json.loads(line) for line in
+                     (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(debug), 12)
+            self.assertIn("lock_source", debug[0])
+
+    def test_movie_keeps_going_when_the_frame_log_stops_early(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = write_phone_session(Path(workspace) / "short-log", frames=12, logged=5)
+            output = process(parse_args([str(session)]))
+
+            self.assertGreater(output.stat().st_size, 0)
+            debug = [json.loads(line) for line in
+                     (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(debug), 12)
+
+
+class PoseLogTests(unittest.TestCase):
+    def test_pose_log_covers_rows_that_carry_no_pose(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            samples = [
+                {"timestamp": 101.0, "quaternion": {"x": 0.2, "y": 0, "z": 0, "w": 0.98}},
+                {"timestamp": 100.0, "quaternion": {"x": 0.0, "y": 0, "z": 0, "w": 1.0}},
+                {"timestamp": 100.5, "quaternion": {"x": 0.1, "y": 0, "z": 0, "w": 0.99}},
+            ]
+            with (session / "pose.jsonl").open("w", encoding="utf-8") as handle:
+                for sample in samples:
+                    handle.write(json.dumps(sample) + "\n")
+                handle.write("{broken\n")
+
+            track = load_pose_track(session)
+            self.assertEqual([stamp for stamp, _ in track], [100.0, 100.5, 101.0])
+
+            row = {"frame_id": 2, "timestamp": 100.52}
+            merged = pose_for_row(row, track)
+            self.assertAlmostEqual(merged["pose"]["quaternion"]["x"], 0.1)
+            self.assertNotIn("pose", row)
+
+            existing = {"frame_id": 1, "timestamp": 100.0, "pose": {"quaternion": {"x": 9.0}}}
+            self.assertEqual(pose_for_row(existing, track)["pose"]["quaternion"]["x"], 9.0)
 
 
 if __name__ == "__main__":

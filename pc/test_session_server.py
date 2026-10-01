@@ -92,6 +92,7 @@ class SessionServerTests(unittest.TestCase):
                                   args=(server, root / "phone_sessions"),
                                   kwargs={"once": True,
                                           "run_import": True,
+                                          "background_tasks": False,
                                           "sessions_root": root / "offline",
                                           "log": lambda *_: None},
                                   daemon=True)
@@ -107,6 +108,35 @@ class SessionServerTests(unittest.TestCase):
         imported = root / "offline" / "20261002-140000-phone"
         self.assertEqual(len(list((imported / "frames").glob("*.jpg"))), 12)
         self.assertTrue((imported / "capture.jsonl").exists())
+
+    def test_process_flag_runs_the_stabiliser_on_the_received_movie(self):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        root = Path(workspace.name)
+        phone = write_phone_session(root / "source" / "20261002-150500")
+        files = {path.name: path.read_bytes() for path in phone.iterdir() if path.is_file()}
+
+        server = create_server("127.0.0.1", 0)
+        port = server.getsockname()[1]
+        thread = threading.Thread(target=serve_forever,
+                                  args=(server, root / "phone_sessions"),
+                                  kwargs={"once": True,
+                                          "run_process": True,
+                                          "background_tasks": False,
+                                          "log": lambda *_: None},
+                                  daemon=True)
+        thread.start()
+        self.addCleanup(server.close)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=60) as client:
+                reply = push_session(client, "20261002-150500", files)
+        finally:
+            thread.join(timeout=60)
+
+        self.assertTrue(reply.startswith("OK 4 "), reply)
+        received = root / "phone_sessions" / "20261002-150500"
+        self.assertGreater((received / "processed.mp4").stat().st_size, 0)
+        self.assertEqual(len((received / "debug.jsonl").read_text(encoding="utf-8").splitlines()), 12)
 
     def test_bad_magic_is_answered_with_an_error(self):
         workspace = tempfile.TemporaryDirectory()
