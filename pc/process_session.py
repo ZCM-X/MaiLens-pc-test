@@ -828,7 +828,9 @@ class PlaneLockTracker:
 
     def __init__(self, detect_every: int = 12, max_age_frames: int | None = None):
         self.detect_every = max(1, int(detect_every))
-        self.max_age_frames = max_age_frames or max(24, self.detect_every * 10)
+        # Hold a good transform briefly through a missed frame burst, then
+        # reacquire instead of freezing an old plane for several seconds.
+        self.max_age_frames = max_age_frames or max(18, self.detect_every * 4)
         self.reset()
 
     def reset(self) -> None:
