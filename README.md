@@ -1,0 +1,94 @@
+# MaiLens-pc-test
+
+MaiLens-pc-test 是一个独立的“手机采集 → Wi‑Fi → 电脑处理”实验项目。它不改动原来的 MaiLens iPhone 工程，先把手机的超广角视频和同一帧的姿态数据送到电脑，所有稳定、裁切和机台检测算法在电脑上迭代，验证后再移植回 iPhone。
+
+## 当前链路
+
+```text
+iPhone 0.5× 相机
+  ├─ JPEG 视频帧（默认 1280×720，约 15 fps）
+  └─ 同帧姿态（四元数、重力、角速度、时间戳）
+             │ TCP / 局域网
+             ▼
+电脑 pc/pc_receiver.py
+  ├─ sessions/<时间>/frames/*.jpg
+  ├─ sessions/<时间>/capture.jsonl
+  └─ sessions/<时间>/raw.mp4
+             │
+             ▼
+电脑 pc/process_session.py
+  ├─ 姿态数字云台稳定
+  ├─ 可选外框/内屏检测
+  └─ processed.mp4 + debug.jsonl
+```
+
+视频和姿态被放在同一个 TCP 数据包里，电脑端不需要猜测两条流的对应关系。发送端使用有限缓冲，只保留最新待发送帧；电脑或网络变慢时会丢弃旧帧，不会把延迟越积越大。
+
+## 电脑端启动
+
+在 Windows PowerShell 中：
+
+```powershell
+py -m venv .venv
+\.venv\Scripts\python.exe -m pip install -r requirements.txt
+\.venv\Scripts\python.exe pc\pc_receiver.py --host 0.0.0.0 --port 8765 --preview
+```
+
+电脑防火墙允许 Python 监听 TCP 8765。手机和电脑必须在同一个局域网，手机端填写电脑的局域网 IPv4 地址（例如 `192.168.1.23`），不能填写 `127.0.0.1`。
+
+接收停止后，终端会打印会话目录，例如：
+
+```text
+sessions/20261001-153012
+```
+
+用电脑处理：
+
+```powershell
+\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 --output processed.mp4 --preview
+```
+
+默认处理使用姿态四元数建立数字云台变换；它会把第一帧姿态作为锁定方向，并通过边缘反射填补裁切后的空白。`--crop 0.74` 控制保留中心视场，值越小预留的稳定余量越大。
+
+如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在电脑上，先安装可选依赖，然后传模型路径：
+
+```powershell
+py -m pip install ultralytics
+\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
+  --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
+```
+
+检测器只使用 `outer_frame` 和 `inner_screen` 两类几何，不会把谱面的 8 个判定点当成机台锁定目标。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
+
+## iPhone 端构建
+
+这是一个独立的最小采集 App。电脑上安装 XcodeGen 后：
+
+```bash
+xcodegen generate --spec project.yml
+xcodebuild -project MaiLensRemoteCapture.xcodeproj \
+  -scheme MaiLensRemoteCapture \
+  -destination 'generic/platform=iOS' \
+  -configuration Release \
+  -archivePath build/MaiLensRemoteCapture.xcarchive \
+  CODE_SIGNING_ALLOWED=NO archive
+```
+
+App 内填写电脑 IPv4 和端口，点“连接电脑”，再点“开始发送”。连接状态、发送帧率、丢帧数和最近一次姿态时间戳都会显示出来。这个实验版本先用 JPEG/TCP 确认算法和同步关系；链路稳定后再把视频编码替换为 VideoToolbox H.264/HEVC。
+
+## 协议
+
+每个包都是大端序：
+
+```text
+4 bytes  magic = MLCP
+1 byte   version = 1
+1 byte   packet type (1 = frame, 2 = hello)
+4 bytes  metadata JSON length
+4 bytes  JPEG payload length
+N bytes  UTF-8 metadata JSON
+M bytes  JPEG bytes
+```
+
+帧 metadata 至少包含 `frame_id`、`timestamp`、`width`、`height` 和 `pose`。`pose` 里有 `timestamp`、`quaternion(x,y,z,w)`、`gravity`、`rotation_rate`。接收端按包内时间戳写入 `capture.jsonl`，所以后续处理可以复现每帧的姿态补偿。
+

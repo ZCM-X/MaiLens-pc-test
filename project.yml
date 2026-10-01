@@ -1,0 +1,28 @@
+name: MaiLensRemoteCapture
+options:
+  bundleIdPrefix: com.mailens
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    GENERATE_INFOPLIST_FILE: "YES"
+    INFOPLIST_KEY_NSCameraUsageDescription: "把后置超广角视频发送到电脑进行稳定算法测试。"
+    INFOPLIST_KEY_NSMotionUsageDescription: "发送同一视频帧对应的手机姿态，供电脑恢复运动和调试稳定算法。"
+    INFOPLIST_KEY_NSLocalNetworkUsageDescription: "通过局域网把相机视频帧和运动姿态发送到你的电脑。"
+    INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+    SWIFT_EMIT_LOC_STRINGS: "YES"
+targets:
+  MaiLensRemoteCapture:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOS/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mailens.remote-capture
+        PRODUCT_NAME: MaiLensRemoteCapture
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"

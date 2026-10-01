@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.app
+__pycache__/
+.venv/
+sessions/
+*.mp4
+*.mov
+
