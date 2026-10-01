@@ -151,14 +151,16 @@ class LiveProcessor:
             "detected_outer": outer,
             "detected_inner": inner,
             "lock_source": self.lock_source,
+            "lock_anchor": "outer_frame" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
         }
         if self.debug:
+            anchor = "outer" if outer is not None else ("inner" if inner is not None else "none")
             stabilized = draw_debug(
                 stabilized,
                 outer,
                 inner,
-                f"{self.frame_index}  lock={self.lock_source}  zoom={zoom:.2f}",
+                f"{self.frame_index}  lock={self.lock_source}  anchor={anchor}  zoom={zoom:.2f}",
             )
         return stabilized, debug
 

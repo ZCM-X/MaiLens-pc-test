@@ -709,6 +709,7 @@ def process(args: argparse.Namespace) -> Path:
                     "detected_outer": outer,
                     "detected_inner": inner,
                     "lock_source": lock_source,
+                    "lock_anchor": "outer_frame" if outer is not None else ("inner_screen" if inner is not None else "none"),
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
     finally:
         writer.release()
