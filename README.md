@@ -10,16 +10,11 @@ iPhone 0.5× 相机
   └─ 同帧姿态（四元数、重力、角速度、时间戳）
              │ TCP / 局域网
              ▼
-电脑 pc/pc_receiver.py
+电脑 pc/pc_receiver.py（可实时处理）
   ├─ sessions/<时间>/frames/*.jpg
   ├─ sessions/<时间>/capture.jsonl
-  └─ sessions/<时间>/raw.mp4
-             │
-             ▼
-电脑 pc/process_session.py
-  ├─ 姿态数字云台稳定
-  ├─ 可选外框/内屏检测
-  └─ processed.mp4 + debug.jsonl
+  ├─ sessions/<时间>/raw.mp4
+  └─ sessions/<时间>/processed-live.mp4（实时模式）
 ```
 
 视频和姿态被放在同一个 TCP 数据包里，电脑端不需要猜测两条流的对应关系。发送端使用有限缓冲，只保留最新待发送帧；电脑或网络变慢时会丢弃旧帧，不会把延迟越积越大。
@@ -31,18 +26,19 @@ iPhone 0.5× 相机
 ```powershell
 py -m venv .venv
 \.venv\Scripts\python.exe -m pip install -r requirements.txt
-\.venv\Scripts\python.exe pc\pc_receiver.py --host 0.0.0.0 --port 8765 --preview
+\.venv\Scripts\python.exe pc\pc_receiver.py --host 0.0.0.0 --port 8765 `
+  --process-live --preview
 ```
 
 电脑防火墙允许 Python 监听 TCP 8765。手机和电脑必须在同一个局域网，手机端填写电脑的局域网 IPv4 地址（例如 `192.168.1.23`），不能填写 `127.0.0.1`。
 
-接收停止后，终端会打印会话目录，例如：
+这条命令会在收到每个视频帧后立即处理并显示结果。按 `q` 或 `Ctrl+C` 停止，终端会打印会话目录，例如：
 
 ```text
 sessions/20261001-153012
 ```
 
-用电脑处理：
+实时模式会同时保存 `raw.mp4` 和 `processed-live.mp4`。如果先只采集原始数据，之后再离线调参，可以用：
 
 ```powershell
 \.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 --output processed.mp4 --preview
@@ -52,7 +48,17 @@ sessions/20261001-153012
 
 处理器默认载入当前 MaiLens 的鱼眼参数（中心 `0.501753869, 0.499423644`、`k1=0.0893163`、`k2=-0.0174637`、输出视场角 `106.4583°`），所以电脑生成的结果会先做鱼眼反变换，再做姿态稳定。参数可以直接用 `--center-x`、`--center-y`、`--k1`、`--k2` 和 `--fov` 覆盖。
 
-如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在电脑上，先安装可选依赖，然后传模型路径：
+如果要让实时模式同时做机台外框/内屏锁定，先安装可选依赖，然后传模型路径：
+
+```powershell
+py -m pip install ultralytics
+\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
+  --process-live --preview --model models\frame-geometry-yolo11n-v2.onnx
+```
+
+实时检测默认每 3 帧运行一次，帧间沿用平滑结果，避免模型推理把网络延迟越积越大。`--debug` 可以在实时画面叠加外框、内屏、中心和缩放信息。
+
+如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在离线处理上：
 
 ```powershell
 py -m pip install ultralytics

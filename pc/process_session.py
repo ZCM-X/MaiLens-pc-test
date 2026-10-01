@@ -41,6 +41,17 @@ def rotation_for_row(row: dict, reference: np.ndarray | None) -> tuple[np.ndarra
     return relative, reference
 
 
+def make_output_rays(width: int, height: int, crop: float, fov_deg: float) -> np.ndarray:
+    """Precompute rectilinear output rays so live processing reuses the grid."""
+    virtual_focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    x = (xx - width * 0.5) / max(virtual_focal * crop, 1.0)
+    y = (yy - height * 0.5) / max(virtual_focal * crop, 1.0)
+    rays = np.stack((x, y, np.ones_like(x)), axis=-1)
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    return rays
+
+
 def build_remap(
     width: int,
     height: int,
@@ -51,15 +62,11 @@ def build_remap(
     k2: float,
     center_x: float,
     center_y: float,
+    output_rays: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map a stabilized rectilinear output ray into the raw clip-on fisheye."""
-    virtual_focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
     source_focal = max(width, height) * 772.4089 / 4032.0
-    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    x = (xx - width * 0.5) / max(virtual_focal * crop, 1.0)
-    y = (yy - height * 0.5) / max(virtual_focal * crop, 1.0)
-    rays = np.stack((x, y, np.ones_like(x)), axis=-1)
-    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    rays = output_rays if output_rays is not None else make_output_rays(width, height, crop, fov_deg)
     source = rays @ rotation.T
     radial = np.linalg.norm(source[..., :2], axis=-1)
     theta = np.arccos(np.clip(source[..., 2], -1.0, 1.0))
