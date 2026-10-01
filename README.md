@@ -76,6 +76,8 @@ xcodebuild -project MaiLensRemoteCapture.xcodeproj \
 
 App 内填写电脑 IPv4 和端口，点“连接电脑”，再点“开始发送”。连接状态、发送帧率、丢帧数和最近一次姿态时间戳都会显示出来。这个实验版本先用 JPEG/TCP 确认算法和同步关系；链路稳定后再把视频编码替换为 VideoToolbox H.264/HEVC。
 
+仓库还附带 `codemagic.yaml`，会生成 `MaiLensRemoteCapture-unsigned.ipa`。它不签名，拿到 IPA 后可以继续用你的第三方工具签名。
+
 ## 协议
 
 每个包都是大端序：
@@ -91,4 +93,3 @@ M bytes  JPEG bytes
 ```
 
 帧 metadata 至少包含 `frame_id`、`timestamp`、`width`、`height` 和 `pose`。`pose` 里有 `timestamp`、`quaternion(x,y,z,w)`、`gravity`、`rotation_rate`。接收端按包内时间戳写入 `capture.jsonl`，所以后续处理可以复现每帧的姿态补偿。
-
