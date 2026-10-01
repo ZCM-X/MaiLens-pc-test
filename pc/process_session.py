@@ -1120,7 +1120,10 @@ def process(args: argparse.Namespace) -> Path:
                         borderMode=cv2.BORDER_REFLECT101,
                     )
                     outer = transform_box_homography(outer, plane_matrix)
-                    inner = transform_box_homography(inner, plane_matrix)
+                    inner = transform_box_homography(
+                        plane_tracker.reference_box,
+                        plane_tracker.reference_to_output,
+                    )
                     center = np.array([0.5, 0.5], dtype=np.float32)
                     zoom = 1.0
                     lock_source = "plane_homography"

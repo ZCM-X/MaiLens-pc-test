@@ -190,7 +190,13 @@ class LiveProcessor:
                 borderMode=cv2.BORDER_REFLECT101,
             )
             outer = transform_box_homography(outer, plane_matrix)
-            inner = transform_box_homography(inner, plane_matrix)
+            # The current detector rectangle is allowed to jitter.  The
+            # green debug frame represents the latched output plane instead,
+            # so the overlay visualizes the lock rather than detector noise.
+            inner = transform_box_homography(
+                self.plane_tracker.reference_box,
+                self.plane_tracker.reference_to_output,
+            )
             # The perspective transform already contains translation, scale
             # and tilt compensation.  Do not apply a second affine crop.
             center = np.array([0.5, 0.5], dtype=np.float32)
