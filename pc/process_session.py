@@ -1529,18 +1529,29 @@ def process(args: argparse.Namespace) -> Path:
     previous_gray = None
     previous_lock_source = "none"
     pose_track = load_pose_track(session)
+    lens_fix = not getattr(args, "no_fisheye", False)
+    max_frames = getattr(args, "max_frames", None)
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
             for index, frame, row in source:
                 if frame is None:
                     continue
+                if max_frames and index >= max_frames:
+                    break
                 row = pose_for_row(row, pose_track)
-                rotation, reference = rotation_for_row(row, reference)
-                map_x, map_y = build_remap(
-                    width, height, rotation, args.crop, args.fov,
-                    args.k1, args.k2, args.center_x, args.center_y,
-                )
-                stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+                if lens_fix:
+                    rotation, reference = rotation_for_row(row, reference)
+                    map_x, map_y = build_remap(
+                        width, height, rotation, args.crop, args.fov,
+                        args.k1, args.k2, args.center_x, args.center_y,
+                    )
+                    stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
+                                           borderMode=cv2.BORDER_REFLECT101)
+                else:
+                    # A clip the phone recorded outside this rig has no
+                    # calibration, so locking the machine plane straight on the
+                    # raw frames beats warping it through the wrong lens model.
+                    stabilized = frame
                 current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
                 if previous_gray is not None and previous_gray.shape != current_gray.shape:
                     previous_gray = None
@@ -1555,14 +1566,17 @@ def process(args: argparse.Namespace) -> Path:
                     lock_tracker.update_flow(previous_gray, current_gray)
                 if args.model and index % args.detect_every == 0:
                     detected_outer_raw, detected_inner_raw = detector.detect(frame)
-                    detected_outer = map_fisheye_box_to_output(
-                        detected_outer_raw, width, height, rotation, args.crop, args.fov,
-                        args.k1, args.k2, args.center_x, args.center_y,
-                    )
-                    detected_inner = map_fisheye_box_to_output(
-                        detected_inner_raw, width, height, rotation, args.crop, args.fov,
-                        args.k1, args.k2, args.center_x, args.center_y,
-                    )
+                    if lens_fix:
+                        detected_outer = map_fisheye_box_to_output(
+                            detected_outer_raw, width, height, rotation, args.crop, args.fov,
+                            args.k1, args.k2, args.center_x, args.center_y,
+                        )
+                        detected_inner = map_fisheye_box_to_output(
+                            detected_inner_raw, width, height, rotation, args.crop, args.fov,
+                            args.k1, args.k2, args.center_x, args.center_y,
+                        )
+                    else:
+                        detected_outer, detected_inner = detected_outer_raw, detected_inner_raw
                     lock_tracker.ingest(
                         detected_outer,
                         detected_inner,
@@ -1674,6 +1688,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
     parser.add_argument("--lock-fill", type=float, default=0.64,
                         help="内屏锁定后占画面短边的比例，默认 0.64")
+    parser.add_argument("--no-fisheye", action="store_true",
+                        help="不做鱼眼→直线矫正，直接在原始帧上锁机台（没有标定的素材用这个）")
+    parser.add_argument("--max-frames", type=int,
+                        help="只处理前 N 帧，用来快速试参数")
     return parser
 
 

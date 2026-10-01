@@ -357,6 +357,17 @@ class VideoBackedSessionTests(unittest.TestCase):
                      (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(len(debug), 12)
 
+    def test_no_fisheye_and_max_frames_lock_the_raw_geometry(self):
+        # An already-rectified clip must not go through the fisheye model again.
+        with tempfile.TemporaryDirectory() as workspace:
+            session = write_phone_session(Path(workspace) / "rectified")
+            output = process(parse_args([str(session), "--no-fisheye", "--max-frames", "4"]))
+
+            self.assertTrue(output.exists())
+            debug = [json.loads(line) for line in
+                     (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(debug), 4)
+
 
 class PoseLogTests(unittest.TestCase):
     def test_pose_log_covers_rows_that_carry_no_pose(self):
