@@ -164,6 +164,34 @@ class SessionServerTests(unittest.TestCase):
         self.assertTrue(reply.startswith(b"ERR"), reply)
         self.assertEqual(list(root.iterdir()), [])
 
+    def test_frame_stream_on_the_upload_port_explains_the_port_mixup(self):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        root = Path(workspace.name)
+        server = create_server("127.0.0.1", 0)
+        port = server.getsockname()[1]
+        thread = threading.Thread(target=serve_forever,
+                                  args=(server, root),
+                                  kwargs={"once": True, "log": lambda *_: None},
+                                  daemon=True)
+        thread.start()
+        self.addCleanup(server.close)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=20) as client:
+                client.sendall(b"MLCP" + bytes([1]) + b"\x00\x00")
+                reply = b""
+                while not reply.endswith(b"\n"):
+                    chunk = client.recv(128)
+                    if not chunk:
+                        break
+                    reply += chunk
+        finally:
+            thread.join(timeout=20)
+
+        text = reply.decode("utf-8")
+        self.assertTrue(text.startswith("ERR"), text)
+        self.assertIn("8765", text)
+
 
 class SafeComponentTests(unittest.TestCase):
     def test_strips_directories_and_empty_names(self):

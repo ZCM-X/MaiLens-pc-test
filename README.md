@@ -189,6 +189,8 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 
 `process_session.py` 两种输入都吃：有 `frames/*.jpg` 的老会话照旧逐张读；手机上只有 `video.mp4` 时就直接解码视频，按帧号和 `capture.jsonl` 对齐，缺姿态的帧再从 120 Hz 的 `pose.jsonl` 里就近取；录像比日志长（中途被杀掉）就按最后一帧的时钟外推，整段照样跑完。`import_phone_session.py` 只在需要 JPEG 帧做标注时才用，它把视频解成 `frames/*.jpg` 并给 `capture.jsonl` 补上 `frame_path`。
 
+如果 `session_server.py` 报 `bad magic` 或提示 `MLCP`，那是手机 App 里的端口被填成了上传端口：改回推流端口（默认 8765），上传端口由 App 自己用「推流端口 +1」算出来，不用手填。
+
 ## iPhone 端构建
 
 这是一个独立的最小采集 App。电脑上安装 XcodeGen 后：

@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 MAGIC = b"MLSF"
+STREAM_MAGIC = b"MLCP"
 VERSION = 1
 MAX_FIELD = 4096
 MAX_FILE = 1 << 40
@@ -75,8 +76,15 @@ def receive_session(connection: socket.socket,
                     output_root: Path,
                     log=print) -> tuple[Path, int, int]:
     reader = Reader(connection)
-    if reader.read_exactly(4) != MAGIC:
-        raise ProtocolError("bad magic; is that really the phone uploader?")
+    magic = reader.read_exactly(4)
+    if magic != MAGIC:
+        if magic == STREAM_MAGIC:
+            raise ProtocolError(
+                "this is the frame stream (MLCP), so the port in the phone app is set to the "
+                "upload port. Set it back to 8765: the app derives the upload port (8765 + 1) "
+                "by itself, and this server only accepts finished recordings."
+            )
+        raise ProtocolError(f"bad magic {magic!r}; is that really the phone uploader?")
     version = reader.read_exactly(1)[0]
     if version != VERSION:
         raise ProtocolError(f"unsupported protocol version {version}")
@@ -249,7 +257,9 @@ def serve(host: str,
     with server:
         bound = server.getsockname()[1]
         log(f"MaiLens session upload listening on {host}:{bound}")
-        log("In the phone app tap 发送到电脑 on a recording; the frame stream can keep running.")
+        log("This port takes finished recordings only.")
+        log(f"Keep the port in the phone app at {max(bound - 1, 1)} for the frame stream;")
+        log("the app adds one for uploads, and tapping 发送到电脑 does the rest.")
         try:
             serve_forever(server, output_root,
                           run_import=run_import,

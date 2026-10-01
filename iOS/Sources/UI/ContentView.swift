@@ -199,7 +199,7 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 86)
             }
-            Text("手机和电脑需连接同一个 Wi‑Fi。先在电脑运行接收程序，再开始发送。")
+            Text("手机和电脑需连接同一个 Wi‑Fi。端口填推流端口（默认 8765）；录制推送会自动用 8766，也就是推流端口 +1，不要把它填到这里。")
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.48))
         }
