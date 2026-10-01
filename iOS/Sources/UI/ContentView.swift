@@ -142,9 +142,30 @@ struct ContentView: View {
                 }
             }
             .font(.system(size: 11, weight: .semibold, design: .monospaced))
+
+            if let upload = uploadLine {
+                Text(upload.text)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(upload.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(16)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private var uploadLine: (text: String, color: Color)? {
+        switch capture.uploadState {
+        case .idle:
+            return nil
+        case .sending(let progress):
+            return (String(format: "正在发送到电脑 %.0f%%", progress * 100), .mint)
+        case .finished(let bytes):
+            let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            return ("已把 \(size) 发到电脑，接着在电脑跑 import_phone_session.py。", .mint)
+        case .failed(let message):
+            return (message, .orange)
+        }
     }
 
     private func statTile(_ title: String, _ value: String) -> some View {
@@ -277,13 +298,21 @@ struct ContentView: View {
                 .foregroundStyle(.white.opacity(0.45))
 
             HStack(spacing: 8) {
-                Button { share(recording) } label: {
-                    Label("导出", systemImage: "square.and.arrow.up")
+                Button { capture.sendToPC(recording, host: host, port: port) } label: {
+                    Label("发到电脑", systemImage: "wifi")
                         .font(.system(size: 12, weight: .semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 9)
                         .foregroundStyle(Color.mint)
                         .background(Color.mint.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+                }
+                Button { share(recording) } label: {
+                    Label("导出", systemImage: "square.and.arrow.up")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 }
                 Button { pendingDelete = recording } label: {
                     Label("删除", systemImage: "trash")
@@ -300,7 +329,7 @@ struct ContentView: View {
     }
 
     private var footer: some View {
-        Text("推流用来实时调试；本地录制把原始 60fps 画面和 120Hz 姿态直接写进手机，不经过网络，之后可以整段拷到电脑离线跑稳定和机台锁定。")
+        Text("推流用来实时调试；本地录制把原始 60fps 画面和 120Hz 姿态写进手机，不经过 JPEG。录完点“发到电脑”走局域网送到电脑，没连电脑也能先存着，之后整段拷过去离线跑稳定和机台锁定。")
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(.white.opacity(0.5))
             .fixedSize(horizontal: false, vertical: true)

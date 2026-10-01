@@ -13,6 +13,7 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var isRecording = false
     @Published private(set) var recordingStatus = SessionRecorder.Status()
+    @Published private(set) var uploadState = SessionUploader.State.idle
     /// Bumped whenever a finished session becomes visible on disk.
     @Published private(set) var libraryRevision = 0
 
@@ -23,9 +24,12 @@ final class CaptureController: NSObject, ObservableObject {
     private let sender = RemoteFrameSender()
     private let motion = MotionPoseProvider()
     private let recorder = SessionRecorder()
+    private let uploader = SessionUploader()
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let targetFrameRate: Int32 = 60
     private var configured = false
+    private var streamHost = ""
+    private var streamPort: UInt16 = 8765
     private var lastSentTimestamp: Double = 0
     private var lastStatsTimestamp = Date.timeIntervalSinceReferenceDate
     private var statsFrameCount = 0
@@ -38,10 +42,16 @@ final class CaptureController: NSObject, ObservableObject {
         }
         motion.onSample = { [weak self] pose in self?.recorder.log(pose: pose) }
         recorder.onStatus = { [weak self] status in self?.recordingStatus = status }
-        recorder.onFinished = { [weak self] _ in
-            self?.isRecording = false
-            self?.libraryRevision += 1
+        recorder.onFinished = { [weak self] recording in
+            guard let self else { return }
+            self.isRecording = false
+            self.libraryRevision += 1
+            // Already talking to the PC, so hand the take over without a tap.
+            if self.isRunning, !self.streamHost.isEmpty {
+                self.sendToPC(recording, host: self.streamHost, port: self.streamPort)
+            }
         }
+        uploader.onState = { [weak self] state in self?.uploadState = state }
     }
 
     func connect(host: String, port: UInt16) {
@@ -50,6 +60,8 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         errorMessage = nil
+        streamHost = host
+        streamPort = port
         motion.start()
         sender.connect(host: host, port: port)
         startCamera()
@@ -84,6 +96,21 @@ final class CaptureController: NSObject, ObservableObject {
         guard isRecording else { return }
         isRecording = false
         recorder.stop()
+    }
+
+    /// The PC listens one port above the frame stream for whole sessions.
+    static func uploadPort(for streamPort: UInt16) -> UInt16 {
+        streamPort < UInt16.max ? streamPort + 1 : streamPort
+    }
+
+    func sendToPC(_ recording: SessionRecorder.Recording, host: String, port: UInt16) {
+        let target = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            errorMessage = "先填电脑 IP 再发送录制。"
+            return
+        }
+        errorMessage = nil
+        uploader.upload(recording, host: target, port: Self.uploadPort(for: port))
     }
 
     private func startCamera() {

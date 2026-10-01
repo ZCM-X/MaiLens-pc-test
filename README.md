@@ -23,9 +23,10 @@ iPhone 本地录制（App 内“开始录制”）
        ├─ capture.jsonl（每帧时间戳 + 最近姿态）
        ├─ pose.jsonl（120 Hz 四元数/重力/角速度/用户加速度）
        └─ session.json（清单）
-             │ 爱思助手 / “文件”App / 分享
+             │ 局域网“发到电脑”（端口 +1），或爱思助手 / “文件”App
              ▼
-电脑 pc/import_phone_session.py → sessions/<时间>-phone/ → pc/process_session.py
+电脑 pc/session_server.py → phone_sessions/<时间>/
+  └─ pc/import_phone_session.py → sessions/<时间>-phone/ → pc/process_session.py
 ```
 
 视频和姿态被放在同一个 TCP 数据包里，电脑端不需要猜测两条流的对应关系。发送端使用有限缓冲，只保留最新待发送帧；电脑或网络变慢时会丢弃旧帧，不会把延迟越积越大。
@@ -161,12 +162,23 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 - `pose.jsonl`：120 Hz 姿态全量日志，字段和推流协议里的 `pose` 完全一致，另带 `user_acceleration`（去掉重力后的加速度，做前后移动补偿用）。
 - `session.json`：帧数、姿态样本数、时长、丢帧、时钟说明。
 
-每次录制按时间写进手机上的 `MaiLensSessions/<yyyyMMdd-HHmmss>/`。导出有三条路：每条会话右侧的“导出”按钮（存到“文件”或分享出去）、手机“文件 → 我的 iPhone → MaiLensRemoteCapture”、或者用爱思助手直接拷整个文件夹到电脑。
+每次录制按时间写进手机上的 `MaiLensSessions/<yyyyMMdd-HHmmss>/`，拿到电脑上有四种办法，前两种就在 App 里：
+
+- “发到电脑”（推荐）：走局域网直接推到电脑，不用线、不用第三方工具。电脑上先起接收端，端口固定是推流端口 +1（默认 8766），加 `--import` 就收到即抽帧成 `sessions/<名字>-phone/`，不加则只把原始文件收进 `phone_sessions/`。只要手机正连着电脑推流，录完会自动发送这一段；没在推流就手动点“发到电脑”。
+- “导出”：存到“文件”或分享出去。
+- 手机“文件 → 我的 iPhone → MaiLensRemoteCapture”里按时间找文件夹。
+- 用爱思助手直接拷整个文件夹。
 
 拷到电脑后先转成和实时会话同构的目录，再跑离线处理：
 
 ```powershell
+# 电脑端接收（另开一个终端，手机点“发到电脑”之前先跑起来）
+.\.venv\Scripts\python.exe pc\session_server.py --import
+
+# 手动导入（用了上面的 --import 就不用跑这条）
 .\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"
+
+# 离线稳定 / 机台锁定
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261002-153000-phone `
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-phone.mp4 --debug
 ```
