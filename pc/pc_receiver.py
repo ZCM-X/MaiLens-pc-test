@@ -33,6 +33,12 @@ def create_session(root: Path) -> Path:
     return directory
 
 
+def scale_box(box, scale_x: float, scale_y: float):
+    if box is None:
+        return None
+    return tuple(int(round(value * scale)) for value, scale in zip(box, (scale_x, scale_y, scale_x, scale_y)))
+
+
 def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.Namespace) -> Path:
     session = create_session(args.output_dir)
     print(f"\n手机已连接：{address[0]}:{address[1]}")
@@ -59,6 +65,10 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
         print("实时处理：鱼眼矫正 + 姿态云台已开启" + (" + 机台检测" if args.model else ""))
     frame_count = 0
     last_report = time.monotonic()
+    report_frame_count = 0
+    display_fps = 0.0
+    processing_scale = float(getattr(args, "processing_scale", 1.0))
+    processing_scale = min(max(processing_scale, 0.25), 1.0)
     try:
         with log_path.open("w", encoding="utf-8", buffering=1) as log_file, \
              processed_log_path.open("w", encoding="utf-8", buffering=1) as processed_log:
@@ -117,7 +127,28 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
                 processed = image
                 processed_row = None
                 if live_processor is not None:
-                    processed, processed_row = live_processor.process(image, metadata)
+                    live_image = image
+                    if processing_scale < 0.999:
+                        live_image = cv2.resize(
+                            image,
+                            (max(1, int(round(width * processing_scale))),
+                             max(1, int(round(height * processing_scale)))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    processed, processed_row = live_processor.process(live_image, metadata)
+                    if processing_scale < 0.999:
+                        processed = cv2.resize(processed, (width, height), interpolation=cv2.INTER_LINEAR)
+                        if processed_row is not None:
+                            processed_row["detected_outer"] = scale_box(
+                                processed_row.get("detected_outer"),
+                                1.0 / processing_scale,
+                                1.0 / processing_scale,
+                            )
+                            processed_row["detected_inner"] = scale_box(
+                                processed_row.get("detected_inner"),
+                                1.0 / processing_scale,
+                                1.0 / processing_scale,
+                            )
                     if processed_writer is None:
                         processed_path = session / "processed-live.mp4"
                         processed_writer = cv2.VideoWriter(
@@ -131,11 +162,12 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
                     processed_writer.write(processed)
                     processed_log.write(json.dumps(processed_row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 frame_count += 1
+                report_frame_count += 1
 
                 if args.preview:
                     shown = processed.copy() if live_processor is not None else image.copy()
                     mode = "LIVE" if live_processor is not None else "RAW"
-                    cv2.putText(shown, f"{mode}  {frame_count}  {args.fps:.0f} fps", (14, 30),
+                    cv2.putText(shown, f"{mode}  {display_fps:.1f}/{args.fps:.0f} fps", (14, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 255, 190), 2, cv2.LINE_AA)
                     cv2.imshow("MaiLens PC receiver", shown)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -143,7 +175,9 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
 
                 now = time.monotonic()
                 if now - last_report >= 2:
-                    print(f"已接收 {frame_count} 帧 · 当前 {width}×{height} · 姿态时间差 {row['sensor_delta_ms'] if row['sensor_delta_ms'] is not None else '无'} ms")
+                    display_fps = report_frame_count / max(now - last_report, 0.001)
+                    print(f"已接收 {frame_count} 帧 · 实际 {display_fps:.1f}/{args.fps:.0f} fps · 当前 {width}×{height} · 姿态时间差 {row['sensor_delta_ms'] if row['sensor_delta_ms'] is not None else '无'} ms")
+                    report_frame_count = 0
                     last_report = now
     finally:
         if video_writer is not None:
@@ -176,6 +210,8 @@ def main() -> None:
     parser.add_argument("--preview", action="store_true", help="显示接收画面，按 q 结束")
     parser.add_argument("--process-live", action="store_true",
                         help="收到每帧后立即做鱼眼矫正和姿态稳定，并实时预览/保存")
+    parser.add_argument("--processing-scale", type=float, default=0.5,
+                        help="实时鱼眼处理比例，默认 0.5 以接近 60 fps；原始帧仍保存全分辨率")
     parser.add_argument("--model", type=Path, help="可选外框/内屏模型；与 --process-live 一起使用")
     parser.add_argument("--debug", action="store_true", help="实时画面叠加检测框、中心和缩放")
     parser.add_argument("--crop", type=float, default=0.74)
@@ -190,6 +226,8 @@ def main() -> None:
         parser.error("--port 必须在 1 到 65535 之间")
     if args.fps <= 0:
         parser.error("--fps 必须大于 0")
+    if not 0.25 <= args.processing_scale <= 1.0:
+        parser.error("--processing-scale 应在 0.25 到 1.0 之间")
     if not 0.2 <= args.crop <= 1.0:
         parser.error("--crop 应在 0.2 到 1.0 之间")
     if args.detect_every < 1:

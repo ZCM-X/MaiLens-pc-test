@@ -70,13 +70,17 @@ def build_remap(
     """Map a stabilized rectilinear output ray into the raw clip-on fisheye."""
     source_focal = max(width, height) * 772.4089 / 4032.0
     rays = output_rays if output_rays is not None else make_output_rays(width, height, crop, fov_deg)
-    source = rays @ rotation.T
-    radial = np.linalg.norm(source[..., :2], axis=-1)
+    # OpenCV's C implementation is substantially faster than a Python-side
+    # matrix multiply for the live path. The output ray is a column vector,
+    # so this is equivalent to `rays @ rotation.T` for the row-shaped grid.
+    source = cv2.transform(rays, rotation)
+    radial = cv2.magnitude(source[..., 0], source[..., 1])
     theta = np.arccos(np.clip(source[..., 2], -1.0, 1.0))
     theta2 = theta * theta
     theta_distorted = theta * (1.0 + k1 * theta2 + k2 * theta2 * theta2)
-    direction_x = np.divide(source[..., 0], radial, out=np.zeros_like(radial), where=radial > 1e-6)
-    direction_y = np.divide(source[..., 1], radial, out=np.zeros_like(radial), where=radial > 1e-6)
+    safe_radial = np.maximum(radial, 1e-6)
+    direction_x = source[..., 0] / safe_radial
+    direction_y = source[..., 1] / safe_radial
     map_x = (center_x * width + source_focal * direction_x * theta_distorted).astype(np.float32)
     map_y = (center_y * height + source_focal * direction_y * theta_distorted).astype(np.float32)
     return map_x, map_y

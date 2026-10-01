@@ -38,6 +38,7 @@ class LiveReceiverTests(unittest.TestCase):
                     detect_every=3,
                     debug=False,
                     preview=False,
+                    processing_scale=0.5,
                 )
                 result = []
 
@@ -70,6 +71,10 @@ class LiveReceiverTests(unittest.TestCase):
                 self.assertTrue((session / "raw.mp4").exists())
                 self.assertTrue((session / "processed-live.mp4").exists())
                 self.assertEqual(len((session / "processed.jsonl").read_text(encoding="utf-8").splitlines()), 3)
+                processed_video = cv2.VideoCapture(str(session / "processed-live.mp4"))
+                self.assertEqual(int(processed_video.get(cv2.CAP_PROP_FRAME_WIDTH)), 320)
+                self.assertEqual(int(processed_video.get(cv2.CAP_PROP_FRAME_HEIGHT)), 180)
+                processed_video.release()
 
 
 if __name__ == "__main__":
