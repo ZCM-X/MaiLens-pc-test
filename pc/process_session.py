@@ -231,6 +231,16 @@ class GeometryDetector:
 
 def draw_debug(frame: np.ndarray, outer, inner, text: str) -> np.ndarray:
     result = frame.copy()
+    height, width = result.shape[:2]
+    cv2.drawMarker(
+        result,
+        (width // 2, height // 2),
+        (255, 255, 255),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=max(12, min(width, height) // 18),
+        thickness=1,
+        line_type=cv2.LINE_AA,
+    )
     if outer:
         cv2.rectangle(result, outer[:2], outer[2:], (40, 210, 255), 2)
     if inner:
