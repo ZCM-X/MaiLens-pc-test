@@ -438,6 +438,37 @@ def plausible_geometry_pair(outer, inner) -> bool:
     return 0.12 <= width_ratio <= 0.90 and 0.12 <= height_ratio <= 0.90
 
 
+def soft_geometry_pair(outer, inner) -> bool:
+    """Accept a mapped pair whose corners grew slightly during fisheye warp.
+
+    Raw detector boxes are strictly contained. After inverse-fisheye mapping,
+    a corner can cross the other box by a few percent even though both boxes
+    came from the same machine. This softer gate is only used for that paired
+    result; unrelated duplicate boxes still go through the strict gate.
+    """
+    if outer is None or inner is None:
+        return False
+    ox0, oy0, ox1, oy1 = (float(value) for value in outer)
+    ix0, iy0, ix1, iy1 = (float(value) for value in inner)
+    ow, oh = ox1 - ox0, oy1 - oy0
+    iw, ih = ix1 - ix0, iy1 - iy0
+    if min(ow, oh, iw, ih) <= 4.0:
+        return False
+    outer_area = ow * oh
+    inner_area = iw * ih
+    if outer_area <= inner_area * 1.08:
+        return False
+    overlap_width = max(0.0, min(ox1, ix1) - max(ox0, ix0))
+    overlap_height = max(0.0, min(oy1, iy1) - max(oy0, iy0))
+    if overlap_width * overlap_height / max(inner_area, 1.0) < 0.78:
+        return False
+    if not (0.45 <= iw / ow <= 1.35 and 0.25 <= ih / oh <= 1.35):
+        return False
+    outer_center = np.array([(ox0 + ox1) * 0.5, (oy0 + oy1) * 0.5], dtype=np.float32)
+    inner_center = np.array([(ix0 + ix1) * 0.5, (iy0 + iy1) * 0.5], dtype=np.float32)
+    return float(np.linalg.norm((inner_center - outer_center) / np.array([ow, oh], dtype=np.float32))) < 0.35
+
+
 def transform_box(box, matrix: np.ndarray):
     if box is None:
         return None
@@ -488,6 +519,158 @@ def transform_box_homography(
     return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
 
 
+def expand_box(box: tuple[int, int, int, int] | None, scale: float) -> tuple[int, int, int, int] | None:
+    """Expand an xyxy box around its centre for the machine-ring overlay."""
+    if box is None:
+        return None
+    cx = (box[0] + box[2]) * 0.5
+    cy = (box[1] + box[3]) * 0.5
+    half_width = max((box[2] - box[0]) * float(scale) * 0.5, 1.0)
+    half_height = max((box[3] - box[1]) * float(scale) * 0.5, 1.0)
+    return (
+        int(round(cx - half_width)),
+        int(round(cy - half_height)),
+        int(round(cx + half_width)),
+        int(round(cy + half_height)),
+    )
+
+
+def apply_plane_lock(
+    frame: np.ndarray,
+    matrix: np.ndarray,
+    target_inner_box: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Composite the locked machine plane over the live background.
+
+    Warping the complete fisheye frame and reflecting its borders duplicates
+    walls and tables around the machine. The desired effect is an anchored
+    machine foreground, so only a feathered ellipse around the fixed screen
+    and button ring is taken from the projective warp; the current background
+    remains untouched and can move naturally behind it.
+    """
+    height, width = frame.shape[:2]
+    warped = cv2.warpPerspective(
+        frame,
+        np.asarray(matrix, dtype=np.float32),
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    valid_source = cv2.warpPerspective(
+        np.full((height, width), 255, dtype=np.uint8),
+        np.asarray(matrix, dtype=np.float32),
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    if target_inner_box is None:
+        return warped
+    x0, y0, x1, y1 = target_inner_box
+    center = (int(round((x0 + x1) * 0.5)), int(round((y0 + y1) * 0.5)))
+    half_width = max((x1 - x0) * 0.5, 8.0)
+    half_height = max((y1 - y0) * 0.5, 8.0)
+    # The physical button ring extends beyond the inner display by roughly a
+    # third. Cap the mask at the image boundary but keep a broad ellipse so
+    # all eight buttons are included in the locked foreground.
+    axes = (
+        max(8, int(round(min(width * 0.60, half_width * 1.72)))),
+        max(8, int(round(min(height * 0.60, half_height * 1.72)))),
+    )
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.ellipse(mask, center, axes, 0.0, 0.0, 360.0, 255, -1)
+    feather = max(9, int(round(min(axes) * 0.06)) * 2 + 1)
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+    mask = cv2.bitwise_and(mask, valid_source)
+    alpha = (mask.astype(np.float32) / 255.0)[..., None]
+    return np.clip(warped.astype(np.float32) * alpha + frame.astype(np.float32) * (1.0 - alpha), 0, 255).astype(np.uint8)
+
+
+def _warp_with_valid_source(
+    frame: np.ndarray,
+    matrix: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp a frame and return a 0..1 mask for pixels with a source sample."""
+    height, width = frame.shape[:2]
+    if matrix is None or not np.isfinite(matrix).all():
+        return frame.copy(), np.zeros((height, width), dtype=np.float32)
+    matrix = np.asarray(matrix, dtype=np.float32)
+    warped = cv2.warpPerspective(
+        frame, matrix, (width, height), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    valid = cv2.warpPerspective(
+        np.full((height, width), 255, dtype=np.uint8), matrix,
+        (width, height), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped, valid.astype(np.float32) / 255.0
+
+
+def _soft_ellipse_mask(
+    shape: tuple[int, int],
+    box: tuple[int, int, int, int] | None,
+    scale: float = 1.0,
+) -> np.ndarray:
+    """Return a feathered ellipse mask for a fixed output geometry box."""
+    height, width = shape
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if box is None:
+        return mask.astype(np.float32)
+    x0, y0, x1, y1 = (float(value) for value in box)
+    center = (int(round((x0 + x1) * 0.5)), int(round((y0 + y1) * 0.5)))
+    axes = (
+        max(8, int(round(abs(x1 - x0) * 0.5 * float(scale)))),
+        max(8, int(round(abs(y1 - y0) * 0.5 * float(scale)))),
+    )
+    cv2.ellipse(mask, center, axes, 0.0, 0.0, 360.0, 255, -1)
+    feather = max(3, int(round(min(axes) * 0.06)) * 2 + 1)
+    if feather > 3:
+        mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+    return mask.astype(np.float32) / 255.0
+
+
+def apply_multi_plane_lock(
+    frame: np.ndarray,
+    screen_matrix: np.ndarray | None,
+    ring_matrix: np.ndarray | None,
+    target_inner_box: tuple[int, int, int, int] | None,
+    target_outer_box: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Composite independent screen and button-ring plane warps.
+
+    A single homography cannot remove parallax between a display and raised
+    buttons when the phone moves toward/away from the cabinet.  This function
+    keeps the display as the priority layer and applies a second LK/RANSAC
+    homography to the annulus around it.  If the ring tracker has not acquired
+    enough features, the established single-plane path is used unchanged.
+    """
+    if screen_matrix is None:
+        return frame.copy()
+    if ring_matrix is None or target_inner_box is None:
+        return apply_plane_lock(frame, screen_matrix, target_inner_box)
+
+    height, width = frame.shape[:2]
+    screen_warp, screen_valid = _warp_with_valid_source(frame, screen_matrix)
+    ring_warp, ring_valid = _warp_with_valid_source(frame, ring_matrix)
+    if target_outer_box is None:
+        target_outer_box = expand_box(target_inner_box, 1.72)
+
+    inner_alpha = _soft_ellipse_mask((height, width), target_inner_box, 1.08)
+    outer_alpha = _soft_ellipse_mask((height, width), target_outer_box, 1.02)
+    # Subtract the screen ellipse so the ring warp cannot overwrite the
+    # playable display.  A small overlap is left for feathered compositing.
+    ring_alpha = np.clip(outer_alpha - inner_alpha * 0.88, 0.0, 1.0) * ring_valid
+    screen_alpha = inner_alpha * screen_valid
+    result = frame.astype(np.float32)
+    ring_alpha = ring_alpha[..., None]
+    screen_alpha = screen_alpha[..., None]
+    result = ring_warp.astype(np.float32) * ring_alpha + result * (1.0 - ring_alpha)
+    result = screen_warp.astype(np.float32) * screen_alpha + result * (1.0 - screen_alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def _target_plane(box: tuple[int, int, int, int], width: int, height: int, lock_fill: float) -> np.ndarray | None:
     """Create the fixed, centered output rectangle for the first valid lock."""
     points = _box_points(box)
@@ -506,6 +689,55 @@ def _target_plane(box: tuple[int, int, int, int], width: int, height: int, lock_
         [cx + target_width * 0.5, cy + target_height * 0.5],
         [cx - target_width * 0.5, cy + target_height * 0.5],
     ])
+
+
+def detect_screen_circle(
+    gray: np.ndarray,
+    box: tuple[int, int, int, int] | None,
+) -> tuple[float, float, float] | None:
+    """Find the circular playable screen inside a detector reference box."""
+    if box is None:
+        return None
+    height, width = gray.shape[:2]
+    x0, y0, x1, y1 = (int(value) for value in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(width, x1), min(height, y1)
+    if x1 - x0 < 80 or y1 - y0 < 80:
+        return None
+    roi = gray[y0:y1, x0:x1]
+    blurred = cv2.medianBlur(roi, 5)
+    min_radius = max(24, int(min(x1 - x0, y1 - y0) * 0.16))
+    max_radius = max(min_radius + 8, int(min(x1 - x0, y1 - y0) * 0.55))
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(40, int(min(x1 - x0, y1 - y0) * 0.22)),
+        param1=100,
+        param2=30,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+    if circles is None:
+        return None
+    center = np.array([(x1 - x0) * 0.5, (y1 - y0) * 0.5], dtype=np.float32)
+    candidates = []
+    for raw_x, raw_y, raw_radius in np.asarray(circles[0], dtype=np.float32):
+        candidate = np.array([raw_x, raw_y], dtype=np.float32)
+        distance = float(np.linalg.norm(candidate - center))
+        if distance > max(x1 - x0, y1 - y0) * 0.30:
+            continue
+        radius = float(raw_radius)
+        if not (min_radius <= radius <= max_radius):
+            continue
+        # Prefer the playable circle (near the detector centre and below the
+        # oversized cabinet/body circles Hough often returns).
+        score = distance + abs(radius - min(x1 - x0, y1 - y0) * 0.30) * 0.45
+        candidates.append((score, raw_x + x0, raw_y + y0, radius))
+    if not candidates:
+        return None
+    _score, cx, cy, radius = min(candidates, key=lambda item: item[0])
+    return float(cx), float(cy), float(radius)
 
 
 def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> tuple[np.ndarray, np.ndarray]:
@@ -770,14 +1002,16 @@ class GeometryLockTracker:
         inner: tuple[int, int, int, int] | None,
         width: int,
         height: int,
+        allow_soft_pair: bool = False,
     ) -> None:
         """Accept each detector result independently after jump checks."""
         # Validate the pair before updating state.  An inner-screen-only
         # prediction is not a cabinet anchor; an overlapping pair loses its
         # scale signal but may still leave an explicit outer anchor usable.
+        mapped_pair = allow_soft_pair and soft_geometry_pair(outer, inner)
         if outer is None:
             inner = None
-        elif inner is not None and not plausible_geometry_pair(outer, inner):
+        elif inner is not None and not plausible_geometry_pair(outer, inner) and not mapped_pair:
             inner = None
 
         for attribute, candidate, age_attribute in (
@@ -807,7 +1041,8 @@ class GeometryLockTracker:
         # If a new outer candidate is incompatible with the retained inner
         # box, keep the position anchor and discard the stale scale box.  This
         # prevents a false inner detection from changing distance compensation.
-        if self.outer_box is not None and self.inner_box is not None and not plausible_geometry_pair(self.outer_box, self.inner_box):
+        retained_pair = allow_soft_pair and soft_geometry_pair(self.outer_box, self.inner_box)
+        if self.outer_box is not None and self.inner_box is not None and not plausible_geometry_pair(self.outer_box, self.inner_box) and not retained_pair:
             self.inner_box = None
             self.inner_age_frames = self.max_age_frames + self.detect_every
         self._sync_aliases()
@@ -817,27 +1052,38 @@ class GeometryLockTracker:
 
 
 class PlaneLockTracker:
-    """Track the visible screen as a plane and map it to one fixed target.
+    """Track the screen and button ring as one machine plane.
 
-    The detector supplies an initial screen box, but it is not used as the
-    frame-to-frame stabilizer. Good features inside the screen are tracked
-    with LK optical flow and a RANSAC homography is estimated for every frame.
-    This preserves translation, roll, perspective and moderate front/back
-    motion in one transform, which a centre/scale box lock cannot do.
+    The detector supplies an inner-screen box and an outer-buttons box. Good
+    features across that combined machine ROI are tracked with LK optical
+    flow and a RANSAC homography is estimated for every frame. The same warp
+    is applied to the complete image, so the screen and all eight buttons
+    move together into one fixed, front-facing target.
     """
 
-    def __init__(self, detect_every: int = 12, max_age_frames: int | None = None):
+    def __init__(
+        self,
+        detect_every: int = 12,
+        max_age_frames: int | None = None,
+        feature_region: str = "combined",
+    ):
         self.detect_every = max(1, int(detect_every))
         # Hold a good transform briefly through a missed frame burst, then
         # reacquire instead of freezing an old plane for several seconds.
         self.max_age_frames = max_age_frames or max(18, self.detect_every * 4)
+        # ``combined`` is the original behaviour and tracks screen plus
+        # bezel.  ``ring`` restricts points to the annulus outside the
+        # screen; it is used by DualPlaneLockTracker for the raised buttons.
+        self.feature_region = str(feature_region)
         self.reset()
 
     def reset(self) -> None:
         self.reference_gray: np.ndarray | None = None
         self.previous_gray: np.ndarray | None = None
         self.reference_box: tuple[int, int, int, int] | None = None
+        self.reference_outer_box: tuple[int, int, int, int] | None = None
         self.current_box: tuple[int, int, int, int] | None = None
+        self.current_outer_box: tuple[int, int, int, int] | None = None
         self.reference_to_output: np.ndarray | None = None
         self.current_to_reference = np.eye(3, dtype=np.float32)
         self.points: np.ndarray | None = None
@@ -863,29 +1109,79 @@ class PlaneLockTracker:
         matrix = self.reference_to_output @ self.current_to_reference
         return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
 
-    @staticmethod
-    def _feature_mask(gray: np.ndarray, box: tuple[int, int, int, int] | None) -> np.ndarray:
+    def _feature_mask(
+        self,
+        gray: np.ndarray,
+        box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
         mask = np.zeros(gray.shape[:2], dtype=np.uint8)
-        if box is None:
+        feature_box = outer_box or box
+        if feature_box is None:
             mask[:, :] = 255
             return mask
         height, width = gray.shape[:2]
-        x0, y0, x1, y1 = box
-        inset_x = max(2, int((x1 - x0) * 0.04))
-        inset_y = max(2, int((y1 - y0) * 0.04))
-        mask[max(0, y0 + inset_y):min(height, y1 - inset_y),
-             max(0, x0 + inset_x):min(width, x1 - inset_x)] = 255
+        if box is not None and outer_box is not None and self.feature_region == "ring":
+            # Track the physical button/bezel ring without allowing display
+            # pixels to dominate the homography.  The two ellipses are only a
+            # feature-selection mask; the actual warp remains projective.
+            x0, y0, x1, y1 = box
+            ox0, oy0, ox1, oy1 = outer_box
+            outer_cx = int(round((ox0 + ox1) * 0.5))
+            outer_cy = int(round((oy0 + oy1) * 0.5))
+            inner_cx = int(round((x0 + x1) * 0.5))
+            inner_cy = int(round((y0 + y1) * 0.5))
+            outer_axes = (
+                max(8, int(round((ox1 - ox0) * 0.48))),
+                max(8, int(round((oy1 - oy0) * 0.48))),
+            )
+            inner_axes = (
+                max(8, int(round((x1 - x0) * 0.58))),
+                max(8, int(round((y1 - y0) * 0.58))),
+            )
+            cv2.ellipse(mask, (outer_cx, outer_cy), outer_axes, 0.0, 0.0, 360.0, 255, -1)
+            # Leave a small overlap at the screen edge so the two warped
+            # regions feather without a visible seam.
+            inner_cut = np.zeros_like(mask)
+            cv2.ellipse(inner_cut, (inner_cx, inner_cy), inner_axes, 0.0, 0.0, 360.0, 255, -1)
+            mask = cv2.subtract(mask, inner_cut)
+        elif box is not None and outer_box is not None:
+            # The detector's outer rectangle also covers cabinet body and
+            # background after inverse-fisheye mapping. Restrict features to
+            # an ellipse around the screen, which contains the button ring
+            # while excluding the wall/table that caused duplicate warps.
+            x0, y0, x1, y1 = box
+            ox0, oy0, ox1, oy1 = outer_box
+            cx = int(round((x0 + x1) * 0.5))
+            cy = int(round((y0 + y1) * 0.5))
+            inner_half_x = max((x1 - x0) * 0.5, 4.0)
+            inner_half_y = max((y1 - y0) * 0.5, 4.0)
+            outer_half_x = max((ox1 - ox0) * 0.5, 4.0)
+            outer_half_y = max((oy1 - oy0) * 0.5, 4.0)
+            axis_x = int(round(max(inner_half_x * 1.15, min(outer_half_x * 1.15, inner_half_x * 1.55))))
+            axis_y = int(round(max(inner_half_y * 1.15, min(outer_half_y * 1.15, inner_half_y * 1.55))))
+            cv2.ellipse(mask, (cx, cy), (axis_x, axis_y), 0.0, 0.0, 360.0, 255, -1)
+        else:
+            x0, y0, x1, y1 = feature_box
+            inset_x = max(2, int((x1 - x0) * 0.04))
+            inset_y = max(2, int((y1 - y0) * 0.04))
+            mask[max(0, y0 + inset_y):min(height, y1 - inset_y),
+                 max(0, x0 + inset_x):min(width, x1 - inset_x)] = 255
         return mask
 
-    @classmethod
-    def _find_points(cls, gray: np.ndarray, box: tuple[int, int, int, int] | None) -> np.ndarray | None:
+    def _find_points(
+        self,
+        gray: np.ndarray,
+        box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray | None:
         points = cv2.goodFeaturesToTrack(
             gray,
             maxCorners=120,
             qualityLevel=0.008,
             minDistance=5,
             blockSize=7,
-            mask=cls._feature_mask(gray, box),
+            mask=self._feature_mask(gray, box, outer_box),
             useHarrisDetector=False,
         )
         if points is None or len(points) < 8:
@@ -896,6 +1192,7 @@ class PlaneLockTracker:
         self,
         gray: np.ndarray,
         box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None,
         width: int,
         height: int,
         lock_fill: float,
@@ -907,11 +1204,13 @@ class PlaneLockTracker:
         reference_to_output = cv2.getPerspectiveTransform(points, target)
         if reference_to_output is None or not np.isfinite(reference_to_output).all():
             return False
-        tracked = self._find_points(gray, box)
+        tracked = self._find_points(gray, box, outer_box)
         self.reference_gray = gray.copy()
         self.previous_gray = gray.copy()
         self.reference_box = tuple(int(value) for value in box)
+        self.reference_outer_box = tuple(int(value) for value in outer_box) if outer_box is not None else self.reference_box
         self.current_box = tuple(int(value) for value in box)
+        self.current_outer_box = tuple(int(value) for value in outer_box) if outer_box is not None else self.current_box
         self.reference_to_output = reference_to_output.astype(np.float32)
         self.current_to_reference = np.eye(3, dtype=np.float32)
         self.points = tracked
@@ -942,6 +1241,7 @@ class PlaneLockTracker:
         self,
         gray: np.ndarray,
         box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None,
         width: int,
         height: int,
         lock_fill: float,
@@ -949,8 +1249,9 @@ class PlaneLockTracker:
         if self.frame_shape != gray.shape[:2]:
             self.reset()
         if not self.locked:
-            return self.initialize(gray, box, width, height, lock_fill)
+            return self.initialize(gray, box, outer_box, width, height, lock_fill)
         self.current_box = tuple(int(value) for value in box) if box is not None else self.current_box
+        self.current_outer_box = tuple(int(value) for value in outer_box) if outer_box is not None else self.current_outer_box
         success = False
         if self.previous_gray is not None and self.points is not None and len(self.points) >= 8:
             next_points, status, errors = cv2.calcOpticalFlowPyrLK(
@@ -1010,11 +1311,39 @@ class PlaneLockTracker:
             self.last_success = True
         self.previous_gray = gray.copy()
         if self.points is None or len(self.points) < 12 or self.frames_since_refresh >= self.detect_every:
-            refreshed = self._find_points(gray, self.current_box)
+            refreshed = self._find_points(gray, self.current_box, self.current_outer_box)
             if refreshed is not None:
                 self.points = refreshed
                 self.frames_since_refresh = 0
         return self.locked
+
+
+def resolve_fps(session: Path, rows: list[dict], override: float | None) -> float:
+    """Nominal frame rate without requiring a manifest.
+
+    A session stopped with Ctrl+C never got its ``session.json``, so fall back
+    to the file when it exists and to the frame timestamps when it does not.
+    """
+    if override:
+        return float(override)
+    manifest_path = session / "session.json"
+    if manifest_path.exists():
+        try:
+            value = json.loads(manifest_path.read_text(encoding="utf-8")).get("nominal_fps")
+            if value:
+                return float(value)
+        except (OSError, TypeError, ValueError):
+            pass
+    timestamps = [float(row["timestamp"]) for row in rows
+                  if isinstance(row.get("timestamp"), (int, float))]
+    deltas = sorted(later - earlier
+                    for earlier, later in zip(timestamps, timestamps[1:])
+                    if later > earlier)
+    if deltas:
+        median = deltas[len(deltas) // 2]
+        if median > 0:
+            return max(1.0, min(240.0, 1.0 / median))
+    return 60.0
 
 
 def process(args: argparse.Namespace) -> Path:
@@ -1030,7 +1359,7 @@ def process(args: argparse.Namespace) -> Path:
     if first_image is None:
         raise RuntimeError("无法读取会话第一帧")
     height, width = first_image.shape[:2]
-    fps = float(args.fps or (json.loads((session / "session.json").read_text(encoding="utf-8")).get("nominal_fps", 15)))
+    fps = resolve_fps(session, rows, args.fps)
     output = args.output or session / "processed.mp4"
     output.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -1081,11 +1410,18 @@ def process(args: argparse.Namespace) -> Path:
                         detected_inner_raw, width, height, rotation, args.crop, args.fov,
                         args.k1, args.k2, args.center_x, args.center_y,
                     )
-                    lock_tracker.ingest(detected_outer, detected_inner, width, height)
+                    lock_tracker.ingest(
+                        detected_outer,
+                        detected_inner,
+                        width,
+                        height,
+                        allow_soft_pair=True,
+                    )
                 outer, inner = lock_tracker.boxes()
                 plane_locked = plane_tracker.update(
                     current_gray,
                     inner,
+                    outer,
                     width,
                     height,
                     getattr(args, "lock_fill", 0.64),
@@ -1114,18 +1450,13 @@ def process(args: argparse.Namespace) -> Path:
                     previous_lock_source = lock_source
                 plane_matrix = plane_tracker.output_homography if plane_locked else None
                 if plane_matrix is not None:
-                    stabilized = cv2.warpPerspective(
-                        stabilized,
-                        plane_matrix,
-                        (width, height),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REFLECT101,
-                    )
-                    outer = transform_box_homography(outer, plane_matrix)
-                    inner = transform_box_homography(
+                    fixed_inner = transform_box_homography(
                         plane_tracker.reference_box,
                         plane_tracker.reference_to_output,
                     )
+                    stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
+                    outer = expand_box(fixed_inner, 1.45)
+                    inner = fixed_inner
                     center = np.array([0.5, 0.5], dtype=np.float32)
                     zoom = 1.0
                     lock_source = "plane_homography"

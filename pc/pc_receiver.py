@@ -187,18 +187,19 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             processed_writer.release()
         if args.preview:
             cv2.destroyAllWindows()
-
-    manifest = {
-        "frame_count": frame_count,
-        "nominal_fps": args.fps,
-        "video": "raw.mp4",
-        "metadata": "capture.jsonl",
-        "live_processed_video": "processed-live.mp4" if live_processor is not None else None,
-        "live_processed_metadata": "processed.jsonl" if live_processor is not None else None,
-        "created_local": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
-    (session / "session.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"会话完成：{frame_count} 帧 → {session}")
+        # Also written here, so a session stopped with Ctrl+C still carries the
+        # manifest the offline processor reads its nominal frame rate from.
+        manifest = {
+            "frame_count": frame_count,
+            "nominal_fps": args.fps,
+            "video": "raw.mp4",
+            "metadata": "capture.jsonl",
+            "live_processed_video": "processed-live.mp4" if live_processor is not None else None,
+            "live_processed_metadata": "processed.jsonl" if live_processor is not None else None,
+            "created_local": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        (session / "session.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"会话完成：{frame_count} 帧 → {session}")
     return session
 
 

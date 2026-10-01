@@ -14,6 +14,7 @@ try:
         GeometryLockTracker,
         PlaneLockTracker,
         apply_geometry_lock,
+        apply_plane_lock,
         build_remap,
         draw_debug,
         geometry_margins,
@@ -22,6 +23,7 @@ try:
         rotation_for_row,
         transform_box,
         transform_box_homography,
+        expand_box,
         geometry_reference,
         update_geometry_lock_state,
     )
@@ -31,6 +33,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         GeometryLockTracker,
         PlaneLockTracker,
         apply_geometry_lock,
+        apply_plane_lock,
         build_remap,
         draw_debug,
         geometry_margins,
@@ -39,6 +42,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         rotation_for_row,
         transform_box,
         transform_box_homography,
+        expand_box,
         geometry_reference,
         update_geometry_lock_state,
     )
@@ -134,7 +138,16 @@ class LiveProcessor:
                 detected_inner_raw, width, height, rotation, self.crop, self.fov,
                 self.k1, self.k2, self.center_x, self.center_y,
             )
-            self.lock_tracker.ingest(detected_outer, detected_inner, width, height)
+            # Both boxes came from one raw-frame detector result.  Their
+            # inverse-fisheye corners can cross by a few percent, so allow the
+            # mapped-pair gate while still rejecting unrelated duplicates.
+            self.lock_tracker.ingest(
+                detected_outer,
+                detected_inner,
+                width,
+                height,
+                allow_soft_pair=True,
+            )
 
         if not self.detector.enabled:
             self.lock_tracker.reset()
@@ -144,6 +157,7 @@ class LiveProcessor:
         plane_locked = self.plane_tracker.update(
             current_gray,
             inner,
+            outer,
             width,
             height,
             self.lock_fill,
@@ -182,21 +196,16 @@ class LiveProcessor:
 
         plane_matrix = self.plane_tracker.output_homography if plane_locked else None
         if plane_matrix is not None:
-            stabilized = cv2.warpPerspective(
-                stabilized,
-                plane_matrix,
-                (width, height),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REFLECT101,
-            )
-            outer = transform_box_homography(outer, plane_matrix)
-            # The current detector rectangle is allowed to jitter.  The
-            # green debug frame represents the latched output plane instead,
-            # so the overlay visualizes the lock rather than detector noise.
-            inner = transform_box_homography(
+            fixed_inner = transform_box_homography(
                 self.plane_tracker.reference_box,
                 self.plane_tracker.reference_to_output,
             )
+            stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
+            outer = expand_box(fixed_inner, 1.45)
+            # The current detector rectangle is allowed to jitter.  The
+            # green debug frame represents the latched output plane instead,
+            # so the overlay visualizes the lock rather than detector noise.
+            inner = fixed_inner
             # The perspective transform already contains translation, scale
             # and tilt compensation.  Do not apply a second affine crop.
             center = np.array([0.5, 0.5], dtype=np.float32)

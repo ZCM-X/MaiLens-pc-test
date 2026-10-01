@@ -19,6 +19,7 @@ from .process_session import (
     _project_points,
     process,
     quat_to_matrix,
+    resolve_fps,
     rotation_for_row,
     update_geometry_lock_state,
 )
@@ -58,8 +59,8 @@ class ProcessSessionTests(unittest.TestCase):
         second = cv2.warpPerspective(first, motion, (width, height), borderMode=cv2.BORDER_REFLECT101)
 
         tracker = PlaneLockTracker(detect_every=3)
-        self.assertTrue(tracker.initialize(first, (120, 80, 520, 400), width, height, 0.64))
-        self.assertTrue(tracker.update(second, (80, 60, 560, 430), width, height, 0.64))
+        self.assertTrue(tracker.initialize(first, (120, 80, 520, 400), (90, 50, 550, 430), width, height, 0.64))
+        self.assertTrue(tracker.update(second, (80, 60, 560, 430), (50, 40, 590, 450), width, height, 0.64))
         projected = _project_points(moved, tracker.output_homography)
         expected = _project_points(source, tracker.reference_to_output)
         self.assertIsNotNone(projected)
@@ -73,10 +74,10 @@ class ProcessSessionTests(unittest.TestCase):
         first = np.zeros((height, width), dtype=np.uint8)
         cv2.rectangle(first, (60, 40), (260, 200), 180, 3)
         tracker = PlaneLockTracker(detect_every=2, max_age_frames=3)
-        self.assertTrue(tracker.initialize(first, (60, 40, 260, 200), width, height, 0.64))
+        self.assertTrue(tracker.initialize(first, (60, 40, 260, 200), (45, 25, 275, 215), width, height, 0.64))
         before = tracker.output_homography.copy()
         blank = np.zeros_like(first)
-        self.assertTrue(tracker.update(blank, (60, 40, 260, 200), width, height, 0.64))
+        self.assertTrue(tracker.update(blank, (60, 40, 260, 200), (45, 25, 275, 215), width, height, 0.64))
         np.testing.assert_allclose(tracker.output_homography, before, atol=1e-6)
         self.assertFalse(tracker.last_success)
 
@@ -296,6 +297,34 @@ class ProcessSessionTests(unittest.TestCase):
             self.assertEqual(output, root / "processed.mp4")
             self.assertGreater((root / "processed.mp4").stat().st_size, 0)
             self.assertEqual(len((root / "debug.jsonl").read_text(encoding="utf-8").splitlines()), 4)
+
+
+class ResolveFpsTests(unittest.TestCase):
+    def test_uses_the_manifest_when_it_exists(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            (session / "session.json").write_text(json.dumps({"nominal_fps": 30}), encoding="utf-8")
+            self.assertEqual(resolve_fps(session, [], None), 30.0)
+
+    def test_falls_back_to_frame_timestamps_without_a_manifest(self):
+        # Ctrl+C stops the receiver before it writes session.json.
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            rows = [{"timestamp": 100.0 + index / 60.0} for index in range(60)]
+            self.assertAlmostEqual(resolve_fps(session, rows, None), 60.0, places=3)
+
+    def test_explicit_override_wins(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            (session / "session.json").write_text(json.dumps({"nominal_fps": 30}), encoding="utf-8")
+            self.assertEqual(resolve_fps(session, [], 24.0), 24.0)
+
+    def test_survives_a_broken_manifest(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            (session / "session.json").write_text("{not json", encoding="utf-8")
+            rows = [{"timestamp": 1.0}, {"timestamp": 2.0}]
+            self.assertEqual(resolve_fps(session, rows, None), 1.0)
 
 
 if __name__ == "__main__":
