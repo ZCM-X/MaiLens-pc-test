@@ -12,7 +12,9 @@ from .process_session import (
     apply_geometry_lock,
     build_remap,
     geometry_margins,
+    geometry_reference,
     map_fisheye_points_to_output,
+    plausible_geometry_pair,
     process,
     quat_to_matrix,
     rotation_for_row,
@@ -121,6 +123,22 @@ class ProcessSessionTests(unittest.TestCase):
         self.assertEqual(outer, (20, 20, 380, 280))
         self.assertEqual(inner, (80, 60, 320, 230))
 
+    def test_geometry_detector_rejects_overlapping_duplicate_boxes(self):
+        outer, inner = GeometryDetector._pick_geometry_boxes([
+            ("outer_buttons", 0.94, (20, 20, 380, 280)),
+            ("inner_screen", 0.96, (20, 20, 380, 280)),
+        ])
+        self.assertEqual(outer, (20, 20, 380, 280))
+        self.assertIsNone(inner)
+        self.assertFalse(plausible_geometry_pair(outer, inner))
+
+    def test_inner_screen_only_never_becomes_outer_anchor(self):
+        outer, inner = GeometryDetector._pick_geometry_boxes([
+            ("inner_screen", 0.96, (80, 60, 320, 230)),
+        ])
+        self.assertIsNone(outer)
+        self.assertIsNone(inner)
+
     def test_geometry_lock_uses_outer_frame_when_inner_screen_is_missing(self):
         center, zoom, source = update_geometry_lock_state(
             np.array([0.5, 0.5], dtype=np.float32),
@@ -167,6 +185,37 @@ class ProcessSessionTests(unittest.TestCase):
         np.testing.assert_array_equal(center, previous)
         self.assertEqual(zoom, 1.08)
         self.assertEqual(source, "none")
+
+    def test_geometry_lock_compensates_front_back_motion_in_opposite_direction(self):
+        width, height = 400, 300
+        outer = (40, 30, 360, 270)
+        initial_inner = (120, 90, 280, 210)
+        reference_size, reference_zoom = geometry_reference(initial_inner, width, height, 0.64)
+        center, first_zoom, source = update_geometry_lock_state(
+            np.array([0.5, 0.5], dtype=np.float32),
+            1.0,
+            outer,
+            initial_inner,
+            width,
+            height,
+            0.64,
+            snap=True,
+            reference_target_size=reference_size,
+            reference_zoom=reference_zoom,
+        )
+        self.assertEqual(source, "inner_screen")
+        closer_inner = (80, 60, 320, 240)
+        _center, closer_zoom, _source = update_geometry_lock_state(
+            center, first_zoom, outer, closer_inner, width, height, 0.64,
+            reference_target_size=reference_size, reference_zoom=reference_zoom,
+        )
+        farther_inner = (150, 112, 250, 188)
+        _center, farther_zoom, _source = update_geometry_lock_state(
+            center, first_zoom, outer, farther_inner, width, height, 0.64,
+            reference_target_size=reference_size, reference_zoom=reference_zoom,
+        )
+        self.assertLess(closer_zoom, first_zoom)
+        self.assertGreater(farther_zoom, first_zoom)
 
     def test_pose_only_session_produces_processed_video_and_debug_log(self):
         with tempfile.TemporaryDirectory() as temporary:

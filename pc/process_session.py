@@ -217,11 +217,11 @@ class GeometryDetector:
         self.cv_net = None
         self.backend = "none"
         self.input_size = 640
-        # The trained MaiMoller model has a few valid outer-box predictions
-        # around 0.29 on oblique frames.  Keeping the threshold at 0.25 lets
-        # those frames contribute the cabinet anchor without accepting the
-        # low-confidence duplicate boxes below it.
-        self.confidence = 0.25
+        # The small v3 training set produces a real inner-screen prediction
+        # below 0.10 on dark/oblique frames.  Geometry pairing and jump checks
+        # below provide the safety gate, so a high global confidence threshold
+        # would prevent distance compensation from running at all.
+        self.confidence = 0.05
         self.names = {0: "outer_buttons", 1: "inner_screen", 2: "button"}
         if model_path:
             model_path = Path(model_path)
@@ -342,25 +342,26 @@ class GeometryDetector:
             for label, confidence, box in boxes
             if any(token in label for token in ("inner", "screen", "display"))
         ]
+        # Select a geometrically valid pair rather than taking the most
+        # confident box of each class independently.  Two classes can be
+        # predicted for the same rectangle, and that pair would otherwise
+        # make the distance lock pump or follow the background.
+        valid_pairs = []
+        for outer_confidence, outer_box in outer_candidates:
+            for inner_confidence, inner_box in inner_candidates:
+                if plausible_geometry_pair(outer_box, inner_box):
+                    score = outer_confidence * inner_confidence
+                    valid_pairs.append((score, outer_confidence + inner_confidence,
+                                        area(outer_box), outer_box, inner_box))
+        if valid_pairs:
+            _score, _confidence, _area, outer, inner = max(valid_pairs)
+            return outer, inner
+
+        # An explicit outer prediction is still useful as a centre anchor when
+        # the inner screen is occluded or temporarily missed.  Keep it only;
+        # never reinterpret an inner-screen-only prediction as the cabinet.
         outer = max(outer_candidates, key=lambda item: (item[0], area(item[1])))[1] if outer_candidates else None
-        inner = max(inner_candidates, key=lambda item: (item[0], area(item[1])))[1] if inner_candidates else None
-        if outer is None and boxes:
-            # Keep the detector usable with a one-class machine model while
-            # avoiding the old behaviour of treating a button class as the
-            # cabinet when a multi-task model detects only gameplay buttons.
-            non_button_boxes = [
-                box for label, _, box in boxes
-                if not any(token in label for token in ("button", "key", "star", "marker", "slide", "note", "tap"))
-            ]
-            if non_button_boxes:
-                outer = max(non_button_boxes, key=area)
-        if inner is not None and outer is not None:
-            ix0, iy0, ix1, iy1 = inner
-            ox0, oy0, ox1, oy1 = outer
-            intersection = max(0, min(ix1, ox1) - max(ix0, ox0)) * max(0, min(iy1, oy1) - max(iy0, oy0))
-            if intersection / max(area(inner), 1) < 0.35:
-                inner = None
-        return outer, inner
+        return outer, None
 
 
 def draw_debug(frame: np.ndarray, outer, inner, text: str) -> np.ndarray:
@@ -395,6 +396,48 @@ def geometry_margins(outer, inner) -> dict[str, int] | None:
     }
 
 
+def box_area(box) -> float:
+    """Return a non-negative xyxy box area."""
+    if box is None:
+        return 0.0
+    return float(max(0, box[2] - box[0]) * max(0, box[3] - box[1]))
+
+
+def plausible_geometry_pair(outer, inner) -> bool:
+    """Check that the inner screen is really inside the cabinet ring.
+
+    A detector can return two high-confidence boxes for the same rectangle or
+    for unrelated background regions.  Such a pair must never drive the lock
+    transform: the screen should be mostly contained by a strictly larger
+    outer cabinet box with a visible bezel on every side.
+    """
+    if outer is None or inner is None:
+        return False
+    ox0, oy0, ox1, oy1 = (float(value) for value in outer)
+    ix0, iy0, ix1, iy1 = (float(value) for value in inner)
+    ow, oh = ox1 - ox0, oy1 - oy0
+    iw, ih = ix1 - ix0, iy1 - iy0
+    outer_size = max(ow * oh, 1.0)
+    inner_size = max(iw * ih, 1.0)
+    if ow <= 1.0 or oh <= 1.0 or iw <= 1.0 or ih <= 1.0:
+        return False
+    if outer_size <= inner_size * 1.18:
+        return False
+    overlap_width = max(0.0, min(ox1, ix1) - max(ox0, ix0))
+    overlap_height = max(0.0, min(oy1, iy1) - max(oy0, iy0))
+    if overlap_width * overlap_height / inner_size < 0.72:
+        return False
+    # Permit a small mapping error at the edge, but reject an inner box that
+    # is actually a background rectangle outside the cabinet.
+    margin_x = ow * 0.08
+    margin_y = oh * 0.08
+    if ix0 < ox0 - margin_x or iy0 < oy0 - margin_y or ix1 > ox1 + margin_x or iy1 > oy1 + margin_y:
+        return False
+    width_ratio = iw / ow
+    height_ratio = ih / oh
+    return 0.12 <= width_ratio <= 0.90 and 0.12 <= height_ratio <= 0.90
+
+
 def transform_box(box, matrix: np.ndarray):
     if box is None:
         return None
@@ -411,7 +454,11 @@ def transform_box(box, matrix: np.ndarray):
 def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> tuple[np.ndarray, np.ndarray]:
     """Move the tracked screen center to the output center without a hard snap."""
     height, width = frame.shape[:2]
-    zoom = float(max(0.70, min(1.60, zoom)))
+    # A close/far movement can require substantially more than the old
+    # 0.70..1.60 range.  The source is the fisheye frame, so this is still a
+    # crop operation; the bounds only prevent an invalid transform when the
+    # target has left the usable lens area.
+    zoom = float(max(0.45, min(2.50, zoom)))
     cx, cy = width * 0.5, height * 0.5
     tracked = np.array([center[0] * width, center[1] * height], dtype=np.float32)
     scaled_tracked = np.array([cx, cy], dtype=np.float32) + (tracked - np.array([cx, cy], dtype=np.float32)) * zoom
@@ -423,6 +470,19 @@ def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> t
     return locked, matrix
 
 
+def geometry_reference(inner, width: int, height: int, lock_fill: float = 0.64) -> tuple[float, float] | tuple[None, None]:
+    """Return the first-lock screen size and crop zoom used for distance lock."""
+    if inner is None:
+        return None, None
+    inner_width = max(int(inner[2] - inner[0]), 1)
+    inner_height = max(int(inner[3] - inner[1]), 1)
+    target_size = math.sqrt(float(inner_width * inner_height))
+    lock_fill = float(min(max(lock_fill, 0.35), 0.90))
+    reference_zoom = min(lock_fill * width / inner_width,
+                         lock_fill * height / inner_height)
+    return target_size, max(0.45, min(2.50, float(reference_zoom)))
+
+
 def update_geometry_lock_state(
     previous_center: np.ndarray,
     previous_zoom: float,
@@ -432,37 +492,57 @@ def update_geometry_lock_state(
     height: int,
     lock_fill: float = 0.64,
     snap: bool = False,
+    reference_target_size: float | None = None,
+    reference_zoom: float | None = None,
 ) -> tuple[np.ndarray, float, str]:
-    """Smooth a detected machine target into a center/zoom lock state."""
+    """Smooth a detected machine target into a center/zoom lock state.
+
+    ``outer`` controls position.  ``inner`` controls distance compensation:
+    its geometric-mean size is compared with the size at the first valid
+    lock, and the crop zoom is adjusted in the opposite direction.  When the
+    screen is temporarily unavailable, the previous zoom is held rather than
+    estimating distance from the less stable outer ring.
+    """
     center = previous_center.copy()
     zoom = float(previous_zoom)
     # The cabinet is the lock anchor.  The inner screen is only used to set
     # the crop scale; using its centre as the anchor makes the output drift
     # whenever the bezel is asymmetric or the screen is mounted high/low.
     anchor = outer or inner
-    target = inner or outer
     source = "none"
-    if anchor and target:
+    if anchor:
         center_target = np.array([
             (anchor[0] + anchor[2]) / (2 * width),
             (anchor[1] + anchor[3]) / (2 * height),
         ], dtype=np.float32)
-        target_width = max(target[2] - target[0], 1)
-        target_height = max(target[3] - target[1], 1)
-        lock_fill = float(min(max(lock_fill, 0.35), 0.90))
-        target_fill = lock_fill if inner else min(lock_fill + 0.12, 0.90)
-        zoom_target = min(target_fill * width / target_width,
-                          target_fill * height / target_height)
-        zoom_target = max(0.70, min(1.35, zoom_target))
         if snap:
             center = center_target
-            zoom = zoom_target
         else:
             # The target box is already filtered by GeometryLockTracker. Use
             # its current centre directly so the output does not visibly lag
-            # behind a real phone translation; smooth only the scale change.
+            # behind a real phone translation.
             center = center_target
-            zoom = previous_zoom * 0.85 + zoom_target * 0.15
+        if inner is not None:
+            target_width = max(inner[2] - inner[0], 1)
+            target_height = max(inner[3] - inner[1], 1)
+            target_size = math.sqrt(float(target_width * target_height))
+            lock_fill = float(min(max(lock_fill, 0.35), 0.90))
+            if reference_target_size is None or reference_zoom is None:
+                # Establish the size seen at the first valid lock.  This
+                # makes later front/back movement use a stable reference
+                # instead of recomputing a new target from detector noise.
+                reference_target_size, reference_zoom = geometry_reference(
+                    inner, width, height, lock_fill,
+                )
+            zoom_target = float(reference_zoom) * float(reference_target_size) / max(target_size, 1.0)
+            zoom_target = max(0.45, min(2.50, zoom_target))
+            if snap:
+                zoom = zoom_target
+            else:
+                # A modest low-pass filter removes detector-size pumping while
+                # still following a deliberate change in phone distance.
+                if abs(zoom_target - previous_zoom) / max(abs(previous_zoom), 1e-3) > 0.015:
+                    zoom = previous_zoom * 0.88 + zoom_target * 0.12
         source = "inner_screen" if inner else "outer_buttons"
     return center, zoom, source
 
@@ -477,7 +557,7 @@ class GeometryLockTracker:
     outer) box used by the live loop to decide when a detector must run.
     """
 
-    def __init__(self, detect_every: int = 4, max_age_frames: int | None = None):
+    def __init__(self, detect_every: int = 12, max_age_frames: int | None = None):
         self.detect_every = max(1, int(detect_every))
         self.max_age_frames = max_age_frames or max(18, self.detect_every * 8)
         self.outer_box: tuple[int, int, int, int] | None = None
@@ -587,7 +667,26 @@ class GeometryLockTracker:
             previous_points, current_points,
             method=cv2.RANSAC, ransacReprojThreshold=3.0,
         )
-        if matrix is None or inliers is None or int(inliers.sum()) < 4:
+        if matrix is None or inliers is None:
+            return
+        inlier_mask = inliers.reshape(-1).astype(bool)
+        inlier_count = int(inlier_mask.sum())
+        if inlier_count < 6 or inlier_count / max(len(previous_points), 1) < 0.45:
+            # A few background corners can still produce an affine fit.  Do
+            # not let that fit move a locked cabinet.
+            return
+        predicted = cv2.transform(previous_points[None, :, :], matrix)[0]
+        residual = np.linalg.norm(predicted - current_points, axis=1)[inlier_mask]
+        if len(residual) == 0 or float(np.median(residual)) > 5.0 or float(np.percentile(residual, 90)) > 9.0:
+            return
+        a, b = float(matrix[0, 0]), float(matrix[0, 1])
+        c, d = float(matrix[1, 0]), float(matrix[1, 1])
+        scale_x = math.sqrt(a * a + c * c)
+        scale_y = math.sqrt(b * b + d * d)
+        rotation_degrees = abs(math.degrees(math.atan2(c, a)))
+        if not (0.65 <= scale_x <= 1.55 and 0.65 <= scale_y <= 1.55):
+            return
+        if abs(scale_x - scale_y) > 0.12 or rotation_degrees > 25.0:
             return
         for attribute in ("outer_box", "inner_box"):
             previous = getattr(self, attribute)
@@ -601,6 +700,10 @@ class GeometryLockTracker:
                 continue
             if self._compatible(previous, transformed, width, height):
                 setattr(self, attribute, self._blend_box(previous, transformed, 0.80))
+        if self.outer_box is not None and self.inner_box is not None and not plausible_geometry_pair(self.outer_box, self.inner_box):
+            # Optical flow is allowed to move both boxes, but never allowed to
+            # turn them into two overlapping copies of the same rectangle.
+            self.inner_box = None
         self._sync_aliases()
 
     def ingest(
@@ -611,6 +714,14 @@ class GeometryLockTracker:
         height: int,
     ) -> None:
         """Accept each detector result independently after jump checks."""
+        # Validate the pair before updating state.  An inner-screen-only
+        # prediction is not a cabinet anchor; an overlapping pair loses its
+        # scale signal but may still leave an explicit outer anchor usable.
+        if outer is None:
+            inner = None
+        elif inner is not None and not plausible_geometry_pair(outer, inner):
+            inner = None
+
         for attribute, candidate, age_attribute in (
             ("outer_box", outer, "outer_age_frames"),
             ("inner_box", inner, "inner_age_frames"),
@@ -635,6 +746,12 @@ class GeometryLockTracker:
                 setattr(self, age_attribute, getattr(self, age_attribute) + self.detect_every)
                 if getattr(self, age_attribute) > self.max_age_frames:
                     setattr(self, attribute, None)
+        # If a new outer candidate is incompatible with the retained inner
+        # box, keep the position anchor and discard the stale scale box.  This
+        # prevents a false inner detection from changing distance compensation.
+        if self.outer_box is not None and self.inner_box is not None and not plausible_geometry_pair(self.outer_box, self.inner_box):
+            self.inner_box = None
+            self.inner_age_frames = self.max_age_frames + self.detect_every
         self._sync_aliases()
 
     def boxes(self) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
@@ -665,6 +782,8 @@ def process(args: argparse.Namespace) -> Path:
     reference = None
     previous_center = np.array([0.5, 0.5], dtype=np.float32)
     previous_zoom = 1.0
+    reference_target_size: float | None = None
+    reference_zoom: float | None = None
     lock_tracker = GeometryLockTracker(args.detect_every)
     previous_gray = None
     previous_lock_source = "none"
@@ -682,7 +801,7 @@ def process(args: argparse.Namespace) -> Path:
                 stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
                 current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
                 lock_tracker.update_flow(previous_gray, current_gray)
-                if args.model and (index % args.detect_every == 0 or lock_tracker.box is None):
+                if args.model and index % args.detect_every == 0:
                     detected_outer_raw, detected_inner_raw = detector.detect(frame)
                     detected_outer = map_fisheye_box_to_output(
                         detected_outer_raw, width, height, rotation, args.crop, args.fov,
@@ -694,6 +813,13 @@ def process(args: argparse.Namespace) -> Path:
                     )
                     lock_tracker.ingest(detected_outer, detected_inner, width, height)
                 outer, inner = lock_tracker.boxes()
+                if lock_tracker.box is None:
+                    reference_target_size = None
+                    reference_zoom = None
+                elif inner is not None and (reference_target_size is None or reference_zoom is None):
+                    reference_target_size, reference_zoom = geometry_reference(
+                        inner, width, height, args.lock_fill,
+                    )
                 center, zoom, lock_source = update_geometry_lock_state(
                     previous_center,
                     previous_zoom,
@@ -703,6 +829,8 @@ def process(args: argparse.Namespace) -> Path:
                     height,
                     getattr(args, "lock_fill", 0.64),
                     snap=previous_lock_source in ("none", "searching") and lock_tracker.box is not None,
+                    reference_target_size=reference_target_size,
+                    reference_zoom=reference_zoom,
                 )
                 if lock_source != "none":
                     previous_center, previous_zoom = center, zoom
@@ -756,8 +884,8 @@ def main() -> None:
     parser.add_argument("--fps", type=float)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--detect-every", type=int, default=4,
-                        help="模型每隔多少帧检测一次，默认 4；中间帧使用光流跟踪")
+    parser.add_argument("--detect-every", type=int, default=12,
+                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
     parser.add_argument("--lock-fill", type=float, default=0.64,
                         help="内屏锁定后占画面短边的比例，默认 0.64")
     args = parser.parse_args()

@@ -20,6 +20,7 @@ try:
         make_output_rays,
         rotation_for_row,
         transform_box,
+        geometry_reference,
         update_geometry_lock_state,
     )
 except ImportError:  # Running from `python pc/pc_receiver.py`.
@@ -34,6 +35,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         make_output_rays,
         rotation_for_row,
         transform_box,
+        geometry_reference,
         update_geometry_lock_state,
     )
 
@@ -51,7 +53,7 @@ class LiveProcessor:
         k1: float = 0.0893163,
         k2: float = -0.0174637,
         model: Path | None = None,
-        detect_every: int = 4,
+        detect_every: int = 12,
         lock_fill: float = 0.64,
         debug: bool = False,
     ) -> None:
@@ -71,6 +73,8 @@ class LiveProcessor:
         self.output_rays: np.ndarray | None = None
         self.previous_center = np.array([0.5, 0.5], dtype=np.float32)
         self.previous_zoom = 1.0
+        self.reference_target_size: float | None = None
+        self.reference_zoom: float | None = None
         self.lock_tracker = GeometryLockTracker(self.detect_every)
         self.previous_gray: np.ndarray | None = None
         self.detection_age = 0
@@ -100,14 +104,13 @@ class LiveProcessor:
             self.lock_tracker.reset()
             self.previous_center = np.array([0.5, 0.5], dtype=np.float32)
             self.previous_zoom = 1.0
+            self.reference_target_size = None
+            self.reference_zoom = None
             self.lock_source = "searching"
         self.lock_tracker.update_flow(self.previous_gray, current_gray)
 
         detector_ran = False
-        if self.detector.enabled and (
-            self.frame_index % self.detect_every == 0
-            or self.lock_tracker.box is None
-        ):
+        if self.detector.enabled and self.frame_index % self.detect_every == 0:
             detector_ran = True
             # The model was trained on the raw clip-on-lens geometry. Detect
             # there, then map the resulting boxes through the same fisheye
@@ -127,6 +130,15 @@ class LiveProcessor:
             self.lock_tracker.reset()
 
         outer, inner = self.lock_tracker.boxes()
+        if self.lock_tracker.box is None:
+            # Keep the last displayed transform until a new target is found,
+            # but do not carry its distance reference to a different target.
+            self.reference_target_size = None
+            self.reference_zoom = None
+        elif inner is not None and (self.reference_target_size is None or self.reference_zoom is None):
+            self.reference_target_size, self.reference_zoom = geometry_reference(
+                inner, width, height, self.lock_fill,
+            )
         self.detection_age = self.lock_tracker.age_frames
 
         center = self.previous_center.copy()
@@ -141,6 +153,8 @@ class LiveProcessor:
             height,
             self.lock_fill,
             snap=acquiring,
+            reference_target_size=self.reference_target_size,
+            reference_zoom=self.reference_zoom,
         )
         if lock_source != "none":
             self.previous_center, self.previous_zoom = center, zoom

@@ -76,6 +76,26 @@ class LiveProcessorTests(unittest.TestCase):
         self.assertEqual(second.shape, (240, 400, 3))
         self.assertEqual(debug["lock_source"], "outer_buttons")
 
+    def test_detector_runs_on_fixed_schedule_while_searching(self):
+        class CountingDetector:
+            enabled = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def detect(self, _frame):
+                self.calls += 1
+                return None, None
+
+        detector = CountingDetector()
+        processor = LiveProcessor(detect_every=3)
+        processor.detector = detector
+        frame = np.zeros((90, 160, 3), dtype=np.uint8)
+        metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}
+        for _ in range(8):
+            processor.process(frame, metadata)
+        self.assertEqual(detector.calls, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

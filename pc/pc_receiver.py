@@ -225,7 +225,8 @@ def main() -> None:
     parser.add_argument("--center-y", type=float, default=0.499423644)
     parser.add_argument("--k1", type=float, default=0.0893163)
     parser.add_argument("--k2", type=float, default=-0.0174637)
-    parser.add_argument("--detect-every", type=int, default=4)
+    parser.add_argument("--detect-every", type=int, default=12,
+                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
     args = parser.parse_args()
     if args.machine_lock and args.model is None:
         args.model = Path("models/frame-geometry-yolo11n-v3.onnx")
