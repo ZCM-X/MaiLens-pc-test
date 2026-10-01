@@ -112,8 +112,7 @@ class LiveProcessor:
             self.lock_tracker.ingest(detected_outer, detected_inner, width, height)
 
         if not self.detector.enabled:
-            self.lock_tracker.box = None
-            self.lock_tracker.source = "none"
+            self.lock_tracker.reset()
 
         outer, inner = self.lock_tracker.boxes()
         self.detection_age = self.lock_tracker.age_frames

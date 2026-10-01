@@ -415,12 +415,16 @@ def update_geometry_lock_state(
     """Smooth a detected machine target into a center/zoom lock state."""
     center = previous_center.copy()
     zoom = float(previous_zoom)
+    # The cabinet is the lock anchor.  The inner screen is only used to set
+    # the crop scale; using its centre as the anchor makes the output drift
+    # whenever the bezel is asymmetric or the screen is mounted high/low.
+    anchor = outer or inner
     target = inner or outer
     source = "none"
-    if target:
+    if anchor and target:
         center_target = np.array([
-            (target[0] + target[2]) / (2 * width),
-            (target[1] + target[3]) / (2 * height),
+            (anchor[0] + anchor[2]) / (2 * width),
+            (anchor[1] + anchor[3]) / (2 * height),
         ], dtype=np.float32)
         target_width = max(target[2] - target[0], 1)
         target_height = max(target[3] - target[1], 1)
@@ -443,17 +447,46 @@ def update_geometry_lock_state(
 
 
 class GeometryLockTracker:
-    """Reject detector jumps and carry a machine box between detections."""
+    """Keep independent outer/inner geometry boxes between detections.
+
+    The outer cabinet is the position anchor while the inner display controls
+    the crop size.  Both boxes are carried by the same optical-flow transform
+    so a temporary miss of either detector does not move the lock target.
+    ``box`` remains as a compatibility alias for the preferred (inner, then
+    outer) box used by the live loop to decide when a detector must run.
+    """
 
     def __init__(self, detect_every: int = 4, max_age_frames: int | None = None):
         self.detect_every = max(1, int(detect_every))
         self.max_age_frames = max_age_frames or max(18, self.detect_every * 8)
+        self.outer_box: tuple[int, int, int, int] | None = None
+        self.inner_box: tuple[int, int, int, int] | None = None
         self.box: tuple[int, int, int, int] | None = None
         self.source = "none"
         self.age_frames = 0
-        self.preferred_miss_frames = 0
-        self.pending_source = "none"
-        self.pending_count = 0
+        self.outer_age_frames = 0
+        self.inner_age_frames = 0
+
+    def _sync_aliases(self) -> None:
+        self.box = self.inner_box or self.outer_box
+        if self.inner_box is not None:
+            self.source = "inner_screen"
+            self.age_frames = self.inner_age_frames
+        elif self.outer_box is not None:
+            self.source = "outer_frame"
+            self.age_frames = self.outer_age_frames
+        else:
+            self.source = "none"
+            self.age_frames = max(self.outer_age_frames, self.inner_age_frames)
+
+    def reset(self) -> None:
+        self.outer_box = None
+        self.inner_box = None
+        self.box = None
+        self.source = "none"
+        self.age_frames = 0
+        self.outer_age_frames = 0
+        self.inner_age_frames = 0
 
     @staticmethod
     def _center_size(box: tuple[int, int, int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -488,10 +521,14 @@ class GeometryLockTracker:
 
     def update_flow(self, previous_gray: np.ndarray | None, current_gray: np.ndarray | None) -> None:
         """Follow the locked machine with sparse optical flow between detections."""
-        if self.box is None or previous_gray is None or current_gray is None:
+        if (self.outer_box is None and self.inner_box is None) or previous_gray is None or current_gray is None:
             return
         height, width = current_gray.shape[:2]
-        x0, y0, x1, y1 = self.box
+        active = [box for box in (self.outer_box, self.inner_box) if box is not None]
+        x0 = min(box[0] for box in active)
+        y0 = min(box[1] for box in active)
+        x1 = max(box[2] for box in active)
+        y1 = max(box[3] for box in active)
         pad_x = max(4, int((x1 - x0) * 0.08))
         pad_y = max(4, int((y1 - y0) * 0.08))
         roi = np.zeros_like(previous_gray, dtype=np.uint8)
@@ -531,15 +568,19 @@ class GeometryLockTracker:
         )
         if matrix is None or inliers is None or int(inliers.sum()) < 4:
             return
-        transformed = transform_box(self.box, matrix)
-        if transformed is None:
-            return
-        tx0, ty0, tx1, ty1 = transformed
-        if tx1 <= tx0 or ty1 <= ty0:
-            return
-        if not self._compatible(self.box, transformed, width, height):
-            return
-        self.box = self._blend_box(self.box, transformed, 0.80)
+        for attribute in ("outer_box", "inner_box"):
+            previous = getattr(self, attribute)
+            if previous is None:
+                continue
+            transformed = transform_box(previous, matrix)
+            if transformed is None:
+                continue
+            tx0, ty0, tx1, ty1 = transformed
+            if tx1 <= tx0 or ty1 <= ty0:
+                continue
+            if self._compatible(previous, transformed, width, height):
+                setattr(self, attribute, self._blend_box(previous, transformed, 0.80))
+        self._sync_aliases()
 
     def ingest(
         self,
@@ -548,65 +589,35 @@ class GeometryLockTracker:
         width: int,
         height: int,
     ) -> None:
-        """Accept a detector result after source and jump consistency checks."""
-        candidate = inner or outer
-        candidate_source = "inner_screen" if inner is not None else ("outer_frame" if outer is not None else "none")
-        if candidate is None:
-            self.age_frames += self.detect_every
-            self.preferred_miss_frames += self.detect_every
-        elif self.box is None:
-            self.box = candidate
-            self.source = candidate_source
-            self.age_frames = 0
-            self.preferred_miss_frames = 0
-            self.pending_source = "none"
-            self.pending_count = 0
-        elif self.source == "inner_screen" and candidate_source == "outer_frame":
-            # Keep the better inner-screen lock while its detector briefly
-            # misses; the flow tracker carries it through these frames.
-            self.age_frames = 0
-            self.preferred_miss_frames += self.detect_every
-            if self.preferred_miss_frames > self.max_age_frames:
-                self.box = candidate
-                self.source = candidate_source
-                self.preferred_miss_frames = 0
-        elif candidate_source != self.source:
-            if candidate_source == self.pending_source:
-                self.pending_count += 1
+        """Accept each detector result independently after jump checks."""
+        for attribute, candidate, age_attribute in (
+            ("outer_box", outer, "outer_age_frames"),
+            ("inner_box", inner, "inner_age_frames"),
+        ):
+            previous = getattr(self, attribute)
+            if candidate is None:
+                age = getattr(self, age_attribute) + self.detect_every
+                setattr(self, age_attribute, age)
+                if age > self.max_age_frames:
+                    setattr(self, attribute, None)
+                continue
+            if previous is None:
+                setattr(self, attribute, tuple(int(value) for value in candidate))
+                setattr(self, age_attribute, 0)
+                continue
+            if self._compatible(previous, candidate, width, height):
+                setattr(self, attribute, self._blend_box(previous, candidate, 0.22))
+                setattr(self, age_attribute, 0)
             else:
-                self.pending_source = candidate_source
-                self.pending_count = 1
-            if self.pending_count >= 2 and self._compatible(self.box, candidate, width, height):
-                self.box = self._blend_box(self.box, candidate, 0.35)
-                self.source = candidate_source
-                self.age_frames = 0
-                self.preferred_miss_frames = 0
-                self.pending_source = "none"
-                self.pending_count = 0
-        elif self._compatible(self.box, candidate, width, height):
-            self.box = self._blend_box(self.box, candidate, 0.22)
-            self.age_frames = 0
-            self.preferred_miss_frames = 0
-            self.pending_source = "none"
-            self.pending_count = 0
-        else:
-            self.age_frames += self.detect_every
-
-        if self.age_frames > self.max_age_frames:
-            self.box = None
-            self.source = "none"
-            self.preferred_miss_frames = 0
-            self.pending_source = "none"
-            self.pending_count = 0
+                # A far-away detector result is almost always a false match;
+                # keep the last good box and let optical flow bridge the gap.
+                setattr(self, age_attribute, getattr(self, age_attribute) + self.detect_every)
+                if getattr(self, age_attribute) > self.max_age_frames:
+                    setattr(self, attribute, None)
+        self._sync_aliases()
 
     def boxes(self) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
-        if self.box is None:
-            return None, None
-        if self.source == "inner_screen":
-            return None, self.box
-        if self.source == "outer_frame":
-            return self.box, None
-        return None, None
+        return self.outer_box, self.inner_box
 
 
 def process(args: argparse.Namespace) -> Path:

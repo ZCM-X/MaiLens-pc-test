@@ -70,12 +70,12 @@ class ProcessSessionTests(unittest.TestCase):
         self.assertEqual(outer, (80, 60, 280, 220))
         self.assertIsNone(inner)
 
-    def test_geometry_tracker_prefers_existing_inner_screen_over_outer_fallback(self):
+    def test_geometry_tracker_keeps_outer_and_inner_boxes_when_inner_detector_misses(self):
         tracker = GeometryLockTracker(detect_every=3)
         tracker.ingest((40, 30, 360, 270), (100, 80, 300, 220), 400, 300)
         tracker.ingest((45, 35, 355, 265), None, 400, 300)
         outer, inner = tracker.boxes()
-        self.assertIsNone(outer)
+        self.assertIsNotNone(outer)
         self.assertIsNotNone(inner)
 
     def test_geometry_tracker_follows_translation_between_detector_frames(self):
@@ -127,7 +127,7 @@ class ProcessSessionTests(unittest.TestCase):
         self.assertLess(float(center[0]), 0.5)
         self.assertGreater(zoom, 0.70)
 
-    def test_geometry_lock_prefers_inner_screen_target(self):
+    def test_geometry_lock_uses_outer_center_and_inner_size(self):
         center, _zoom, source = update_geometry_lock_state(
             np.array([0.5, 0.5], dtype=np.float32),
             1.0,
@@ -137,8 +137,15 @@ class ProcessSessionTests(unittest.TestCase):
             300,
         )
         self.assertEqual(source, "inner_screen")
-        self.assertGreater(float(center[0]), 0.5)
-        self.assertLess(float(center[1]), 0.5)
+        np.testing.assert_allclose(center, [0.35, 0.46666667], atol=1e-6)
+
+    def test_geometry_tracker_rejects_far_outer_jump_but_keeps_inner_box(self):
+        tracker = GeometryLockTracker(detect_every=3)
+        tracker.ingest((40, 30, 360, 270), (100, 80, 300, 220), 400, 300)
+        tracker.ingest((300, 10, 395, 100), (105, 84, 305, 224), 400, 300)
+        outer, inner = tracker.boxes()
+        self.assertEqual(outer, (40, 30, 360, 270))
+        self.assertIsNotNone(inner)
 
     def test_geometry_lock_keeps_state_but_does_not_report_a_stale_box(self):
         previous = np.array([0.42, 0.56], dtype=np.float32)
