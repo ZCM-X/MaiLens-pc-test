@@ -17,6 +17,7 @@ try:
         make_output_rays,
         rotation_for_row,
         transform_box,
+        update_geometry_lock_state,
     )
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
@@ -27,6 +28,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         make_output_rays,
         rotation_for_row,
         transform_box,
+        update_geometry_lock_state,
     )
 
 
@@ -44,6 +46,7 @@ class LiveProcessor:
         k2: float = -0.0174637,
         model: Path | None = None,
         detect_every: int = 3,
+        lock_fill: float = 0.64,
         debug: bool = False,
     ) -> None:
         self.crop = crop
@@ -53,6 +56,7 @@ class LiveProcessor:
         self.k1 = k1
         self.k2 = k2
         self.detect_every = max(1, detect_every)
+        self.lock_fill = float(min(max(lock_fill, 0.35), 0.90))
         self.debug = debug
         self.detector = GeometryDetector(model)
         self.frame_index = 0
@@ -63,6 +67,9 @@ class LiveProcessor:
         self.previous_zoom = 1.0
         self.previous_outer = None
         self.previous_inner = None
+        self.detection_age = 0
+        self.max_detection_age = max(12, self.detect_every * 8)
+        self.lock_source = "none"
 
     def process(self, frame: np.ndarray, metadata: dict) -> tuple[np.ndarray, dict]:
         height, width = frame.shape[:2]
@@ -78,24 +85,44 @@ class LiveProcessor:
         )
         stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
 
-        if self.detector.model is not None and (
-            self.frame_index % self.detect_every == 0 or self.previous_inner is None
+        detector_ran = False
+        if self.detector.enabled and (
+            self.frame_index % self.detect_every == 0
+            or (self.previous_inner is None and self.previous_outer is None)
         ):
-            self.previous_outer, self.previous_inner = self.detector.detect(stabilized)
+            detector_ran = True
+            detected_outer, detected_inner = self.detector.detect(stabilized)
+            if detected_outer is not None or detected_inner is not None:
+                self.previous_outer, self.previous_inner = detected_outer, detected_inner
+                self.detection_age = 0
+            else:
+                self.detection_age += self.detect_every
+        elif self.detector.enabled:
+            self.detection_age += 1
+
+        if not self.detector.enabled:
+            self.detection_age = 0
+        elif self.detection_age > self.max_detection_age:
+            self.previous_outer, self.previous_inner = None, None
+
         outer, inner = self.previous_outer, self.previous_inner
 
         center = self.previous_center.copy()
         zoom = self.previous_zoom
-        if inner:
-            center_target = np.array([
-                (inner[0] + inner[2]) / (2 * width),
-                (inner[1] + inner[3]) / (2 * height),
-            ], dtype=np.float32)
-            center = self.previous_center * 0.82 + center_target * 0.18
-            inner_width = max(inner[2] - inner[0], 1)
-            zoom_target = max(0.75, min(1.25, 0.30 * width / inner_width))
-            zoom = self.previous_zoom * 0.93 + zoom_target * 0.07
+        center, zoom, lock_source = update_geometry_lock_state(
+            self.previous_center,
+            self.previous_zoom,
+            outer,
+            inner,
+            width,
+            height,
+            self.lock_fill,
+        )
+        if lock_source != "none":
             self.previous_center, self.previous_zoom = center, zoom
+            self.lock_source = lock_source
+        elif detector_ran:
+            self.lock_source = "searching"
 
         stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
         outer = transform_box(outer, geometry_matrix)
@@ -110,13 +137,15 @@ class LiveProcessor:
             "zoom": zoom,
             "detected_outer": outer,
             "detected_inner": inner,
+            "lock_source": self.lock_source,
+            "detection_age_frames": self.detection_age,
         }
         if self.debug:
             stabilized = draw_debug(
                 stabilized,
                 outer,
                 inner,
-                f"{self.frame_index}  crop={self.crop:.2f}  zoom={zoom:.2f}",
+                f"{self.frame_index}  lock={self.lock_source}  zoom={zoom:.2f}",
             )
         return stabilized, debug
 
@@ -126,4 +155,3 @@ class LiveProcessor:
         if pose.get("timestamp") is None or metadata.get("timestamp") is None:
             return None
         return (float(pose["timestamp"]) - float(metadata["timestamp"])) * 1000.0
-

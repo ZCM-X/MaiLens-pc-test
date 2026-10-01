@@ -89,32 +89,143 @@ def build_remap(
 class GeometryDetector:
     def __init__(self, model_path: Path | None):
         self.model = None
+        self.cv_net = None
+        self.backend = "none"
+        self.input_size = 640
+        self.confidence = 0.30
+        self.names = {0: "outer_frame", 1: "inner_screen"}
         if model_path:
+            model_path = Path(model_path)
+            opencv_error = None
+            if model_path.suffix.lower() == ".onnx":
+                try:
+                    self.cv_net = cv2.dnn.readNetFromONNX(str(model_path))
+                    self.backend = "opencv-dnn"
+                    return
+                except Exception as error:
+                    opencv_error = error
+
             try:
                 from ultralytics import YOLO  # type: ignore
-                self.model = YOLO(str(model_path))
-            except ImportError as error:
-                raise RuntimeError("使用 --model 前请先安装 ultralytics") from error
+                self.model = YOLO(str(model_path), task="detect")
+                self.backend = "ultralytics"
+            except (ImportError, ModuleNotFoundError) as error:
+                detail = f"；OpenCV DNN 错误：{opencv_error}" if opencv_error else ""
+                if model_path.suffix.lower() == ".onnx":
+                    raise RuntimeError(f"无法加载 ONNX 检测模型：{model_path}{detail}") from error
+                raise RuntimeError("使用非 ONNX 模型前请先安装可用的 ultralytics/torch") from error
+            except Exception as error:
+                if model_path.suffix.lower() == ".onnx":
+                    detail = f"；OpenCV DNN 错误：{opencv_error}" if opencv_error else ""
+                    raise RuntimeError(f"无法加载检测模型：{model_path}{detail}") from error
+                raise RuntimeError(f"无法加载检测模型：{model_path}") from error
+
+    @property
+    def enabled(self) -> bool:
+        return self.model is not None or self.cv_net is not None
 
     def detect(self, frame: np.ndarray) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
-        if self.model is None:
+        if not self.enabled:
             return None, None
-        result = self.model.predict(frame, imgsz=640, conf=0.22, verbose=False)[0]
-        boxes = []
-        names = result.names
-        for box in result.boxes:
-            xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
-            cls = int(box.cls[0].item())
-            label_value = names[cls] if isinstance(names, (list, tuple)) else names.get(cls, cls)
-            label = str(label_value).lower()
-            boxes.append((label, tuple(xyxy)))
-        outer = next((box for label, box in boxes if "outer" in label or "frame" in label), None)
-        inner = next((box for label, box in boxes if "inner" in label or "screen" in label), None)
+        if self.cv_net is not None:
+            boxes = self._detect_opencv(frame)
+        else:
+            result = self.model.predict(frame, imgsz=self.input_size, conf=self.confidence, device="cpu", verbose=False)[0]
+            names = result.names
+            boxes = []
+            for box in result.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+                cls = int(box.cls[0].item())
+                label_value = names[cls] if isinstance(names, (list, tuple)) else names.get(cls, cls)
+                boxes.append((str(label_value).lower(), float(box.conf[0].item()), tuple(xyxy)))
+
+        return self._pick_geometry_boxes(boxes)
+
+    def _detect_opencv(self, frame: np.ndarray) -> list[tuple[str, float, tuple[int, int, int, int]]]:
+        """Run a YOLO export through OpenCV DNN without torch/onnxruntime."""
+        height, width = frame.shape[:2]
+        scale = min(self.input_size / max(width, 1), self.input_size / max(height, 1))
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
+        pad_x = (self.input_size - resized_width) // 2
+        pad_y = (self.input_size - resized_height) // 2
+        canvas[pad_y:pad_y + resized_height, pad_x:pad_x + resized_width] = resized
+
+        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (self.input_size, self.input_size), swapRB=True)
+        self.cv_net.setInput(blob)
+        output = np.squeeze(self.cv_net.forward())
+        if output.ndim != 2:
+            return []
+        # Ultralytics YOLO exports are usually [classes+4, candidates].
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+        if output.shape[1] <= 4:
+            return []
+
+        candidates: list[tuple[str, float, tuple[int, int, int, int], int]] = []
+        for row in output:
+            class_scores = row[4:]
+            class_id = int(np.argmax(class_scores))
+            confidence = float(class_scores[class_id])
+            if confidence < self.confidence:
+                continue
+            center_x, center_y, box_width, box_height = (float(value) for value in row[:4])
+            x0 = int(round((center_x - box_width * 0.5 - pad_x) / max(scale, 1e-6)))
+            y0 = int(round((center_y - box_height * 0.5 - pad_y) / max(scale, 1e-6)))
+            x1 = int(round((center_x + box_width * 0.5 - pad_x) / max(scale, 1e-6)))
+            y1 = int(round((center_y + box_height * 0.5 - pad_y) / max(scale, 1e-6)))
+            box = (max(0, x0), max(0, y0), min(width, x1), min(height, y1))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
+            candidates.append((self.names.get(class_id, str(class_id)), confidence, box, class_id))
+
+        # Keep one stable candidate per class. The final geometry selector
+        # chooses the most confident valid outer and inner boxes.
+        selected: list[tuple[str, float, tuple[int, int, int, int]]] = []
+        for class_id in sorted({candidate[3] for candidate in candidates}):
+            class_candidates = [candidate for candidate in candidates if candidate[3] == class_id]
+            boxes = [[candidate[2][0], candidate[2][1], candidate[2][2] - candidate[2][0], candidate[2][3] - candidate[2][1]] for candidate in class_candidates]
+            scores = [candidate[1] for candidate in class_candidates]
+            keep = cv2.dnn.NMSBoxes(boxes, scores, self.confidence, 0.45)
+            for index in np.asarray(keep).reshape(-1).tolist() if len(keep) else []:
+                label, confidence, box, _ = class_candidates[int(index)]
+                selected.append((label, confidence, box))
+        return selected
+
+    @staticmethod
+    def _pick_geometry_boxes(boxes: list[tuple[str, float, tuple[int, int, int, int]]]):
+        # Normalize labels so both Ultralytics and OpenCV DNN backends share
+        # exactly the same outer/inner selection and overlap validation.
+        boxes = [(str(label).lower(), float(confidence), tuple(box)) for label, confidence, box in boxes]
+
+        def area(box: tuple[int, int, int, int]) -> int:
+            return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+        outer_candidates = [
+            (confidence, box)
+            for label, confidence, box in boxes
+            if any(token in label for token in ("outer", "frame", "cabinet", "machine", "arcade"))
+        ]
+        inner_candidates = [
+            (confidence, box)
+            for label, confidence, box in boxes
+            if any(token in label for token in ("inner", "screen", "display"))
+        ]
+        outer = max(outer_candidates, key=lambda item: (item[0], area(item[1])))[1] if outer_candidates else None
+        inner = max(inner_candidates, key=lambda item: (item[0], area(item[1])))[1] if inner_candidates else None
         if outer is None and boxes:
-            outer = max((box for _, box in boxes), key=lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1]))
-        if inner is None and outer is not None:
-            candidates = [box for _, box in boxes if box != outer and box[2] > box[0] and box[3] > box[1]]
-            inner = min(candidates, key=lambda b: (b[2] - b[0]) * (b[3] - b[1])) if candidates else None
+            # Keep the detector usable with a one-class machine model while
+            # avoiding the old behaviour of treating a second outer box as an
+            # inner screen.
+            outer = max((box for _, _, box in boxes), key=area)
+        if inner is not None and outer is not None:
+            ix0, iy0, ix1, iy1 = inner
+            ox0, oy0, ox1, oy1 = outer
+            intersection = max(0, min(ix1, ox1) - max(ix0, ox0)) * max(0, min(iy1, oy1) - max(iy0, oy0))
+            if intersection / max(area(inner), 1) < 0.35:
+                inner = None
         return outer, inner
 
 
@@ -156,6 +267,38 @@ def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> t
     return locked, matrix
 
 
+def update_geometry_lock_state(
+    previous_center: np.ndarray,
+    previous_zoom: float,
+    outer,
+    inner,
+    width: int,
+    height: int,
+    lock_fill: float = 0.64,
+) -> tuple[np.ndarray, float, str]:
+    """Smooth a detected machine target into a center/zoom lock state."""
+    center = previous_center.copy()
+    zoom = float(previous_zoom)
+    target = inner or outer
+    source = "none"
+    if target:
+        center_target = np.array([
+            (target[0] + target[2]) / (2 * width),
+            (target[1] + target[3]) / (2 * height),
+        ], dtype=np.float32)
+        center = previous_center * 0.82 + center_target * 0.18
+        target_width = max(target[2] - target[0], 1)
+        target_height = max(target[3] - target[1], 1)
+        lock_fill = float(min(max(lock_fill, 0.35), 0.90))
+        target_fill = lock_fill if inner else min(lock_fill + 0.12, 0.90)
+        zoom_target = min(target_fill * width / target_width,
+                          target_fill * height / target_height)
+        zoom_target = max(0.70, min(1.35, zoom_target))
+        zoom = previous_zoom * 0.93 + zoom_target * 0.07
+        source = "inner_screen" if inner else "outer_frame"
+    return center, zoom, source
+
+
 def process(args: argparse.Namespace) -> Path:
     session = args.session
     metadata_path = session / "capture.jsonl"
@@ -194,17 +337,22 @@ def process(args: argparse.Namespace) -> Path:
                     args.k1, args.k2, args.center_x, args.center_y,
                 )
                 stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
-                if args.model and (index % args.detect_every == 0 or previous_inner is None):
+                if args.model and (
+                    index % args.detect_every == 0
+                    or (previous_outer is None and previous_inner is None)
+                ):
                     previous_outer, previous_inner = detector.detect(stabilized)
                 outer, inner = previous_outer, previous_inner
-                center = previous_center.copy()
-                zoom = previous_zoom
-                if inner:
-                    center_target = np.array([(inner[0] + inner[2]) / (2 * width), (inner[1] + inner[3]) / (2 * height)], dtype=np.float32)
-                    center = previous_center * 0.82 + center_target * 0.18
-                    inner_width = max(inner[2] - inner[0], 1)
-                    zoom_target = max(0.75, min(1.25, 0.30 * width / inner_width))
-                    zoom = previous_zoom * 0.93 + zoom_target * 0.07
+                center, zoom, lock_source = update_geometry_lock_state(
+                    previous_center,
+                    previous_zoom,
+                    outer,
+                    inner,
+                    width,
+                    height,
+                    getattr(args, "lock_fill", 0.64),
+                )
+                if lock_source != "none":
                     previous_center, previous_zoom = center, zoom
                 stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                 outer = transform_box(outer, geometry_matrix)
@@ -227,6 +375,7 @@ def process(args: argparse.Namespace) -> Path:
                     "zoom": zoom,
                     "detected_outer": outer,
                     "detected_inner": inner,
+                    "lock_source": lock_source,
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
     finally:
         writer.release()
@@ -253,11 +402,15 @@ def main() -> None:
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--detect-every", type=int, default=3,
                         help="模型每隔多少帧检测一次，默认 3；中间帧沿用平滑结果")
+    parser.add_argument("--lock-fill", type=float, default=0.64,
+                        help="内屏锁定后占画面短边的比例，默认 0.64")
     args = parser.parse_args()
     if not 0.2 <= args.crop <= 1.0:
         parser.error("--crop 应在 0.2 到 1.0 之间")
     if args.detect_every < 1:
         parser.error("--detect-every 必须大于 0")
+    if not 0.35 <= args.lock_fill <= 0.90:
+        parser.error("--lock-fill 应在 0.35 到 0.90 之间")
     process(args)
 
 

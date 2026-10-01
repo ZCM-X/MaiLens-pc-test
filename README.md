@@ -50,20 +50,20 @@ sessions/20261001-153012
 
 处理器默认载入当前 MaiLens 的鱼眼参数（中心 `0.501753869, 0.499423644`、`k1=0.0893163`、`k2=-0.0174637`、输出视场角 `106.4583°`），所以电脑生成的结果会先做鱼眼反变换，再做姿态稳定。参数可以直接用 `--center-x`、`--center-y`、`--k1`、`--k2` 和 `--fov` 覆盖。
 
-如果要让实时模式同时做机台外框/内屏锁定，先安装可选依赖，然后传模型路径：
+如果要让实时模式同时做机台外框/内屏锁定，直接使用仓库内的 ONNX 模型。电脑端优先用 OpenCV DNN 推理，不需要安装 PyTorch：
 
 ```powershell
-py -m pip install ultralytics
 .\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
-  --process-live --preview --model models\frame-geometry-yolo11n-v2.onnx
+  --process-live --preview --machine-lock --debug
 ```
 
-实时检测默认每 3 帧运行一次，帧间沿用平滑结果，避免模型推理把网络延迟越积越大。`--debug` 可以在实时画面叠加外框、内屏、中心和缩放信息。
+如果要使用 `.pt` 等非 ONNX 模型，才需要额外安装 `ultralytics` 和对应的 PyTorch 运行环境。
+
+实时检测默认每 3 帧运行一次，帧间沿用平滑结果；短暂漏检时最多保留约 0.2 秒，之后会停止使用旧框。内屏存在时以内屏中心为锁定目标，否则退回机台外框中心。`--debug` 会在实时画面叠加外框、内屏、锁定来源和缩放信息；`--lock-fill 0.64` 可以调整内屏在画面中的大小。
 
 如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在离线处理上：
 
 ```powershell
-py -m pip install ultralytics
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
 ```

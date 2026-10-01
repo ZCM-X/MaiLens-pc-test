@@ -60,6 +60,7 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             k2=args.k2,
             model=args.model,
             detect_every=args.detect_every,
+            lock_fill=getattr(args, "lock_fill", 0.64),
             debug=args.debug,
         )
         print("实时处理：鱼眼矫正 + 姿态云台已开启" + (" + 机台检测" if args.model else ""))
@@ -213,6 +214,10 @@ def main() -> None:
     parser.add_argument("--processing-scale", type=float, default=0.5,
                         help="实时鱼眼处理比例，默认 0.5 以接近 60 fps；原始帧仍保存全分辨率")
     parser.add_argument("--model", type=Path, help="可选外框/内屏模型；与 --process-live 一起使用")
+    parser.add_argument("--machine-lock", action="store_true",
+                        help="启用机台检测居中；默认使用 models/frame-geometry-yolo11n-v2.onnx")
+    parser.add_argument("--lock-fill", type=float, default=0.64,
+                        help="内屏锁定后占画面短边的比例，默认 0.64")
     parser.add_argument("--debug", action="store_true", help="实时画面叠加检测框、中心和缩放")
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
@@ -222,12 +227,16 @@ def main() -> None:
     parser.add_argument("--k2", type=float, default=-0.0174637)
     parser.add_argument("--detect-every", type=int, default=3)
     args = parser.parse_args()
+    if args.machine_lock and args.model is None:
+        args.model = Path("models/frame-geometry-yolo11n-v2.onnx")
     if not (0 < args.port < 65536):
         parser.error("--port 必须在 1 到 65535 之间")
     if args.fps <= 0:
         parser.error("--fps 必须大于 0")
     if not 0.25 <= args.processing_scale <= 1.0:
         parser.error("--processing-scale 应在 0.25 到 1.0 之间")
+    if not 0.35 <= args.lock_fill <= 0.90:
+        parser.error("--lock-fill 应在 0.35 到 0.90 之间")
     if not 0.2 <= args.crop <= 1.0:
         parser.error("--crop 应在 0.2 到 1.0 之间")
     if args.detect_every < 1:
