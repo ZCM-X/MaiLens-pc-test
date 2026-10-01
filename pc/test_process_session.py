@@ -39,6 +39,10 @@ class ProcessSessionTests(unittest.TestCase):
                 "model": None,
                 "crop": 0.74,
                 "fov": 106.4583,
+                "center_x": 0.501753869,
+                "center_y": 0.499423644,
+                "k1": 0.0893163,
+                "k2": -0.0174637,
                 "fps": None,
                 "debug": True,
                 "preview": False,
@@ -52,4 +56,3 @@ class ProcessSessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
