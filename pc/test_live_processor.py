@@ -50,7 +50,7 @@ class LiveProcessorTests(unittest.TestCase):
         }
 
         _output, first = processor.process(frame, metadata)
-        self.assertEqual(first["lock_source"], "outer_frame")
+        self.assertEqual(first["lock_source"], "outer_buttons")
         self.assertIsNotNone(first["detected_outer"])
 
         for _ in range(3):

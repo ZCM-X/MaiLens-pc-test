@@ -59,43 +59,50 @@ sessions/20261001-153012
 
 如果要使用 `.pt` 等非 ONNX 模型，才需要额外安装 `ultralytics` 和对应的 PyTorch 运行环境。
 
-实时检测默认每 4 帧运行一次，模型在原始鱼眼帧上检测，再映射到鱼眼矫正后的输出坐标；中间帧使用稀疏光流跟踪。锁定器会分别保留外框与内屏：外框中心负责把整台机台送到画面中心，内屏尺寸只负责裁切缩放。调试画面用黄色框标外框、绿色框标内屏，白色十字是输出中心；`--lock-fill 0.64` 可以调整内屏在画面中的大小。
+实时检测默认每 4 帧运行一次，模型在原始鱼眼帧上检测，再映射到鱼眼矫正后的输出坐标；中间帧使用稀疏光流跟踪。几何模型的 `outer_buttons` 中心负责把整台机台送到画面中心，`inner_screen` 尺寸只负责裁切缩放。调试画面用黄色框标外圈按键区域、绿色框标内屏，白色十字是输出中心；`--lock-fill 0.64` 可以调整内屏在画面中的大小。
 
 ## 标注自己的机台数据
 
-当前内置模型经常框到内屏而不是机台主体，因此建议先用自己的鱼眼画面标一些真实样本，再训练新的模型。运行标注工具：
+这里要训练两套模型，两个数据集不要混在一起：
+
+1. 几何模型：`outer_buttons` + `inner_screen`，负责识别外圈按键区域、内屏以及两者的距离关系，用于机台居中和裁切。
+2. 按键模型：`button` + `inner_screen`，负责在内屏坐标系中识别谱面按键；它的结果不参与机台居中。
+
+当前内置模型经常框到内屏而不是外圈按键区域，因此建议先用自己的鱼眼照片标这两套数据，再训练新的模型。运行标注工具：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
   --input sessions\你的会话目录 --output datasets\geometry `
-  --every 6 --val-every 10
+  --preset geometry --every 6 --val-every 10
 ```
 
-`--input` 可以是实时会话目录、视频、单张图或图片目录。视频默认每 6 帧取一帧，避免连续相似帧占满数据；`--max-frames 120` 可限制本次数量。窗口里拖动矩形，按 `1` 标完整机台可见外框，按 `2` 标实际游戏内屏；按 `s` 保存，`n`/空格下一张，`p` 上一张，`x` 删除当前类别框，`r` 清除此图，`q` 退出。下一次以相同 `--output` 打开会继续已有标注。
+`--input` 可以是实时会话目录、视频、单张图或图片目录。视频默认每 6 帧取一帧，避免连续相似帧占满数据；`--max-frames 120` 可限制本次数量。窗口里用 `1`、`2` 切换类别，拖动矩形，按 `s` 保存，`n`/空格下一张，`p` 上一张，`x` 删除当前类别框，`r` 清除此图，`q` 退出。下一次以相同 `--output` 打开会继续已有标注。
 
 iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张都看，所以把 `--every` 设为 `1`，例如：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
   --input "C:\Users\93543\Downloads\maimoller训练" `
-  --output datasets\maimoller-buttons --every 1 --with-buttons
+  --output datasets\maimoller-geometry --preset geometry --every 1
 ```
 
-如果要同时标谱面的八个按键，打开第三类：
+几何模型按截图中的方式标：`outer_buttons` 只画一个整体框，覆盖外圈 8 个实体按键和它们所在的环形区域；不要拆成 8 个小框。`inner_screen` 沿圆形游戏屏幕边缘画一个整体矩形。
+
+按键模型单独使用另一份输出目录：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
-  --input sessions\你的会话目录 --output datasets\geometry-buttons `
-  --every 6 --val-every 10 --with-buttons
+  --input "C:\Users\93543\Downloads\maimoller训练" `
+  --output datasets\maimoller-buttons --preset buttons `
+  --every 1 --val-every 10 --max-instances 16
 ```
 
-启用后按 `3`，在同一帧依次框出最多 8 个按键；按 `z` 撤销最后一个按键，`x` 清空全部按键。按键少于 8 个时只标清楚可见的按键，不要为了凑数乱框。
+按键模型中 `1=button`，`2=inner_screen`；`button` 可以在同一张图重复框选多个谱面按键，按 `z` 撤销最后一个。若要专门训练滑条，把 `--preset buttons` 改成 `--preset slides`，类别会变成 `slide + inner_screen`。
 
-训练时只标这两个目标：
+两套模型的标注语义分别是：
 
-- `outer_frame`：整台机台/机柜在画面里可见的完整外轮廓，包括屏幕外的边框和机身；不要把地面、背景或旁边设备框进去。
-- `inner_screen`：显示游戏内容的屏幕矩形，沿屏幕玻璃/显示区域的边缘框；它可以包含屏幕里的按键，但不要把单个按键、判定星星或 UI 元素单独当成内屏框。
-- `button`：每个谱面按键的可见区域，一个按键一个框，最多 8 个；它只用于后续按键/谱面识别，不参与机台居中或裁切缩放。
+- 几何模型：`outer_buttons`、`inner_screen`，外圈按键区域只标一个整体框。
+- 按键模型：`button`、`inner_screen`，每个谱面按键一个框；内屏框在两套模型中都保留，作为坐标参考。
 
 不要为了每张图都凑两个框而猜测。某个目标被遮挡或出画时，只标清楚可见的那个；两类都看不清就跳过样本。工具输出标准 YOLO `images/{train,val}`、`labels/{train,val}` 和 `dataset.yaml`。建议先标至少 100 张，覆盖远近、左右偏移、倾斜、遮挡和曝光变化，再按 Ultralytics YOLO 文档训练并导出 ONNX。
 
@@ -106,7 +113,7 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
   --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
 ```
 
-检测器锁定只使用 `outer_frame` 和 `inner_screen` 两类几何；即使模型还输出 `button`，也不会把按键当成机台外框。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
+检测器锁定只使用几何模型的 `outer_buttons` 和 `inner_screen`；按键模型的结果不会把机台锁到某个谱面元素。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
 
 ## iPhone 端构建
 

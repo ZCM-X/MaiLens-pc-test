@@ -151,7 +151,7 @@ class LiveProcessor:
             "detected_outer": outer,
             "detected_inner": inner,
             "lock_source": self.lock_source,
-            "lock_anchor": "outer_frame" if outer is not None else ("inner_screen" if inner is not None else "none"),
+            "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
         }
         if self.debug:

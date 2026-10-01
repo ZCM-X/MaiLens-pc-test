@@ -218,7 +218,7 @@ class GeometryDetector:
         self.backend = "none"
         self.input_size = 640
         self.confidence = 0.30
-        self.names = {0: "outer_frame", 1: "inner_screen", 2: "button"}
+        self.names = {0: "outer_buttons", 1: "inner_screen", 2: "button"}
         if model_path:
             model_path = Path(model_path)
             opencv_error = None
@@ -346,7 +346,7 @@ class GeometryDetector:
             # cabinet when a multi-task model detects only gameplay buttons.
             non_button_boxes = [
                 box for label, _, box in boxes
-                if not any(token in label for token in ("button", "key", "star", "marker"))
+                if not any(token in label for token in ("button", "key", "star", "marker", "slide", "note", "tap"))
             ]
             if non_button_boxes:
                 outer = max(non_button_boxes, key=area)
@@ -447,7 +447,7 @@ def update_geometry_lock_state(
             # behind a real phone translation; smooth only the scale change.
             center = center_target
             zoom = previous_zoom * 0.85 + zoom_target * 0.15
-        source = "inner_screen" if inner else "outer_frame"
+        source = "inner_screen" if inner else "outer_buttons"
     return center, zoom, source
 
 
@@ -478,7 +478,7 @@ class GeometryLockTracker:
             self.source = "inner_screen"
             self.age_frames = self.inner_age_frames
         elif self.outer_box is not None:
-            self.source = "outer_frame"
+            self.source = "outer_buttons"
             self.age_frames = self.outer_age_frames
         else:
             self.source = "none"
@@ -714,7 +714,7 @@ def process(args: argparse.Namespace) -> Path:
                     "detected_outer": outer,
                     "detected_inner": inner,
                     "lock_source": lock_source,
-                    "lock_anchor": "outer_frame" if outer is not None else ("inner_screen" if inner is not None else "none"),
+                    "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
     finally:
         writer.release()

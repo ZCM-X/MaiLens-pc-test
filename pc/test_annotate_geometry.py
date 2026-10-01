@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from tools.annotate_geometry import FrameSource, GeometryAnnotator
+from tools.annotate_geometry import BUTTON_CLASSES, FrameSource, GeometryAnnotator
 from .process_session import GeometryDetector
 
 
@@ -18,27 +18,30 @@ class AnnotationTests(unittest.TestCase):
             source = FrameSource(source_path, image_paths=[source_path])
             output = root / "dataset"
             try:
-                annotator = GeometryAnnotator(source, output, 0, include_buttons=True)
+                annotator = GeometryAnnotator(
+                    source, output, 0, classes=BUTTON_CLASSES, repeated_class=0,
+                )
                 annotator.boxes = {
-                    0: [(20, 20, 380, 180)],
-                    1: [(80, 50, 320, 150)],
-                    2: [
+                    0: [
                         (40 + index * 40, 155, 65 + index * 40, 185)
                         for index in range(8)
                     ],
+                    1: [(80, 50, 320, 150)],
                 }
                 annotator.save()
 
                 labels_path = output / "labels" / "train" / "frame-000001.txt"
                 lines = labels_path.read_text(encoding="utf-8").splitlines()
-                self.assertEqual(sum(line.startswith("2 ") for line in lines), 8)
+                self.assertEqual(sum(line.startswith("0 ") for line in lines), 8)
                 dataset_yaml = (output / "dataset.yaml").read_text(encoding="utf-8")
-                self.assertIn("nc: 3", dataset_yaml)
+                self.assertIn("nc: 2", dataset_yaml)
                 self.assertIn("button", dataset_yaml)
 
-                reloaded = GeometryAnnotator(source, output, 0, include_buttons=True)
-                self.assertEqual(len(reloaded.boxes[2]), 8)
-                self.assertEqual(reloaded.boxes[2][0], (40, 155, 65, 185))
+                reloaded = GeometryAnnotator(
+                    source, output, 0, classes=BUTTON_CLASSES, repeated_class=0,
+                )
+                self.assertEqual(len(reloaded.boxes[0]), 8)
+                self.assertEqual(reloaded.boxes[0][0], (40, 155, 65, 185))
             finally:
                 source.close()
 
@@ -52,7 +55,7 @@ class AnnotationTests(unittest.TestCase):
 
     def test_button_detections_do_not_replace_real_geometry(self):
         outer, inner = GeometryDetector._pick_geometry_boxes([
-            ("outer_frame", 0.80, (20, 10, 380, 290)),
+            ("outer_buttons", 0.80, (20, 10, 380, 290)),
             ("inner_screen", 0.90, (80, 40, 320, 230)),
             ("button", 0.99, (100, 210, 140, 250)),
         ])

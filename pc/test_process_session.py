@@ -107,7 +107,7 @@ class ProcessSessionTests(unittest.TestCase):
 
     def test_geometry_detector_selects_labeled_outer_and_inner_boxes(self):
         outer, inner = GeometryDetector._pick_geometry_boxes([
-            ("outer_frame", 0.90, (20, 20, 380, 280)),
+            ("outer_buttons", 0.90, (20, 20, 380, 280)),
             ("inner_screen", 0.88, (80, 60, 320, 230)),
             ("inner_screen", 0.40, (0, 0, 30, 30)),
         ])
@@ -123,7 +123,7 @@ class ProcessSessionTests(unittest.TestCase):
             400,
             300,
         )
-        self.assertEqual(source, "outer_frame")
+        self.assertEqual(source, "outer_buttons")
         self.assertLess(float(center[0]), 0.5)
         self.assertGreater(zoom, 0.70)
 
