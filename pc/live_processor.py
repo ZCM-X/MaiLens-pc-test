@@ -12,6 +12,7 @@ try:
     from .process_session import (
         GeometryDetector,
         GeometryLockTracker,
+        PlaneLockTracker,
         apply_geometry_lock,
         build_remap,
         draw_debug,
@@ -20,6 +21,7 @@ try:
         make_output_rays,
         rotation_for_row,
         transform_box,
+        transform_box_homography,
         geometry_reference,
         update_geometry_lock_state,
     )
@@ -27,6 +29,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
         GeometryDetector,
         GeometryLockTracker,
+        PlaneLockTracker,
         apply_geometry_lock,
         build_remap,
         draw_debug,
@@ -35,6 +38,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         make_output_rays,
         rotation_for_row,
         transform_box,
+        transform_box_homography,
         geometry_reference,
         update_geometry_lock_state,
     )
@@ -76,6 +80,7 @@ class LiveProcessor:
         self.reference_target_size: float | None = None
         self.reference_zoom: float | None = None
         self.lock_tracker = GeometryLockTracker(self.detect_every)
+        self.plane_tracker = PlaneLockTracker(self.detect_every)
         self.previous_gray: np.ndarray | None = None
         self.detection_age = 0
         self.lock_source = "none"
@@ -107,7 +112,12 @@ class LiveProcessor:
             self.reference_target_size = None
             self.reference_zoom = None
             self.lock_source = "searching"
-        self.lock_tracker.update_flow(self.previous_gray, current_gray)
+            self.plane_tracker.reset()
+        # Once the plane lock is active it owns the LK pass.  Keeping the old
+        # box tracker only during acquisition avoids doing two optical-flow
+        # solves for every 60-fps frame.
+        if not self.plane_tracker.locked:
+            self.lock_tracker.update_flow(self.previous_gray, current_gray)
 
         detector_ran = False
         if self.detector.enabled and self.frame_index % self.detect_every == 0:
@@ -128,8 +138,16 @@ class LiveProcessor:
 
         if not self.detector.enabled:
             self.lock_tracker.reset()
+            self.plane_tracker.reset()
 
         outer, inner = self.lock_tracker.boxes()
+        plane_locked = self.plane_tracker.update(
+            current_gray,
+            inner,
+            width,
+            height,
+            self.lock_fill,
+        )
         if self.lock_tracker.box is None:
             # Keep the last displayed transform until a new target is found,
             # but do not carry its distance reference to a different target.
@@ -162,9 +180,26 @@ class LiveProcessor:
         elif detector_ran or self.lock_tracker.box is None:
             self.lock_source = "searching"
 
-        stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
-        outer = transform_box(outer, geometry_matrix)
-        inner = transform_box(inner, geometry_matrix)
+        plane_matrix = self.plane_tracker.output_homography if plane_locked else None
+        if plane_matrix is not None:
+            stabilized = cv2.warpPerspective(
+                stabilized,
+                plane_matrix,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT101,
+            )
+            outer = transform_box_homography(outer, plane_matrix)
+            inner = transform_box_homography(inner, plane_matrix)
+            # The perspective transform already contains translation, scale
+            # and tilt compensation.  Do not apply a second affine crop.
+            center = np.array([0.5, 0.5], dtype=np.float32)
+            zoom = 1.0
+            self.lock_source = "plane_homography"
+        else:
+            stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
+            outer = transform_box(outer, geometry_matrix)
+            inner = transform_box(inner, geometry_matrix)
         self.previous_gray = current_gray
         self.frame_index += 1
 
@@ -180,6 +215,11 @@ class LiveProcessor:
             "lock_source": self.lock_source,
             "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
+            "plane_lock": plane_matrix is not None,
+            "plane_age_frames": self.plane_tracker.age_frames,
+            "plane_inliers": self.plane_tracker.inliers,
+            "plane_inlier_ratio": self.plane_tracker.inlier_ratio,
+            "plane_reprojection_error": self.plane_tracker.reprojection_error,
         }
         if self.debug:
             anchor = "outer" if outer is not None else ("inner" if inner is not None else "none")

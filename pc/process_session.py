@@ -451,6 +451,63 @@ def transform_box(box, matrix: np.ndarray):
     return (int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1)))
 
 
+def _box_points(box: tuple[int, int, int, int] | None) -> np.ndarray | None:
+    """Return box corners in clockwise order for homography operations."""
+    if box is None:
+        return None
+    x0, y0, x1, y1 = (float(value) for value in box)
+    if x1 - x0 < 4.0 or y1 - y0 < 4.0:
+        return None
+    return np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+
+
+def _project_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray | None:
+    """Project 2-D points with a 3x3 homography and reject invalid output."""
+    if matrix is None or not np.isfinite(matrix).all():
+        return None
+    source = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(source, np.asarray(matrix, dtype=np.float32)).reshape(-1, 2)
+    if not np.isfinite(projected).all():
+        return None
+    return projected
+
+
+def transform_box_homography(
+    box: tuple[int, int, int, int] | None,
+    matrix: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """Transform an xyxy box through a perspective matrix for debug output."""
+    points = _box_points(box)
+    if points is None:
+        return None
+    projected = _project_points(points, matrix)
+    if projected is None:
+        return None
+    x0, y0 = projected.min(axis=0)
+    x1, y1 = projected.max(axis=0)
+    return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+
+
+def _target_plane(box: tuple[int, int, int, int], width: int, height: int, lock_fill: float) -> np.ndarray | None:
+    """Create the fixed, centered output rectangle for the first valid lock."""
+    points = _box_points(box)
+    if points is None:
+        return None
+    source_width = max(float(box[2] - box[0]), 1.0)
+    source_height = max(float(box[3] - box[1]), 1.0)
+    fill = float(min(max(lock_fill, 0.35), 0.90))
+    scale = min(fill * width / source_width, fill * height / source_height)
+    target_width = source_width * scale
+    target_height = source_height * scale
+    cx, cy = width * 0.5, height * 0.5
+    return np.float32([
+        [cx - target_width * 0.5, cy - target_height * 0.5],
+        [cx + target_width * 0.5, cy - target_height * 0.5],
+        [cx + target_width * 0.5, cy + target_height * 0.5],
+        [cx - target_width * 0.5, cy + target_height * 0.5],
+    ])
+
+
 def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> tuple[np.ndarray, np.ndarray]:
     """Move the tracked screen center to the output center without a hard snap."""
     height, width = frame.shape[:2]
@@ -759,6 +816,205 @@ class GeometryLockTracker:
         return self.outer_box, self.inner_box
 
 
+class PlaneLockTracker:
+    """Track the visible screen as a plane and map it to one fixed target.
+
+    The detector supplies an initial screen box, but it is not used as the
+    frame-to-frame stabilizer. Good features inside the screen are tracked
+    with LK optical flow and a RANSAC homography is estimated for every frame.
+    This preserves translation, roll, perspective and moderate front/back
+    motion in one transform, which a centre/scale box lock cannot do.
+    """
+
+    def __init__(self, detect_every: int = 12, max_age_frames: int | None = None):
+        self.detect_every = max(1, int(detect_every))
+        self.max_age_frames = max_age_frames or max(24, self.detect_every * 10)
+        self.reset()
+
+    def reset(self) -> None:
+        self.reference_gray: np.ndarray | None = None
+        self.previous_gray: np.ndarray | None = None
+        self.reference_box: tuple[int, int, int, int] | None = None
+        self.current_box: tuple[int, int, int, int] | None = None
+        self.reference_to_output: np.ndarray | None = None
+        self.current_to_reference = np.eye(3, dtype=np.float32)
+        self.points: np.ndarray | None = None
+        self.age_frames = 0
+        self.inliers = 0
+        self.inlier_ratio = 0.0
+        self.reprojection_error = 0.0
+        self.last_success = False
+        self.frame_shape: tuple[int, int] | None = None
+        self.frames_since_refresh = 0
+
+    @property
+    def locked(self) -> bool:
+        return self.reference_gray is not None and self.reference_to_output is not None
+
+    @property
+    def output_homography(self) -> np.ndarray | None:
+        # A stale projective warp freezes the last good frame while the phone
+        # keeps moving. Hold it for only a short grace period, then let the
+        # caller use its detector/affine fallback while LK reacquires.
+        if not self.locked or self.age_frames > max(3, self.detect_every // 2):
+            return None
+        matrix = self.reference_to_output @ self.current_to_reference
+        return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
+
+    @staticmethod
+    def _feature_mask(gray: np.ndarray, box: tuple[int, int, int, int] | None) -> np.ndarray:
+        mask = np.zeros(gray.shape[:2], dtype=np.uint8)
+        if box is None:
+            mask[:, :] = 255
+            return mask
+        height, width = gray.shape[:2]
+        x0, y0, x1, y1 = box
+        inset_x = max(2, int((x1 - x0) * 0.04))
+        inset_y = max(2, int((y1 - y0) * 0.04))
+        mask[max(0, y0 + inset_y):min(height, y1 - inset_y),
+             max(0, x0 + inset_x):min(width, x1 - inset_x)] = 255
+        return mask
+
+    @classmethod
+    def _find_points(cls, gray: np.ndarray, box: tuple[int, int, int, int] | None) -> np.ndarray | None:
+        points = cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=120,
+            qualityLevel=0.008,
+            minDistance=5,
+            blockSize=7,
+            mask=cls._feature_mask(gray, box),
+            useHarrisDetector=False,
+        )
+        if points is None or len(points) < 8:
+            return None
+        return points.astype(np.float32)
+
+    def initialize(
+        self,
+        gray: np.ndarray,
+        box: tuple[int, int, int, int] | None,
+        width: int,
+        height: int,
+        lock_fill: float,
+    ) -> bool:
+        points = _box_points(box)
+        target = _target_plane(box, width, height, lock_fill) if box is not None else None
+        if points is None or target is None:
+            return False
+        reference_to_output = cv2.getPerspectiveTransform(points, target)
+        if reference_to_output is None or not np.isfinite(reference_to_output).all():
+            return False
+        tracked = self._find_points(gray, box)
+        self.reference_gray = gray.copy()
+        self.previous_gray = gray.copy()
+        self.reference_box = tuple(int(value) for value in box)
+        self.current_box = tuple(int(value) for value in box)
+        self.reference_to_output = reference_to_output.astype(np.float32)
+        self.current_to_reference = np.eye(3, dtype=np.float32)
+        self.points = tracked
+        self.age_frames = 0
+        self.inliers = 0
+        self.inlier_ratio = 1.0 if tracked is not None else 0.0
+        self.reprojection_error = 0.0
+        self.last_success = True
+        self.frame_shape = gray.shape[:2]
+        self.frames_since_refresh = 0
+        return True
+
+    @staticmethod
+    def _valid_homography(matrix: np.ndarray, previous_points: np.ndarray, current_points: np.ndarray) -> tuple[bool, int, float, float]:
+        if matrix is None or not np.isfinite(matrix).all():
+            return False, 0, 0.0, float("inf")
+        projected = _project_points(previous_points, matrix)
+        if projected is None or len(projected) != len(current_points):
+            return False, 0, 0.0, float("inf")
+        residual = np.linalg.norm(projected - current_points, axis=1)
+        inlier_mask = residual <= 4.0
+        inlier_count = int(inlier_mask.sum())
+        ratio = inlier_count / max(len(residual), 1)
+        median_error = float(np.median(residual[inlier_mask])) if inlier_count else float("inf")
+        return inlier_count >= 8 and ratio >= 0.52 and median_error <= 3.0, inlier_count, ratio, median_error
+
+    def update(
+        self,
+        gray: np.ndarray,
+        box: tuple[int, int, int, int] | None,
+        width: int,
+        height: int,
+        lock_fill: float,
+    ) -> bool:
+        if self.frame_shape != gray.shape[:2]:
+            self.reset()
+        if not self.locked:
+            return self.initialize(gray, box, width, height, lock_fill)
+        self.current_box = tuple(int(value) for value in box) if box is not None else self.current_box
+        success = False
+        if self.previous_gray is not None and self.points is not None and len(self.points) >= 8:
+            next_points, status, errors = cv2.calcOpticalFlowPyrLK(
+                self.previous_gray,
+                gray,
+                self.points,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+            )
+            if next_points is not None and status is not None:
+                valid = status.reshape(-1).astype(bool)
+                if errors is not None:
+                    valid &= errors.reshape(-1) < 30.0
+                previous_points = self.points.reshape(-1, 2)[valid]
+                current_points = next_points.reshape(-1, 2)[valid]
+                if len(previous_points) >= 8:
+                    matrix, _mask = cv2.findHomography(
+                        previous_points,
+                        current_points,
+                        cv2.RANSAC,
+                        3.0,
+                    )
+                    valid_h, count, ratio, error = self._valid_homography(
+                        matrix, previous_points, current_points,
+                    )
+                    if valid_h:
+                        try:
+                            inverse = np.linalg.inv(matrix).astype(np.float32)
+                        except np.linalg.LinAlgError:
+                            inverse = None
+                        if inverse is not None and np.isfinite(inverse).all():
+                            candidate = self.current_to_reference @ inverse
+                            ref_corners = _box_points(self.reference_box)
+                            projected = _project_points(ref_corners, candidate) if ref_corners is not None else None
+                            if projected is not None:
+                                area = abs(float(cv2.contourArea(projected.astype(np.float32))))
+                                ref_area = max(box_area(self.reference_box), 1.0)
+                                if 0.08 <= area / ref_area <= 12.0:
+                                    self.current_to_reference = candidate
+                                    self.points = current_points.reshape(-1, 1, 2).astype(np.float32)
+                                    self.inliers = count
+                                    self.inlier_ratio = ratio
+                                    self.reprojection_error = error
+                                    self.frames_since_refresh += 1
+                                    success = True
+        if not success:
+            self.age_frames += 1
+            self.last_success = False
+            self.points = None
+            if self.age_frames > self.max_age_frames:
+                self.reset()
+                return False
+        else:
+            self.age_frames = 0
+            self.last_success = True
+        self.previous_gray = gray.copy()
+        if self.points is None or len(self.points) < 12 or self.frames_since_refresh >= self.detect_every:
+            refreshed = self._find_points(gray, self.current_box)
+            if refreshed is not None:
+                self.points = refreshed
+                self.frames_since_refresh = 0
+        return self.locked
+
+
 def process(args: argparse.Namespace) -> Path:
     session = args.session
     metadata_path = session / "capture.jsonl"
@@ -786,6 +1042,7 @@ def process(args: argparse.Namespace) -> Path:
     reference_target_size: float | None = None
     reference_zoom: float | None = None
     lock_tracker = GeometryLockTracker(args.detect_every)
+    plane_tracker = PlaneLockTracker(args.detect_every)
     previous_gray = None
     previous_lock_source = "none"
     try:
@@ -801,7 +1058,17 @@ def process(args: argparse.Namespace) -> Path:
                 )
                 stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
                 current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
-                lock_tracker.update_flow(previous_gray, current_gray)
+                if previous_gray is not None and previous_gray.shape != current_gray.shape:
+                    previous_gray = None
+                    lock_tracker.reset()
+                    plane_tracker.reset()
+                    previous_center = np.array([0.5, 0.5], dtype=np.float32)
+                    previous_zoom = 1.0
+                    reference_target_size = None
+                    reference_zoom = None
+                    previous_lock_source = "searching"
+                if not plane_tracker.locked:
+                    lock_tracker.update_flow(previous_gray, current_gray)
                 if args.model and index % args.detect_every == 0:
                     detected_outer_raw, detected_inner_raw = detector.detect(frame)
                     detected_outer = map_fisheye_box_to_output(
@@ -814,6 +1081,13 @@ def process(args: argparse.Namespace) -> Path:
                     )
                     lock_tracker.ingest(detected_outer, detected_inner, width, height)
                 outer, inner = lock_tracker.boxes()
+                plane_locked = plane_tracker.update(
+                    current_gray,
+                    inner,
+                    width,
+                    height,
+                    getattr(args, "lock_fill", 0.64),
+                )
                 if lock_tracker.box is None:
                     reference_target_size = None
                     reference_zoom = None
@@ -836,9 +1110,25 @@ def process(args: argparse.Namespace) -> Path:
                 if lock_source != "none":
                     previous_center, previous_zoom = center, zoom
                     previous_lock_source = lock_source
-                stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
-                outer = transform_box(outer, geometry_matrix)
-                inner = transform_box(inner, geometry_matrix)
+                plane_matrix = plane_tracker.output_homography if plane_locked else None
+                if plane_matrix is not None:
+                    stabilized = cv2.warpPerspective(
+                        stabilized,
+                        plane_matrix,
+                        (width, height),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT101,
+                    )
+                    outer = transform_box_homography(outer, plane_matrix)
+                    inner = transform_box_homography(inner, plane_matrix)
+                    center = np.array([0.5, 0.5], dtype=np.float32)
+                    zoom = 1.0
+                    lock_source = "plane_homography"
+                    previous_lock_source = lock_source
+                else:
+                    stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
+                    outer = transform_box(outer, geometry_matrix)
+                    inner = transform_box(inner, geometry_matrix)
                 previous_gray = current_gray
                 if args.debug:
                     shown = draw_debug(stabilized, outer, inner, f"{index + 1}/{len(rows)}  crop={args.crop:.2f}  zoom={zoom:.2f}")
@@ -861,6 +1151,11 @@ def process(args: argparse.Namespace) -> Path:
                     "geometry_margins": geometry_margins(outer, inner),
                     "lock_source": lock_source,
                     "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
+                    "plane_lock": plane_matrix is not None,
+                    "plane_age_frames": plane_tracker.age_frames,
+                    "plane_inliers": plane_tracker.inliers,
+                    "plane_inlier_ratio": plane_tracker.inlier_ratio,
+                    "plane_reprojection_error": plane_tracker.reprojection_error,
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
     finally:
         writer.release()

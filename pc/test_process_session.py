@@ -9,12 +9,14 @@ import numpy as np
 from .process_session import (
     GeometryDetector,
     GeometryLockTracker,
+    PlaneLockTracker,
     apply_geometry_lock,
     build_remap,
     geometry_margins,
     geometry_reference,
     map_fisheye_points_to_output,
     plausible_geometry_pair,
+    _project_points,
     process,
     quat_to_matrix,
     rotation_for_row,
@@ -43,6 +45,41 @@ class RotationMappingTests(unittest.TestCase):
 
 
 class ProcessSessionTests(unittest.TestCase):
+    def test_plane_lock_keeps_perspective_screen_in_same_output_position(self):
+        width, height = 640, 480
+        first = np.zeros((height, width), dtype=np.uint8)
+        cv2.rectangle(first, (120, 80), (520, 400), 80, -1)
+        for y in range(100, 400, 20):
+            for x in range(140, 520, 20):
+                cv2.circle(first, (x, y), 3, 150 + (x + y) % 90, -1)
+        source = np.float32([[120, 80], [520, 80], [520, 400], [120, 400]])
+        moved = np.float32([[80, 60], [560, 90], [530, 430], [100, 400]])
+        motion = cv2.getPerspectiveTransform(source, moved)
+        second = cv2.warpPerspective(first, motion, (width, height), borderMode=cv2.BORDER_REFLECT101)
+
+        tracker = PlaneLockTracker(detect_every=3)
+        self.assertTrue(tracker.initialize(first, (120, 80, 520, 400), width, height, 0.64))
+        self.assertTrue(tracker.update(second, (80, 60, 560, 430), width, height, 0.64))
+        projected = _project_points(moved, tracker.output_homography)
+        expected = _project_points(source, tracker.reference_to_output)
+        self.assertIsNotNone(projected)
+        self.assertIsNotNone(expected)
+        np.testing.assert_allclose(projected, expected, atol=4.0)
+        self.assertGreaterEqual(tracker.inliers, 8)
+        self.assertGreaterEqual(tracker.inlier_ratio, 0.52)
+
+    def test_plane_lock_holds_reference_when_flow_quality_fails(self):
+        width, height = 320, 240
+        first = np.zeros((height, width), dtype=np.uint8)
+        cv2.rectangle(first, (60, 40), (260, 200), 180, 3)
+        tracker = PlaneLockTracker(detect_every=2, max_age_frames=3)
+        self.assertTrue(tracker.initialize(first, (60, 40, 260, 200), width, height, 0.64))
+        before = tracker.output_homography.copy()
+        blank = np.zeros_like(first)
+        self.assertTrue(tracker.update(blank, (60, 40, 260, 200), width, height, 0.64))
+        np.testing.assert_allclose(tracker.output_homography, before, atol=1e-6)
+        self.assertFalse(tracker.last_success)
+
     def test_geometry_margins_are_derived_from_two_boxes(self):
         self.assertEqual(
             geometry_margins((10, 20, 390, 280), (85, 95, 315, 205)),
