@@ -23,6 +23,13 @@ targets:
     platform: iOS
     sources:
       - path: iOS/Sources
+      # Holds MachineDetector.mlpackage, produced by Training/export_coreml.py
+      # on the macOS build machine.
+      - path: iOS/Resources
+        buildPhase: resources
+        optional: true
+        excludes:
+          - "README.md"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mailens.remote-capture

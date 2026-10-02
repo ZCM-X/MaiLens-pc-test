@@ -9,6 +9,16 @@ workflows:
     scripts:
       - name: Install XcodeGen
         script: brew install xcodegen
+      - name: Export Core ML detector
+        script: |
+          # Core ML conversion only works on macOS/Linux, so the phone model is
+          # produced here and bundled into the app as MachineDetector.mlpackage.
+          # A failure must not block the unsigned IPA.
+          python3 -m venv .coreml-env
+          .coreml-env/bin/python -m pip install --upgrade pip
+          .coreml-env/bin/python -m pip install "ultralytics>=8.3" "coremltools>=9.0" "onnx>=1.16" "numpy<=2.3.5" || true
+          .coreml-env/bin/python Training/export_coreml.py \
+            || echo "Core ML export failed; building without the bundled detector"
       - name: Generate Xcode project
         script: xcodegen generate --spec project.yml
       - name: Archive unsigned app
