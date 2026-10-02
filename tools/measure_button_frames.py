@@ -14,6 +14,7 @@ anything that follows cos/sin of the angle once round the ring is the camera,
 not the cabinet.
 """
 import argparse
+import warnings
 from pathlib import Path
 
 import cv2
@@ -39,10 +40,22 @@ def write_image(path: Path, image: np.ndarray) -> None:
     path.write_bytes(encoded.tobytes())
 
 
-def polar_signals(image, centre, angles, radii):
-    blue = image[:, :, 0].astype(int)
-    green = image[:, :, 1].astype(int)
-    red = image[:, :, 2].astype(int)
+def image_signals(image):
+    """Blue-minus-green and red-minus-green for the whole frame, once.
+
+    A polar sweep reads the same three channels over and over, and the centre
+    search runs hundreds of sweeps, so converting the frame to int inside each
+    one dominated the running time on a full-resolution picture.
+    """
+    blue = image[:, :, 0].astype(np.int16)
+    green = image[:, :, 1].astype(np.int16)
+    red = image[:, :, 2].astype(np.int16)
+    return blue - green, red - green
+
+
+def polar_signals(image, centre, angles, radii, signals=None):
+    violet_image, redness_image = image_signals(image) if signals is None \
+        else signals
     height, width = image.shape[:2]
     angle_grid, radius_grid = np.meshgrid(angles, radii, indexing="ij")
     radians = np.radians(angle_grid)
@@ -51,37 +64,53 @@ def polar_signals(image, centre, angles, radii):
     inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
     violet = np.full(x.shape, np.nan)
     redness = np.full(x.shape, np.nan)
-    violet[inside] = blue[y[inside], x[inside]] - green[y[inside], x[inside]]
-    redness[inside] = red[y[inside], x[inside]] - green[y[inside], x[inside]]
+    violet[inside] = violet_image[y[inside], x[inside]]
+    redness[inside] = redness_image[y[inside], x[inside]]
     return violet, redness
 
 
-def frame_edges(violet, redness, radii, low=25, neutral=40):
-    """Inner and outer radius of the tile at one angle, or None on a gap."""
-    outer = np.nan
-    for i, radius in enumerate(radii):
-        if radius < 278.0:
-            continue
-        if radius > 345.0 or not np.isfinite(violet[i]):
-            break
-        if abs(violet[i]) < low and abs(redness[i]) < neutral:
-            outer = radius
-            break
-    if not np.isfinite(outer):
-        return None
-    band = [violet[i] for i, radius in enumerate(radii)
-            if np.isfinite(violet[i]) and outer - 40.0 < radius < outer - 12.0]
-    if not band or float(np.median(band)) < 40.0:
-        return None
-    for i in range(len(radii) - 1, -1, -1):
-        radius = radii[i]
-        if radius > outer - 12.0:
-            continue
-        if radius < 210.0:
-            break
-        if np.isfinite(violet[i]) and abs(violet[i]) < low:
-            return radius, outer
-    return None
+def frame_edges(violet, redness, radii, bounds, low=25, neutral=40):
+    """Inner and outer radius of the tile at every angle.
+
+    Returns two arrays; a NaN means that angle fell in a gap between frames.
+    Everything is done with whole-array comparisons rather than a Python loop,
+    because the sweep needs a fine stride and a plain loop over a million
+    samples is far too slow to run interactively.
+    """
+    outer_lo, outer_hi, inner_lo = bounds
+    radial = radii[None, :]
+    finite = np.isfinite(violet)
+    # Work from the outside in: the tile's outer boundary is the first neutral
+    # sample past the middle of the ring, and a boundary only counts as a
+    # boundary when the band just inside it is actually violet.
+    neutral_ring = finite & (np.abs(violet) < low) & (np.abs(redness) < neutral)
+    window = ((radial >= outer_lo) & (radial <= outer_hi))
+    candidates = neutral_ring & window
+    has_outer = candidates.any(axis=1)
+    first = np.argmax(candidates, axis=1)
+    outer = np.where(has_outer, radii[first], np.nan)
+
+    inner_span = outer - inner_lo
+    band_hi = outer - 0.05 * inner_span
+    band_lo = outer - 0.16 * inner_span
+    band = np.where(finite & (radial > band_lo[:, None])
+                    & (radial < band_hi[:, None]), violet, np.nan)
+    with warnings.catch_warnings():
+        # A row that found no outer edge is all-NaN and fails the test below
+        # anyway; the warning about it is noise on every sweep.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        violet_band = np.nanmedian(band, axis=1)
+    solid = np.isfinite(violet_band) & (violet_band > 40.0)
+
+    inner_limit = np.where(np.isfinite(outer), outer - 0.05 * inner_span, 0.0)
+    inward = finite & (np.abs(violet) < low) & (radial < inner_limit[:, None]) \
+        & (radial >= inner_lo)
+    index = np.where(inward, np.arange(len(radii))[None, :], -1)
+    last = index.max(axis=1)
+    inner = np.where(last >= 0, radii[np.maximum(last, 0)], np.nan)
+
+    good = solid & np.isfinite(inner)
+    return np.where(good, inner, np.nan), np.where(good, outer, np.nan)
 
 
 def split_runs(angles, rows, shortest=8.0):
@@ -111,15 +140,54 @@ def user_label(angle):
     return ((1 - int(round((angle - 22.5) / 45.0))) % 8) + 1
 
 
-def measure(image, centre, stride=0.25):
+def violet_mask(image, floor=32, value=70, signals=None):
+    violet, _ = image_signals(image) if signals is None else signals
+    return (violet > floor) & (image.max(axis=2) > value)
+
+
+def violet_points(image, most=60000, signals=None):
+    """The violet pixels once, as a point cloud, so the search can reuse them."""
+    ys, xs = np.nonzero(violet_mask(image, signals=signals))
+    if len(xs) < 200:
+        return None
+    step = max(1, len(xs) // most)
+    return np.column_stack([xs[::step], ys[::step]]).astype(float)
+
+
+def ring_radius(points, centre):
+    """Mid radius of the ring, straight off the violet mask.
+
+    Everything in the tool used to be in absolute pixels, which only worked on
+    a screenshot at one size.  The tiles themselves set the scale, so the
+    median distance from the centre to a violet pixel is the radius to hang
+    the rest of the bounds off.
+    """
+    if points is None or len(points) < 200:
+        return None
+    radius = np.hypot(points[:, 0] - centre[0], points[:, 1] - centre[1])
+    return float(np.median(radius))
+
+
+def measure(image, centre, stride=0.25, radius=None, points=None, signals=None):
+    points = violet_points(image, signals=signals) if points is None else points
+    radius = radius or ring_radius(points, centre)
+    if not radius or radius < 8.0:
+        return []
     angles = np.arange(0.0, 360.0, stride)
-    radii = np.arange(200.0, 380.0, 0.5)
-    return measure_with(image, centre, angles, radii, stride)
+    step = max(0.25, radius / 600.0)
+    radii = np.arange(0.45 * radius, 1.60 * radius, step)
+    bounds = (0.92 * radius, 1.36 * radius, 0.45 * radius)
+    return measure_with(image, centre, angles, radii, stride, bounds,
+                        signals=signals)
 
 
-def measure_with(image, centre, angles, radii, stride):
-    violet, redness = polar_signals(image, centre, angles, radii)
-    rows = [frame_edges(violet[j], redness[j], radii) for j in range(len(angles))]
+def measure_with(image, centre, angles, radii, stride, bounds, signals=None):
+    violet, redness = polar_signals(image, centre, angles, radii,
+                                    signals=signals)
+    inner, outer = frame_edges(violet, redness, radii, bounds)
+    rows = [(None if not (np.isfinite(inner[j]) and np.isfinite(outer[j]))
+             else (float(inner[j]), float(outer[j])))
+            for j in range(len(angles))]
     runs = split_runs(angles, rows)
     out = []
     for run in runs:
@@ -141,7 +209,22 @@ def measure_with(image, centre, angles, radii, stride):
     return out
 
 
-def find_centre(image, guess):
+def _score(image, centre, points, angles, signals=None):
+    radius = ring_radius(points, centre)
+    if not radius or radius < 8.0:
+        return None, None
+    radii = np.arange(0.45 * radius, 1.60 * radius, max(0.5, radius / 200.0))
+    bounds = (0.92 * radius, 1.36 * radius, 0.45 * radius)
+    rows = measure_with(image, centre, angles, radii, 4.0, bounds,
+                        signals=signals)
+    if len(rows) != 8:
+        return None, None
+    outer = np.array([r["outer"] for r in rows])
+    inner = np.array([r["inner"] for r in rows])
+    return float(outer.std() + inner.std()), radius
+
+
+def find_centre(image, guess, points=None, signals=None):
     """Seed the centre by search, then settle it on a circle through the frames.
 
     The radial bounds the measurement uses are absolute, so a guess twenty
@@ -149,26 +232,36 @@ def find_centre(image, guess):
     area is cheap enough and removes the need for the operator to click the
     middle of the cabinet first.
     """
-    angles = np.arange(0.0, 360.0, 4.0)
-    radii = np.arange(200.0, 380.0, 1.0)
+    points = violet_points(image, signals=signals) if points is None else points
+    if points is None:
+        return np.asarray(guess, float)
+    signals = image_signals(image) if signals is None else signals
+    angles = np.arange(0.0, 360.0, 6.0)
     span = int(min(image.shape[:2]) * 0.09)
-    best = (None, None)
-    for dy in range(-span, span + 1, 6):
-        for dx in range(-span, span + 1, 6):
-            centre = np.array([guess[0] + dx, guess[1] + dy], float)
-            rows = measure_with(image, centre, angles, radii, 4.0)
-            if len(rows) != 8:
-                continue
-            outer = np.array([r["outer"] for r in rows])
-            inner = np.array([r["inner"] for r in rows])
-            score = float(outer.std() + inner.std())
-            if best[0] is None or score < best[0]:
-                best = (score, centre)
+    # Each stage refines the last one over three times its own step.  Scanning
+    # the whole span again at two pixels would be 68k measurements on a
+    # full-resolution photo, which is what made this tool look hung; the coarse
+    # grid already covers the span, so the finer stages only have to fill in.
+    stages = [(max(4, span // 3), span)]
+    middle_step = max(2, span // 12)
+    if middle_step < stages[0][0]:
+        stages.append((middle_step, middle_step * 3))
+    stages.append((2, 6))
+    best = (None, None, None)
+    for step, reach in stages:
+        middle = np.asarray(guess, float) if best[1] is None else best[1]
+        for dy in range(-reach, reach + 1, step):
+            for dx in range(-reach, reach + 1, step):
+                centre = np.array([middle[0] + dx, middle[1] + dy], float)
+                score, radius = _score(image, centre, points, angles,
+                                       signals=signals)
+                if score is not None and (best[0] is None or score < best[0]):
+                    best = (score, centre, radius)
     if best[1] is None:
         return np.asarray(guess, float)
     centre = best[1]
     for _ in range(6):
-        rows = measure(image, centre)
+        rows = measure(image, centre, points=points, signals=signals)
         if len(rows) != 8:
             break
         points = []
@@ -220,8 +313,11 @@ def main() -> None:
         np.array([image.shape[1] * 0.5, image.shape[0] * 0.5])
     # The ring of frames is the best centre estimate: it is the thing being
     # measured, and it is symmetric once the eight of them agree.
-    centre = guess if args.centre else find_centre(image, guess)
-    rows = measure(image, centre)
+    signals = image_signals(image)
+    points = violet_points(image, signals=signals)
+    centre = guess if args.centre else \
+        find_centre(image, guess, points, signals=signals)
+    rows = measure(image, centre, points=points, signals=signals)
     print(f"centre ({centre[0]:.1f}, {centre[1]:.1f})   {len(rows)} frames")
     if len(rows) != 8:
         print("注意：没有正好找到 8 个装饰框，检查 --centre")

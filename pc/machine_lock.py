@@ -5,6 +5,8 @@ Stage 1  fisheye unwarp with the calibrated lens profile
 Stage 2  HSV measurement of the inner play field and the purple button ring
 Stage 3  zero-phase temporal smoothing of centre / size / roll
 Stage 4  one affine warp per frame that pins the machine in the middle
+Stage 5  --ring-round: measure the eight button slots and pull the ring back
+         onto the circle a head-on picture has (pc/canonical.py)
 
 The blogger's idea is used directly: the inner screen and the outer button
 ring are measured separately, and the four gaps between them drive the virtual
@@ -22,6 +24,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+try:  # run as a script, ``pc/`` is on sys.path but the project root is not
+    from pc import canonical
+except ImportError:  # pragma: no cover - import shim only
+    import canonical
 
 RAW_FOCAL_CONST = 772.4089 / 4032.0
 
@@ -1221,6 +1228,80 @@ def measure_clip(path: Path, measure_scale: float, max_frames: int | None,
     return meta
 
 
+def canonical_series(rows: list[dict], project, middle: np.ndarray,
+                     order: int = 3, target: float = canonical.TILE_RATIO,
+                     sigma: float = 6.0) -> dict | None:
+    """Measure the eight slots in the delivered frame and fit the pull-back.
+
+    The ring fit has to be smooth in time as well as around the circle: the
+    detector drops a slot now and then, and a coefficient that jumps for one
+    frame is a visible wobble even though the geometry it describes is right.
+    So the coefficients are filled forward and run through the same zero-phase
+    Gaussian the other slow signals use.
+    """
+    count = len(rows)
+    ratios = np.full((count, canonical.SLOT_COUNT), np.nan)
+    radii = []
+    for i, row in enumerate(rows):
+        inner, outer = row["inner"], row["outer"]
+        if inner is None or not inner["points"]:
+            continue
+        points = np.array([project(i, p[0], p[1]) for p in inner["points"]])
+        radius = float(np.median(np.linalg.norm(points - middle, axis=1)))
+        if not np.isfinite(radius) or radius < 2.0:
+            continue
+        radii.append(radius)
+        if outer is None or not outer["points"]:
+            continue
+        buttons = np.array([project(i, p[0], p[1]) for p in outer["points"]])
+        ratios[i] = canonical.slot_ratios(middle, radius, buttons)
+    if not radii:
+        return None
+    screen_radius = float(np.median(radii))
+    coefficients = np.full((count, 2 * order + 1), np.nan)
+    for i in range(count):
+        found = canonical.ring_profile(ratios[i], order)
+        if found is not None:
+            coefficients[i] = found
+    usable = np.isfinite(coefficients[:, 0])
+    if usable.mean() < 0.5:
+        return None
+    for column in range(coefficients.shape[1]):
+        values = fill_nan(coefficients[:, column])
+        coefficients[:, column] = smooth(values, sigma) if sigma > 0 else values
+    fitted = canonical._basis(np.radians(canonical.SLOT_ANGLES), order) \
+        @ coefficients.T
+    fitted = fitted.T
+    before = [canonical.ring_error(ratios[i]) for i in range(count)]
+    before = [value for value in before if value is not None]
+    corrected = np.where(np.isfinite(fitted), ratios * target
+                         / np.where(np.abs(fitted) < 1e-6, np.nan, fitted),
+                         np.nan)
+    after = [canonical.ring_error(corrected[i]) for i in range(count)]
+    after = [value for value in after if value is not None]
+    gaps = {"before": [], "after": []}
+    for i in range(count):
+        for when, table in (("before", ratios), ("after", corrected)):
+            if not np.isfinite(table[i]).any():
+                continue
+            found = canonical.gap_error(canonical.side_gaps(table[i],
+                                                             screen_radius))
+            if all(np.isfinite(found)):
+                gaps[when].append(found)
+    summary = {}
+    for when, values in gaps.items():
+        if values:
+            table = np.array(values)
+            summary[when] = (float(np.median(table[:, 0])),
+                             float(np.median(table[:, 1])))
+    return dict(ratios=ratios, screen_radius=screen_radius,
+                coefficients=coefficients, target=target, order=order,
+                before=float(np.median(before)) if before else None,
+                after=float(np.median(after)) if after else None,
+                gaps=summary,
+                frames=int(usable.sum()))
+
+
 def lock_report(rows: list[dict], project, middle: np.ndarray) -> dict:
     """How well the delivered frame holds up, measured on the warp itself.
 
@@ -1370,6 +1451,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how far the machine may sit off centre, as a "
                              "fraction of the delivered width, before the "
                              "renderer zooms instead; 0 disables the slide")
+    parser.add_argument("--ring-round", type=float, default=0.0,
+                        help="pull the eight button slots back onto one circle "
+                             "(0..1, 0 = off).  Measured against the head-on "
+                             "reference, so the four screen-to-ring gaps come "
+                             "out equal on every side")
+    parser.add_argument("--ring-round-target", type=float,
+                        default=canonical.TILE_RATIO,
+                        help="head-on tile radius over screen radius")
+    parser.add_argument("--ring-round-order", type=int, default=3,
+                        help="harmonics in the ring fit; 3 fits tilt, squash "
+                             "and the first lens term with eight slots")
+    parser.add_argument("--ring-round-sigma", type=float, default=6.0,
+                        help="time window for the ring fit, in frames")
     return parser
 
 
@@ -1436,6 +1530,33 @@ def main() -> None:
         else:
             point = matrices[index] @ np.array([x, y, 1.0])
         return point * scale - np.array([crop_x, crop_y])
+
+    middle = np.array([out_w, out_h], dtype=np.float64) * 0.5
+    ring_round = None
+    if args.ring_round > 0.0:
+        ring_round = canonical_series(
+            rows, project, middle, order=int(args.ring_round_order),
+            target=float(args.ring_round_target),
+            sigma=float(args.ring_round_sigma))
+        if ring_round is None:
+            print("ring round : not enough clean measurements, leaving it off")
+        else:
+            before = ring_round["before"] or 0.0
+            after = ring_round["after"] or 0.0
+            print(f"ring round : {ring_round['frames']}/{len(rows)} frames "
+                  f"measured, screen radius {ring_round['screen_radius']:.1f}px")
+            print(f"  tile ring cv     : {before * 100:6.2f}% -> "
+                  f"{after * 100:6.2f}%  (0% = the eight slots agree)")
+            typical = np.nanmedian(ring_round["ratios"], axis=0)
+            print("  slot error       : "
+                  + canonical.slot_report(typical, float(args.ring_round_target)))
+            sides = ring_round["gaps"]
+            if "before" in sides and "after" in sides:
+                left = sides["before"]
+                found = sides["after"]
+                print(f"  four-side gap    : |L-R| {left[0]:5.1f} -> "
+                      f"{found[0]:5.1f}px  |T-B| {left[1]:5.1f} -> "
+                      f"{found[1]:5.1f}px")
 
     if args.trace is not None:
         args.trace.parent.mkdir(parents=True, exist_ok=True)
@@ -1531,6 +1652,13 @@ def main() -> None:
                                     flags=cv2.INTER_LINEAR,
                                     borderMode=cv2.BORDER_REFLECT101)
         locked = locked[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
+        if ring_round is not None:
+            maps = canonical.pull_back_maps(
+                out_w, out_h, middle, ring_round["screen_radius"],
+                ring_round["coefficients"][index], float(args.ring_round),
+                order=int(args.ring_round_order),
+                target=float(args.ring_round_target))
+            locked = canonical.apply(locked, maps)
         if args.draw:
             row = rows[index]
             source = (row["inner"]["center"] if row["inner"] is not None

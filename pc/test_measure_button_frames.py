@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
 
+from tools import measure_button_frames as frames
 from tools.measure_button_frames import measure, user_label
 
 
@@ -50,6 +52,22 @@ class ButtonFrameTests(unittest.TestCase):
         image, centre = synthetic(skip=3)
         rows = measure(image, centre)
         self.assertLess(len(rows), 8)
+
+    def test_the_centre_search_gives_up_cheaply(self):
+        """Violet paint with no ring must not turn into a minute of scanning."""
+        image = np.full((600, 600, 3), (110, 110, 110), dtype=np.uint8)
+        cv2.rectangle(image, (20, 20), (120, 220), (170, 100, 110), -1)
+        calls = []
+        real = frames._score
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(frames, "_score", counted):
+            found = frames.find_centre(image, np.array([300.0, 300.0]))
+        self.assertTrue(np.allclose(found, [300.0, 300.0]))
+        self.assertLess(len(calls), 400)
 
 
 if __name__ == "__main__":
