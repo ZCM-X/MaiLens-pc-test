@@ -42,13 +42,19 @@ def describe(name: str, track: np.ndarray, steps: np.ndarray, width: int) -> dic
     )
 
 
-def audit(path: Path, fill: float, limit: int | None, caption: str = "") -> dict:
+def audit(path: Path, fill: float, limit: int | None, caption: str = "",
+          scale: float = 1.0) -> dict:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeError(f"cannot open {path}")
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    # Track on a smaller copy: phase correlation is O(n log n) per frame and a
+    # sixth of the pixels answers the same question about how still it is.
+    if scale != 1.0:
+        width = max(8, int(round(width * scale)))
+        height = max(8, int(round(height * scale)))
     radius = fill * width * 0.5
     centre = np.array([width * 0.5, height * 0.5])
     yy, xx = np.mgrid[0:height, 0:width]
@@ -69,6 +75,8 @@ def audit(path: Path, fill: float, limit: int | None, caption: str = "") -> dict
         ok, frame = capture.read()
         if not ok or (limit and index >= limit):
             break
+        if scale != 1.0:
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
         if previous is not None:
             for key, mask in masks.items():
@@ -80,7 +88,7 @@ def audit(path: Path, fill: float, limit: int | None, caption: str = "") -> dict
     capture.release()
 
     report = dict(path=str(path), frames=index, width=width, height=height,
-                  fps=fps, caption=caption)
+                  fps=fps, caption=caption, scale=scale)
     for key in masks:
         track = accum(np.asarray(steps[key])[:, :2])
         report[key] = describe(key, track, np.asarray(steps[key])[:, :2], width)
@@ -94,10 +102,13 @@ def main() -> None:
     parser.add_argument("--fill", type=float, default=0.72,
                         help="lock-fill used by the renderer")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--scale", type=float, default=0.25,
+                        help="downscale factor for tracking (default 0.25)")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
-    payload = [audit(path, args.fill, args.limit) for path in args.videos]
+    payload = [audit(path, args.fill, args.limit, scale=args.scale)
+               for path in args.videos]
     header = f"{'clip':<38}{'cab drift p95':>14}{'cab step std':>14}" \
              f"{'bg drift p95':>14}{'bg step std':>13}"
     print(header)

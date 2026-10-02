@@ -163,6 +163,114 @@ class AnnotationTests(unittest.TestCase):
         self.assertEqual(outer, (20, 10, 380, 290))
         self.assertEqual(inner, (80, 40, 320, 230))
 
+    def test_gap_layer_walks_the_four_sides_and_flags_an_uneven_cabinet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source.jpg"
+            cv2.imwrite(str(source_path), np.zeros((200, 400, 3), dtype=np.uint8))
+            source = FrameSource(source_path, image_paths=[source_path])
+            output = root / "dataset"
+            try:
+                annotator = GeometryAnnotator(
+                    source, output, 0, classes=GEOMETRY_CLASSES, gaps=True,
+                    gap_target=75.0, gap_tolerance=0.08,
+                )
+                annotator.gap_mode = True
+                # Equal gaps on all four sides: the dead-on case.
+                for inner, outer in (((100, 100), (90, 100)),
+                                     ((300, 100), (310, 100)),
+                                     ((200, 50), (200, 40)),
+                                     ((200, 150), (200, 160))):
+                    annotator.add_gap_point(inner)
+                    annotator.add_gap_point(outer)
+                info = annotator.gap_readout()
+                self.assertEqual(set(info["px"]), {"left", "right", "top", "bottom"})
+                for value in info["mm"].values():
+                    self.assertAlmostEqual(value, 75.0, places=6)
+                self.assertTrue(info["ok"])
+                annotator.save()
+
+                gaps_path = output / "gaps" / "frame-000001.json"
+                self.assertTrue(gaps_path.is_file())
+                reloaded = GeometryAnnotator(
+                    source, output, 0, classes=GEOMETRY_CLASSES, gaps=True,
+                    gap_target=75.0, gap_tolerance=0.08,
+                )
+                self.assertEqual(set(reloaded.gap_marks), {"left", "right", "top", "bottom"})
+                self.assertTrue(reloaded.gap_readout()["ok"])
+            finally:
+                source.close()
+
+    def test_gap_layer_names_the_side_that_is_still_pulled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source.jpg"
+            cv2.imwrite(str(source_path), np.zeros((200, 400, 3), dtype=np.uint8))
+            source = FrameSource(source_path, image_paths=[source_path])
+            try:
+                annotator = GeometryAnnotator(
+                    source, root / "dataset", 0, classes=GEOMETRY_CLASSES,
+                    gaps=True, gap_target=75.0, gap_tolerance=0.08,
+                )
+                annotator.gap_marks = {
+                    "left": ((100, 100), (70, 100)),      # 30
+                    "right": ((300, 100), (340, 100)),    # 40
+                    "top": ((200, 50), (200, 20)),        # 30
+                    "bottom": ((200, 150), (200, 190)),   # 40
+                }
+                info = annotator.gap_readout()
+                self.assertFalse(info["ok"])
+                self.assertAlmostEqual(info["mean"], 35.0, places=6)
+                self.assertAlmostEqual(info["mm"]["left"], 75.0 * 30.0 / 35.0, places=6)
+                self.assertAlmostEqual(info["mm"]["right"], 75.0 * 40.0 / 35.0, places=6)
+            finally:
+                source.close()
+
+    def test_auto_gaps_read_the_two_boxes_when_the_frame_is_already_upright(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source.jpg"
+            cv2.imwrite(str(source_path), np.zeros((200, 400, 3), dtype=np.uint8))
+            source = FrameSource(source_path, image_paths=[source_path])
+            try:
+                annotator = GeometryAnnotator(
+                    source, root / "dataset", 0, classes=GEOMETRY_CLASSES,
+                    gaps=True, gap_target=75.0,
+                )
+                annotator.boxes = {0: [(40, 20, 360, 180)], 1: [(90, 45, 310, 155)]}
+                self.assertTrue(annotator.auto_gaps_from_boxes())
+                info = annotator.gap_readout()
+                self.assertAlmostEqual(info["px"]["left"], 50.0, places=6)
+                self.assertAlmostEqual(info["px"]["top"], 25.0, places=6)
+                self.assertFalse(info["ok"])
+            finally:
+                source.close()
+
+    def test_unreadable_frame_is_skipped_instead_of_ending_the_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image_paths = []
+            for index in range(3):
+                path = root / f"image-{index}.png"
+                if index == 1:
+                    path.write_bytes(b"this is not an image")
+                else:
+                    cv2.imwrite(str(path), np.zeros((120, 200, 3), dtype=np.uint8))
+                image_paths.append(path)
+            source = FrameSource(root, image_paths=image_paths)
+            try:
+                annotator = GeometryAnnotator(
+                    source, root / "dataset", 0, classes=GEOMETRY_CLASSES,
+                )
+                self.assertEqual(annotator.index, 0)
+                annotator.load_index(1)
+                self.assertEqual(annotator.index, 2)
+                self.assertEqual(annotator.unreadable, [1])
+                annotator.load_index(0)
+                self.assertEqual(annotator.index, 0)
+            finally:
+                source.close()
+
 
 if __name__ == "__main__":
     unittest.main()

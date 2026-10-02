@@ -13,6 +13,12 @@ The ``buttons`` preset labels the gameplay-object model:
 
 The ``slides`` preset uses ``slide`` in place of ``button`` for slide notes.
 
+``--gaps`` adds a second layer on top of any preset: the four distances between
+the inner screen edge and the outer button ring, one per side.  That is the
+blogger's own criterion -- a distortion-free, dead-on picture has the same gap
+on all four sides -- so the tool prints every side as it would read if the
+average were the real 75 mm, and flags the sides that do not.
+
 It writes ordinary YOLO detection labels, so the resulting folder can be
 used directly to train an Ultralytics model and then exported to ONNX.
 """
@@ -42,6 +48,16 @@ GEOMETRY_CLASSES = ("outer_buttons", "inner_screen")
 BUTTON_CLASSES = ("button", "inner_screen")
 SLIDE_CLASSES = ("slide", "inner_screen")
 COLORS = ((0, 220, 255), (80, 255, 170), (255, 150, 60))  # BGR: yellow, green, orange
+GAP_COLOR = (255, 255, 255)
+GAP_BAD_COLOR = (60, 60, 255)
+# Click order for the gap layer: inner edge then outer edge, per side.
+GAP_SIDES = ("left", "right", "top", "bottom")
+# OpenCV's text renderer only draws ASCII, so the on-screen layer uses these
+# and the terminal output uses the Chinese names.
+GAP_SIDE_SHORT = {"left": "L", "right": "R", "top": "T", "bottom": "B"}
+GAP_SIDE_NAMES = {"left": "左", "right": "右", "top": "上", "bottom": "下"}
+INNER_EDGE = "inner"
+OUTER_EDGE = "outer"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
@@ -188,6 +204,9 @@ class GeometryAnnotator:
         max_instances: int = 16,
         prelabel_model: Path | None = None,
         prelabel_detector: object | None = None,
+        gaps: bool = False,
+        gap_target: float = 75.0,
+        gap_tolerance: float = 0.08,
     ) -> None:
         self.source = source
         self.output = output.expanduser().resolve()
@@ -213,6 +232,12 @@ class GeometryAnnotator:
         self.index = 0
         self.active_class = 0
         self.boxes: dict[int, list[tuple[int, int, int, int]]] = {}
+        self.gaps_enabled = bool(gaps)
+        self.gap_target = float(gap_target)
+        self.gap_tolerance = max(float(gap_tolerance), 0.0)
+        self.gap_mode = False
+        self.gap_marks: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
+        self.gap_pending: list[tuple[int, int]] = []
         self.predicted_classes: set[int] = set()
         self.drag_start: tuple[int, int] | None = None
         self.drag_end: tuple[int, int] | None = None
@@ -220,9 +245,11 @@ class GeometryAnnotator:
         self.display_size = (0, 0)
         self.saved: set[int] = set()
         self.dirty = False
-        self.frame, self.source_frame = self.source.read(0)
+        self.unreadable: list[int] = []
+        self.frame, self.source_frame, self.index = self.read_readable(0)
         if not self.load_existing():
             self.apply_model_suggestions()
+        self.load_gaps()
         resume_index = self.first_unlabeled_index()
         if resume_index is not None and resume_index != self.index:
             self.load_index(resume_index)
@@ -230,6 +257,115 @@ class GeometryAnnotator:
     @property
     def current_base(self) -> str:
         return f"frame-{self.index + 1:06d}"
+
+    # ------------------------------------------------------------- gap layer
+    def gap_path(self, index: int | None = None) -> Path:
+        base = f"frame-{(self.index if index is None else index) + 1:06d}"
+        return self.output / "gaps" / f"{base}.json"
+
+    def gap_values(self) -> dict[str, float]:
+        """The four measured gaps in image pixels, by side."""
+        out: dict[str, float] = {}
+        for side in GAP_SIDES:
+            pair = self.gap_marks.get(side)
+            if pair is None:
+                continue
+            inner, outer = pair
+            out[side] = float(np.hypot(outer[0] - inner[0], outer[1] - inner[1]))
+        return out
+
+    def gap_readout(self) -> dict:
+        """Gaps in pixels, plus what each side would read if 75 mm were the mean.
+
+        The real distance between the screen edge and the button ring is a fixed
+        75 mm, so a picture with no distortion left has the same *pixel* gap on
+        every side.  Scaling the four so their average is the target turns that
+        into a number the operator can read directly: four 75s is dead on, and
+        anything else names the side that is still pulled.
+        """
+        values = self.gap_values()
+        info: dict = {"px": values, "mm": {}, "mean": None, "spread": None,
+                      "missing": [GAP_SIDE_NAMES[s] for s in GAP_SIDES if s not in values]}
+        if not values:
+            return info
+        mean = float(np.mean(list(values.values())))
+        info["mean"] = mean
+        info["spread"] = float(max(values.values()) - min(values.values())) / max(mean, 1e-6)
+        for side, value in values.items():
+            info["mm"][side] = self.gap_target * value / max(mean, 1e-6)
+        info["ok"] = (
+            not info["missing"]
+            and info["spread"] <= self.gap_tolerance
+        )
+        return info
+
+    def load_gaps(self) -> None:
+        self.gap_marks = {}
+        self.gap_pending = []
+        if not self.gaps_enabled:
+            return
+        path = self.gap_path()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for side, values in (payload.get("marks") or {}).items():
+            if side in GAP_SIDES and len(values) == 2:
+                self.gap_marks[side] = (
+                    (int(round(values[0][0])), int(round(values[0][1]))),
+                    (int(round(values[1][0])), int(round(values[1][1]))),
+                )
+
+    def save_gaps(self) -> None:
+        if not self.gaps_enabled:
+            return
+        info = self.gap_readout()
+        if not info["px"]:
+            return
+        path = self.gap_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "frame": self.index + 1,
+            "source_frame": self.source_frame,
+            "marks": {side: [list(pair[0]), list(pair[1])]
+                      for side, pair in self.gap_marks.items()},
+            "gap_px": info["px"],
+            "gap_mm": info["mm"],
+            "mean_px": info["mean"],
+            "spread": info["spread"],
+            "target_mm": self.gap_target,
+            "dead_on": bool(info.get("ok")),
+            "image": f"images/{self.split_name()}/{self.current_base}.jpg",
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
+    def auto_gaps_from_boxes(self) -> bool:
+        """Seed the four gaps from the two geometry boxes.
+
+        Only meaningful on a picture that is already upright and dead on --
+        which is what the lock delivers.  On a raw fisheye frame the boxes are
+        axis-aligned while the machine is not, so the four numbers would be
+        measuring the frame rather than the cabinet.
+        """
+        outer = self.boxes.get(0)
+        inner = self.boxes.get(1)
+        if not outer or not inner:
+            return False
+        ox0, oy0, ox1, oy1 = outer[0]
+        ix0, iy0, ix1, iy1 = inner[0]
+        cx = (ix0 + ix1) * 0.5
+        cy = (iy0 + iy1) * 0.5
+        self.gap_marks = {
+            "left": ((ix0, int(cy)), (ox0, int(cy))),
+            "right": ((ix1, int(cy)), (ox1, int(cy))),
+            "top": ((int(cx), iy0), (int(cx), oy0)),
+            "bottom": ((int(cx), iy1), (int(cx), oy1)),
+        }
+        self.gap_pending = []
+        return True
 
     def split_name(self) -> str:
         # Holding out every Nth sampled frame gives a reproducible validation
@@ -303,6 +439,18 @@ class GeometryAnnotator:
     def image_to_display(self, point: tuple[int, int]) -> tuple[int, int]:
         return (int(round(point[0] * self.display_scale)), int(round(point[1] * self.display_scale)))
 
+    def put_text(self, display: np.ndarray, text: str, origin: tuple[int, int],
+                 colour: tuple[int, int, int], scale: float = 0.52) -> None:
+        """Draw a caption that shrinks with the preview.
+
+        cv2 draws text in display pixels, so a down-scaled photo used to carry
+        full-size captions that ran into each other.  Everything textual goes
+        through here so it stays in proportion with the picture.
+        """
+        cv2.putText(display, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale * self.text_scale, colour,
+                    max(1, int(round(2 * self.text_scale))), cv2.LINE_AA)
+
     def display_to_image(self, point: tuple[int, int]) -> tuple[int, int]:
         width, height = self.frame.shape[1], self.frame.shape[0]
         return (
@@ -314,27 +462,34 @@ class GeometryAnnotator:
         height, width = self.frame.shape[:2]
         max_width, max_height = 1500, 900
         self.display_scale = min(1.0, max_width / max(width, 1), max_height / max(height, 1))
+        self.text_scale = max(0.4, min(1.0, self.display_scale))
         display = cv2.resize(
             self.frame,
             (max(1, int(round(width * self.display_scale))), max(1, int(round(height * self.display_scale)))),
             interpolation=cv2.INTER_AREA if self.display_scale < 1.0 else cv2.INTER_LINEAR,
         )
         self.display_size = (display.shape[1], display.shape[0])
+        stroke = max(1, int(round(2 * self.text_scale)))
         for class_id, boxes in self.boxes.items():
             for box_index, box in enumerate(boxes):
                 x0, y0 = self.image_to_display((box[0], box[1]))
                 x1, y1 = self.image_to_display((box[2], box[3]))
-                cv2.rectangle(display, (x0, y0), (x1, y1), COLORS[class_id], 2)
+                cv2.rectangle(display, (x0, y0), (x1, y1), COLORS[class_id], stroke)
                 label = self.classes[class_id]
                 if class_id in self.predicted_classes:
                     label += " [AI]"
                 if class_id == self.repeated_class:
                     label = f"{label} {box_index + 1}/{self.max_instances}"
-                cv2.putText(display, label, (x0 + 5, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, COLORS[class_id], 2, cv2.LINE_AA)
+                self.put_text(display, label, (x0 + 5, max(20, y0 - 8)),
+                              COLORS[class_id], 0.65)
         if self.drag_start is not None and self.drag_end is not None:
             start = self.image_to_display(self.drag_start)
             end = self.image_to_display(self.drag_end)
-            cv2.rectangle(display, start, end, COLORS[self.active_class], 2)
+            cv2.rectangle(display, start, end, COLORS[self.active_class], stroke)
+        gap_line = ""
+        if self.gaps_enabled:
+            self.draw_gaps(display)
+            gap_line = self.gap_caption()
         class_help = "  ".join(
             f"[{class_id + 1}] {name}"
             + (f" {len(self.boxes.get(class_id, []))}/{self.max_instances}" if class_id == self.repeated_class else "")
@@ -344,14 +499,78 @@ class GeometryAnnotator:
             f"{self.index + 1}/{self.source.count}  frame={self.source_frame}  "
             f"{class_help}  active={self.classes[self.active_class]}"
         )
-        cv2.putText(display, help_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-        shortcuts = "drag=draw/replace AI box  s=save  n/space=next  p=previous  x=clear active  r=clear all  q=quit"
+        shortcuts = "drag=draw/replace  s=save  n/space=next  p=prev  x=clear  r=clear all  q=quit"
         if self.repeated_class is not None:
             shortcuts += f"  z=undo {self.classes[self.repeated_class]}"
-        cv2.putText(display, shortcuts, (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+        lines = [(help_text, (255, 255, 255), 0.52), (shortcuts, (255, 255, 255), 0.48)]
+        if self.gaps_enabled:
+            mode = "GAP mode" if self.gap_mode else "box mode"
+            hint = (f"g={mode}  then click L R T B, screen edge then button edge  "
+                    "a=auto from boxes  z=undo  x=clear")
+            lines.append((hint, (200, 255, 200), 0.48))
+            if gap_line:
+                lines.append((gap_line, GAP_COLOR, 0.52))
+        step = max(16, int(round(22 * self.text_scale)))
+        y = max(14, int(round(24 * self.text_scale)))
+        for text, colour, scale in lines:
+            self.put_text(display, text, (12, y), colour, scale)
+            y += step
         return display
 
+    def gap_caption(self) -> str:
+        """One line: every side in pixels, and what it would read at the target."""
+        info = self.gap_readout()
+        if not info["px"]:
+            next_side = GAP_SIDES[min(len(self.gap_pending) // 2, len(GAP_SIDES) - 1)]
+            first = len(self.gap_pending) % 2 == 0
+            which = INNER_EDGE if first else OUTER_EDGE
+            left = len(GAP_SIDES) * 2 - len(self.gap_pending)
+            return (f"gaps: nothing marked yet, next click = "
+                    f"{GAP_SIDE_SHORT[next_side]} {which}  ({left} clicks to go)")
+        parts = []
+        for side in GAP_SIDES:
+            if side not in info["px"]:
+                parts.append(f"{GAP_SIDE_SHORT[side]} --")
+                continue
+            parts.append(f"{GAP_SIDE_SHORT[side]} {info['px'][side]:.0f}px/"
+                         f"{info['mm'][side]:.1f}")
+        verdict = (f"even -> dead on, 4 x {self.gap_target:.0f}" if info.get("ok")
+                   else f"uneven {info['spread'] * 100:.1f}%  (want 4 x {self.gap_target:.0f})")
+        return "gap " + "  ".join(parts) + "   " + verdict
+
+    def draw_gaps(self, display: np.ndarray) -> None:
+        info = self.gap_readout()
+        for side, pair in self.gap_marks.items():
+            inner = self.image_to_display(pair[0])
+            outer = self.image_to_display(pair[1])
+            bad = (side not in info["mm"]
+                   or abs(info["mm"][side] - self.gap_target) > self.gap_target * self.gap_tolerance)
+            color = GAP_BAD_COLOR if bad else GAP_COLOR
+            cv2.line(display, inner, outer, color, 3, cv2.LINE_AA)
+            cv2.circle(display, inner, 4, color, -1)
+            cv2.circle(display, outer, 4, color, -1)
+            middle = ((inner[0] + outer[0]) // 2, (inner[1] + outer[1]) // 2)
+            label = (f"{GAP_SIDE_SHORT[side]} {info['px'][side]:.0f}px"
+                     if side in info["px"] else GAP_SIDE_SHORT[side])
+            if side in info["mm"]:
+                label += f" (={info['mm'][side]:.1f})"
+            self.put_text(display, label, (middle[0] + 6, middle[1] - 6),
+                          color, 0.55)
+        for index, point in enumerate(self.gap_pending):
+            position = self.image_to_display(point)
+            cv2.drawMarker(display, position, (255, 120, 255), cv2.MARKER_CROSS,
+                           max(10, int(round(18 * self.text_scale))),
+                           max(1, int(round(2 * self.text_scale))))
+            step = index // 2
+            edge = INNER_EDGE if index % 2 == 0 else OUTER_EDGE
+            self.put_text(display, f"{GAP_SIDE_SHORT[GAP_SIDES[step]]} {edge}",
+                          (position[0] + 8, position[1] + 20), (255, 120, 255), 0.5)
+
     def mouse(self, event: int, x: int, y: int, _flags: int, _param: object) -> None:
+        if self.gaps_enabled and self.gap_mode:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.add_gap_point(self.display_to_image((x, y)))
+            return
         if event == cv2.EVENT_LBUTTONDOWN:
             self.drag_start = self.display_to_image((x, y))
             self.drag_end = self.drag_start
@@ -377,6 +596,25 @@ class GeometryAnnotator:
             self.drag_start = None
             self.drag_end = None
 
+    def add_gap_point(self, point: tuple[int, int]) -> None:
+        """One click of the gap walk: inner edge, then outer edge, four times."""
+        if len(self.gap_pending) >= len(GAP_SIDES) * 2:
+            self.gap_pending = []
+        self.gap_pending.append(point)
+        if len(self.gap_pending) % 2 == 0:
+            side = GAP_SIDES[len(self.gap_pending) // 2 - 1]
+            self.gap_marks[side] = (self.gap_pending[-2], self.gap_pending[-1])
+            info = self.gap_readout()
+            pixels = info["px"][side]
+            print(f"{GAP_SIDE_NAMES[side]} 间距 {pixels:.1f}px")
+            if not info["missing"]:
+                detail = " ".join(f"{GAP_SIDE_NAMES[s]}={info['mm'][s]:.1f}"
+                                  for s in GAP_SIDES)
+                verdict = ("四边一致 [OK]" if info.get("ok")
+                           else f"还不齐（差 {info['spread'] * 100:.1f}%）")
+                print(f"  四个间距都标好了: {detail}  {verdict}")
+        self.dirty = True
+
     def save(self) -> None:
         image_dir, label_dir = self.split_dirs()
         image_dir.mkdir(parents=True, exist_ok=True)
@@ -394,12 +632,24 @@ class GeometryAnnotator:
         self.saved.add(self.index)
         self.dirty = False
         self.write_dataset_files()
+        self.save_gaps()
         counts = ", ".join(
             f"{self.classes[class_id]}={len(boxes)}" for class_id, boxes in sorted(self.boxes.items())
         ) or "empty"
         if self.repeated_class is not None and self.boxes.get(self.repeated_class):
             counts += f"（{self.classes[self.repeated_class]} 可有多个实例）"
         print(f"已保存 {self.current_base}: {counts}")
+        if self.gaps_enabled:
+            info = self.gap_readout()
+            if info["px"]:
+                detail = "  ".join(
+                    f"{GAP_SIDE_NAMES[s]} {info['px'][s]:.0f}px"
+                    f"→{info['mm'][s]:.1f}"
+                    for s in GAP_SIDES if s in info["px"]
+                )
+                verdict = ("四边一致 [OK]" if info.get("ok")
+                           else f"还不正（差 {info['spread'] * 100:.1f}%）")
+                print(f"    间距 {detail}  {verdict}")
 
     def write_dataset_files(self) -> None:
         self.output.mkdir(parents=True, exist_ok=True)
@@ -424,13 +674,34 @@ class GeometryAnnotator:
         (self.output / "annotation_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_index(self, index: int) -> None:
-        self.index = max(0, min(self.source.count - 1, index))
-        self.frame, self.source_frame = self.source.read(self.index)
+        self.frame, self.source_frame, self.index = self.read_readable(index)
         self.boxes = {}
         self.predicted_classes.clear()
         self.dirty = False
         if not self.load_existing():
             self.apply_model_suggestions()
+        self.load_gaps()
+
+    def read_readable(self, index: int) -> tuple[np.ndarray, int, int]:
+        """Read a frame, stepping past entries OpenCV cannot decode.
+
+        One unreadable file in a folder of screenshots used to end the whole
+        session on the spot.  Skipping it keeps the rest of the set usable.
+        """
+        if self.source.count <= 0:
+            raise RuntimeError("输入里没有可读取的帧")
+        start = max(0, min(self.source.count - 1, index))
+        for step in range(self.source.count):
+            candidate = (start + step) % self.source.count
+            try:
+                frame, source_frame = self.source.read(candidate)
+            except (RuntimeError, IndexError) as error:
+                if candidate not in self.unreadable:
+                    self.unreadable.append(candidate)
+                    print(f"跳过无法读取的帧 {candidate}：{error}", flush=True)
+                continue
+            return frame, source_frame, candidate
+        raise RuntimeError("输入里的每一帧都无法读取")
 
     def run(self) -> None:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -458,19 +729,43 @@ class GeometryAnnotator:
                         self.save()
                     self.load_index(self.index - 1)
                 elif key == ord("x"):
-                    if self.active_class in self.boxes:
+                    if self.gaps_enabled and self.gap_mode and self.gap_marks:
+                        self.gap_marks.clear()
+                        self.gap_pending = []
+                        self.dirty = True
+                    elif self.active_class in self.boxes:
                         self.boxes.pop(self.active_class)
                         self.dirty = True
-                elif key == ord("z") and self.active_class == self.repeated_class:
-                    repeated = self.boxes.get(self.repeated_class, [])
-                    if repeated:
-                        repeated.pop()
-                        if not repeated:
-                            self.boxes.pop(self.repeated_class, None)
+                elif key == ord("z"):
+                    if self.gaps_enabled and self.gap_mode and self.gap_pending:
+                        self.gap_pending.pop()
                         self.dirty = True
+                    elif self.active_class == self.repeated_class:
+                        repeated = self.boxes.get(self.repeated_class, [])
+                        if repeated:
+                            repeated.pop()
+                            if not repeated:
+                                self.boxes.pop(self.repeated_class, None)
+                            self.dirty = True
+                elif key == ord("g") and self.gaps_enabled:
+                    self.gap_mode = not self.gap_mode
+                    self.gap_pending = []
+                    print("间距模式：依次点 左内屏→左外键、右内屏→右外键、上、下（8 次点击）"
+                          if self.gap_mode else "回到框模式")
+                elif key == ord("a") and self.gaps_enabled:
+                    if self.auto_gaps_from_boxes():
+                        info = self.gap_readout()
+                        detail = "  ".join(f"{GAP_SIDE_NAMES[s]}={info['mm'][s]:.1f}"
+                                           for s in GAP_SIDES)
+                        print(f"按两个框自动填入间距：{detail}")
+                        self.dirty = True
+                    else:
+                        print("先画好 outer_buttons 和 inner_screen 两个框，再按 a 自动填间距。")
                 elif key == ord("r"):
-                    if self.boxes:
+                    if self.boxes or self.gap_marks:
                         self.boxes.clear()
+                        self.gap_marks.clear()
+                        self.gap_pending = []
                         self.dirty = True
         finally:
             cv2.destroyAllWindows()
@@ -509,6 +804,23 @@ def main() -> None:
         default=16,
         help="重复目标每帧的框数量上限，默认 16",
     )
+    parser.add_argument(
+        "--gaps",
+        action="store_true",
+        help="加一层间距标注：内屏到外键的左/右/上/下四个距离，四边都等于目标值才是正对",
+    )
+    parser.add_argument(
+        "--gap-target",
+        type=float,
+        default=75.0,
+        help="外键与内屏的真实间距，单位随意，默认 75（mm）；四个读数都接近它才算正对",
+    )
+    parser.add_argument(
+        "--gap-tolerance",
+        type=float,
+        default=0.08,
+        help="四边间距允许的相对差，默认 0.08 即 8%",
+    )
     args = parser.parse_args()
     if args.every < 1:
         parser.error("--every 必须大于 0")
@@ -518,6 +830,10 @@ def main() -> None:
         parser.error("--max-frames 不能为负数")
     if args.max_instances < 1:
         parser.error("--max-instances 必须大于 0")
+    if args.gap_target <= 0:
+        parser.error("--gap-target 必须大于 0")
+    if args.gap_tolerance < 0:
+        parser.error("--gap-tolerance 不能为负数")
     if args.legacy_buttons:
         args.preset = "buttons"
     if args.model and args.preset != "geometry":
@@ -537,6 +853,11 @@ def main() -> None:
         print(f"第 1 类可以在同一帧重复框选，最多 {args.max_instances} 个；按 z 撤销最后一个。")
     else:
         print("外圈按键只画一个整体框，不要把 8 个外圈按键拆成 8 个框。")
+    if args.gaps:
+        print(f"间距层已打开：按 g 进入间距模式，依次点 "
+              + "、".join(f"{GAP_SIDE_NAMES[s]}内屏边→外键边" for s in GAP_SIDES)
+              + f"；每边会同时给出像素值和「平均等于 {args.gap_target:g}」时的读数，"
+                f"四个读数一致（差 ≤{args.gap_tolerance * 100:.0f}%）就是最正对、最不畸变的画面。")
     GeometryAnnotator(
         source,
         args.output,
@@ -545,6 +866,9 @@ def main() -> None:
         repeated_class=repeated_class,
         max_instances=args.max_instances,
         prelabel_model=args.model,
+        gaps=args.gaps,
+        gap_target=args.gap_target,
+        gap_tolerance=args.gap_tolerance,
     ).run()
 
 
