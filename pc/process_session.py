@@ -1066,6 +1066,7 @@ class PlaneLockTracker:
         detect_every: int = 12,
         max_age_frames: int | None = None,
         feature_region: str = "combined",
+        motion_model: str = "homography",
     ):
         self.detect_every = max(1, int(detect_every))
         # Hold a good transform briefly through a missed frame burst, then
@@ -1075,6 +1076,7 @@ class PlaneLockTracker:
         # bezel.  ``ring`` restricts points to the annulus outside the
         # screen; it is used by DualPlaneLockTracker for the raised buttons.
         self.feature_region = str(feature_region)
+        self.motion_model = "similarity" if str(motion_model).lower() == "similarity" else "homography"
         self.reset()
 
     def reset(self) -> None:
@@ -1270,12 +1272,28 @@ class PlaneLockTracker:
                 previous_points = self.points.reshape(-1, 2)[valid]
                 current_points = next_points.reshape(-1, 2)[valid]
                 if len(previous_points) >= 8:
-                    matrix, _mask = cv2.findHomography(
-                        previous_points,
-                        current_points,
-                        cv2.RANSAC,
-                        3.0,
-                    )
+                    if self.motion_model == "similarity":
+                        affine, _inliers = cv2.estimateAffinePartial2D(
+                            previous_points,
+                            current_points,
+                            method=cv2.RANSAC,
+                            ransacReprojThreshold=3.0,
+                            maxIters=2000,
+                            confidence=0.99,
+                            refineIters=10,
+                        )
+                        matrix = (
+                            np.vstack([affine, [0.0, 0.0, 1.0]]).astype(np.float32)
+                            if affine is not None
+                            else None
+                        )
+                    else:
+                        matrix, _mask = cv2.findHomography(
+                            previous_points,
+                            current_points,
+                            cv2.RANSAC,
+                            3.0,
+                        )
                     valid_h, count, ratio, error = self._valid_homography(
                         matrix, previous_points, current_points,
                     )
@@ -1525,12 +1543,17 @@ def process(args: argparse.Namespace) -> Path:
     reference_target_size: float | None = None
     reference_zoom: float | None = None
     lock_tracker = GeometryLockTracker(args.detect_every)
-    plane_tracker = PlaneLockTracker(args.detect_every)
+    plane_tracker = PlaneLockTracker(
+        args.detect_every,
+        motion_model=getattr(args, "plane_model", "homography"),
+    )
     previous_gray = None
     previous_lock_source = "none"
     pose_track = load_pose_track(session)
     lens_fix = not getattr(args, "no_fisheye", False)
     max_frames = getattr(args, "max_frames", None)
+    plane_smooth = float(getattr(args, "plane_smooth", 0.35))
+    plane_smooth_corners: np.ndarray | None = None
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
             for index, frame, row in source:
@@ -1621,7 +1644,27 @@ def process(args: argparse.Namespace) -> Path:
                         plane_tracker.reference_box,
                         plane_tracker.reference_to_output,
                     )
-                    stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
+                    reference_corners = _box_points(plane_tracker.reference_box)
+                    raw_corners = _project_points(reference_corners, plane_matrix)
+                    if plane_smooth_corners is None or raw_corners is None:
+                        plane_smooth_corners = raw_corners
+                    else:
+                        # Smooth in corner space instead of averaging a
+                        # scale-ambiguous matrix.  This removes the per-frame
+                        # projective jitter that showed up as a squashed,
+                        # twitching machine patch.
+                        plane_smooth_corners = (
+                            plane_smooth * raw_corners
+                            + (1.0 - plane_smooth) * plane_smooth_corners
+                        )
+                    if reference_corners is not None and plane_smooth_corners is not None:
+                        matrix = cv2.getPerspectiveTransform(
+                            reference_corners,
+                            plane_smooth_corners.astype(np.float32),
+                        )
+                    else:
+                        matrix = plane_matrix
+                    stabilized = apply_plane_lock(stabilized, matrix, fixed_inner)
                     outer = expand_box(fixed_inner, 1.45)
                     inner = fixed_inner
                     center = np.array([0.5, 0.5], dtype=np.float32)
@@ -1629,6 +1672,7 @@ def process(args: argparse.Namespace) -> Path:
                     lock_source = "plane_homography"
                     previous_lock_source = lock_source
                 else:
+                    plane_smooth_corners = None
                     stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                     outer = transform_box(outer, geometry_matrix)
                     inner = transform_box(inner, geometry_matrix)
@@ -1692,6 +1736,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="不做鱼眼→直线矫正，直接在原始帧上锁机台（没有标定的素材用这个）")
     parser.add_argument("--max-frames", type=int,
                         help="只处理前 N 帧，用来快速试参数")
+    parser.add_argument("--plane-smooth", type=float, default=0.35,
+                        help="机台单应矩阵的时间平滑系数，0 不滤波，1 完全冻结，默认 0.35")
+    parser.add_argument("--plane-model", choices=("homography", "similarity"),
+                        default="homography",
+                        help="机台运动模型：homography 允许透视，similarity 只做旋转/等比缩放/平移，后者更不容易显扁")
     return parser
 
 
@@ -1704,6 +1753,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--detect-every 必须大于 0")
     if not 0.35 <= args.lock_fill <= 0.90:
         parser.error("--lock-fill 应在 0.35 到 0.90 之间")
+    if not 0.0 <= args.plane_smooth <= 1.0:
+        parser.error("--plane-smooth 应在 0 到 1 之间")
     return args
 
 
