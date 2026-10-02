@@ -322,10 +322,15 @@ def lock_matrices(series: dict, small_w: int, small_h: int, lock_fill: float,
 
     half_w = small_w * frame_frac * 0.5
     half_h = small_h * frame_frac * 0.5
+    # A rotated sampling window reaches further than an axis-aligned one, so
+    # the room check has to use its rotated bounding box.
+    angle = np.radians(-float(roll_gain) * roll_sign * roll)
+    reach_x = half_w * np.abs(np.cos(angle)) + half_h * np.abs(np.sin(angle))
+    reach_y = half_w * np.abs(np.sin(angle)) + half_h * np.abs(np.cos(angle))
     room_x = np.minimum(cx, small_w - cx)
     room_y = np.minimum(cy, small_h - cy)
-    need = np.maximum(half_w / np.maximum(room_x, 1e-3),
-                      half_h / np.maximum(room_y, 1e-3))
+    need = np.maximum(reach_x / np.maximum(room_x, 1e-3),
+                      reach_y / np.maximum(room_y, 1e-3))
     need = rolling_max(need, int(max(2.0 * sigma, 4.0)))
     zoom = smooth(np.maximum(zoom, need * 1.03), 2.0)
     zoom = np.maximum(zoom, need * 1.01)
