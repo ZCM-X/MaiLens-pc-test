@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,10 +56,27 @@ def read_image(path: Path) -> np.ndarray:
         with Image.open(path) as image:
             rgb = np.asarray(image.convert("RGB"))
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    # cv2.imread uses the Windows ANSI code page for paths on some builds, so
+    # it fails for valid paths containing Chinese characters. pathlib handles
+    # Unicode paths; imdecode only receives the image bytes.
+    try:
+        encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError as error:
+        raise RuntimeError(f"无法读取图像：{path}") from error
+    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"无法读取图像：{path}")
     return image
+
+
+def write_jpeg(path: Path, image: np.ndarray, quality: int = 95) -> None:
+    """Write JPEG bytes through pathlib so Unicode output paths also work."""
+    ok, encoded = cv2.imencode(
+        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, int(quality)],
+    )
+    if not ok:
+        raise RuntimeError(f"无法编码图像：{path}")
+    path.write_bytes(encoded.tobytes())
 
 
 def normalize_box(box: tuple[int, int, int, int], width: int, height: int) -> str:
@@ -168,6 +186,8 @@ class GeometryAnnotator:
         classes: tuple[str, ...] = GEOMETRY_CLASSES,
         repeated_class: int | None = None,
         max_instances: int = 16,
+        prelabel_model: Path | None = None,
+        prelabel_detector: object | None = None,
     ) -> None:
         self.source = source
         self.output = output.expanduser().resolve()
@@ -177,9 +197,23 @@ class GeometryAnnotator:
             raise ValueError("至少需要一个标注类别")
         self.repeated_class = repeated_class if repeated_class in range(len(self.classes)) else None
         self.max_instances = max(1, int(max_instances))
+        self.prelabel_detector = prelabel_detector
+        if prelabel_model is not None:
+            if self.classes != GEOMETRY_CLASSES:
+                raise ValueError("几何模型预标注只支持 geometry 类别")
+            if self.prelabel_detector is not None:
+                raise ValueError("prelabel_model 和 prelabel_detector 只能设置一个")
+            project_root = Path(__file__).resolve().parents[1]
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            from pc.process_session import GeometryDetector
+            self.prelabel_detector = GeometryDetector(prelabel_model)
+            if not self.prelabel_detector.enabled:
+                raise RuntimeError(f"无法加载预标注模型：{prelabel_model}")
         self.index = 0
         self.active_class = 0
         self.boxes: dict[int, list[tuple[int, int, int, int]]] = {}
+        self.predicted_classes: set[int] = set()
         self.drag_start: tuple[int, int] | None = None
         self.drag_end: tuple[int, int] | None = None
         self.display_scale = 1.0
@@ -187,7 +221,11 @@ class GeometryAnnotator:
         self.saved: set[int] = set()
         self.dirty = False
         self.frame, self.source_frame = self.source.read(0)
-        self.load_existing()
+        if not self.load_existing():
+            self.apply_model_suggestions()
+        resume_index = self.first_unlabeled_index()
+        if resume_index is not None and resume_index != self.index:
+            self.load_index(resume_index)
 
     @property
     def current_base(self) -> str:
@@ -202,7 +240,8 @@ class GeometryAnnotator:
         split = self.split_name()
         return self.output / "images" / split, self.output / "labels" / split
 
-    def load_existing(self) -> None:
+    def load_existing(self) -> bool:
+        loaded = False
         for split in ("train", "val"):
             label_path = self.output / "labels" / split / f"{self.current_base}.txt"
             if not label_path.exists():
@@ -224,8 +263,42 @@ class GeometryAnnotator:
                             denormalize_box([float(value) for value in fields[1:]], width, height)
                         )
                 self.saved.add(self.index)
+                loaded = True
             except (OSError, ValueError):
                 continue
+        return loaded
+
+    def first_unlabeled_index(self) -> int | None:
+        """Resume at the first sampled frame without a saved image/label pair."""
+        for index in range(self.source.count):
+            base = f"frame-{index + 1:06d}"
+            exists = any(
+                (self.output / "labels" / split / f"{base}.txt").is_file()
+                and (self.output / "images" / split / f"{base}.jpg").is_file()
+                for split in ("train", "val")
+            )
+            if exists:
+                self.saved.add(index)
+            else:
+                return index
+        return None
+
+    def apply_model_suggestions(self) -> None:
+        """Seed editable boxes from the geometry model when no reviewed label exists."""
+        self.boxes = {}
+        self.predicted_classes.clear()
+        if self.prelabel_detector is None or self.classes != GEOMETRY_CLASSES:
+            return
+        outer, inner = self.prelabel_detector.detect(self.frame)
+        if outer is not None:
+            self.boxes[0] = [tuple(int(value) for value in outer)]
+            self.predicted_classes.add(0)
+        if inner is not None:
+            self.boxes[1] = [tuple(int(value) for value in inner)]
+            self.predicted_classes.add(1)
+        # Keep the existing auto-save-on-next behavior for AI-prefilled frames;
+        # dragging a corrected box replaces the proposal before it is saved.
+        self.dirty = bool(self.predicted_classes)
 
     def image_to_display(self, point: tuple[int, int]) -> tuple[int, int]:
         return (int(round(point[0] * self.display_scale)), int(round(point[1] * self.display_scale)))
@@ -253,6 +326,8 @@ class GeometryAnnotator:
                 x1, y1 = self.image_to_display((box[2], box[3]))
                 cv2.rectangle(display, (x0, y0), (x1, y1), COLORS[class_id], 2)
                 label = self.classes[class_id]
+                if class_id in self.predicted_classes:
+                    label += " [AI]"
                 if class_id == self.repeated_class:
                     label = f"{label} {box_index + 1}/{self.max_instances}"
                 cv2.putText(display, label, (x0 + 5, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, COLORS[class_id], 2, cv2.LINE_AA)
@@ -270,7 +345,7 @@ class GeometryAnnotator:
             f"{class_help}  active={self.classes[self.active_class]}"
         )
         cv2.putText(display, help_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-        shortcuts = "drag=draw  s=save  n/space=next  p=previous  x=clear active  r=clear all  q=quit"
+        shortcuts = "drag=draw/replace AI box  s=save  n/space=next  p=previous  x=clear active  r=clear all  q=quit"
         if self.repeated_class is not None:
             shortcuts += f"  z=undo {self.classes[self.repeated_class]}"
         cv2.putText(display, shortcuts, (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
@@ -297,6 +372,7 @@ class GeometryAnnotator:
                         self.dirty = True
                 else:
                     self.boxes[self.active_class] = [box]
+                    self.predicted_classes.discard(self.active_class)
                     self.dirty = True
             self.drag_start = None
             self.drag_end = None
@@ -307,7 +383,7 @@ class GeometryAnnotator:
         label_dir.mkdir(parents=True, exist_ok=True)
         image_path = image_dir / f"{self.current_base}.jpg"
         label_path = label_dir / f"{self.current_base}.txt"
-        cv2.imwrite(str(image_path), self.frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        write_jpeg(image_path, self.frame, quality=95)
         height, width = self.frame.shape[:2]
         lines = [
             f"{class_id} {normalize_box(box, width, height)}"
@@ -351,8 +427,10 @@ class GeometryAnnotator:
         self.index = max(0, min(self.source.count - 1, index))
         self.frame, self.source_frame = self.source.read(self.index)
         self.boxes = {}
+        self.predicted_classes.clear()
         self.dirty = False
-        self.load_existing()
+        if not self.load_existing():
+            self.apply_model_suggestions()
 
     def run(self) -> None:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -413,6 +491,11 @@ def main() -> None:
     parser.add_argument("--val-every", type=int, default=10, help="每 N 张放入 val；设 0 表示全部 train")
     parser.add_argument("--max-frames", type=int, default=0, help="最多标注多少张，0 表示不限制")
     parser.add_argument(
+        "--model",
+        type=Path,
+        help="可选几何模型；先画 outer_buttons/inner_screen 预测框，拖动重画即可替换",
+    )
+    parser.add_argument(
         "--with-buttons",
         dest="legacy_buttons",
         action="store_true",
@@ -437,6 +520,8 @@ def main() -> None:
         parser.error("--max-instances 必须大于 0")
     if args.legacy_buttons:
         args.preset = "buttons"
+    if args.model and args.preset != "geometry":
+        parser.error("--model 预标注目前只支持 --preset geometry")
     source = make_source(args.input, args.every, args.max_frames)
     print(f"共 {source.count} 张待标注图像；输出：{args.output.resolve()}")
     presets = {
@@ -446,6 +531,8 @@ def main() -> None:
     }
     classes, repeated_class = presets[args.preset]
     print(f"标注模型：{args.preset}；类别：{', '.join(classes)}")
+    if args.model:
+        print(f"AI 预标注：{args.model.resolve()}；错误框用鼠标拖出正确框替换，类别框显示 [AI]")
     if repeated_class is not None:
         print(f"第 1 类可以在同一帧重复框选，最多 {args.max_instances} 个；按 z 撤销最后一个。")
     else:
@@ -457,6 +544,7 @@ def main() -> None:
         classes=classes,
         repeated_class=repeated_class,
         max_instances=args.max_instances,
+        prelabel_model=args.model,
     ).run()
 
 

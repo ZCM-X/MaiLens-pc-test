@@ -1,6 +1,6 @@
 # PC detector models
 
-`frame-geometry-yolo11n-v4.onnx` is the current geometry detector. It exposes
+`frame-geometry-yolo11n-v5.onnx` is the current PC geometry detector. It exposes
 `outer_buttons` (the cabinet ring around the screen and buttons) and
 `inner_screen`; the machine lock uses both, and `inner_screen` is the class the
 lock depends on most.
@@ -9,7 +9,8 @@ lock depends on most.
 | --- | --- | --- |
 | `frame-geometry-yolo11n-v2.onnx` | 51 hand-labelled photos | inner_screen only reached 0.2-0.4 confidence on real phone footage |
 | `frame-geometry-yolo11n-v3.onnx` | early 5-image experiment | kept for comparison only |
-| `frame-geometry-yolo11n-v4.onnx` | 354 images | current default; mAP50 0.97 on the manual split |
+| `frame-geometry-yolo11n-v4.onnx` | 354 images | previous default; mAP50 0.97 on the manual split |
+| `frame-geometry-yolo11n-v5.onnx` | v4 fine-tuned with 20 corrected raw-phone frames plus the existing manual review set | current PC default; on the 20 raw-phone frames, OpenCV DNN mean IoU is 0.920 outer / 0.929 inner (includes training frames) |
 
 v4 mixes the 51 hand labels with 97 photos from `D:\桌面文件\训练2` and 211
 raw-fisheye frames sampled from the captured sessions:

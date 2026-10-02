@@ -456,7 +456,13 @@ def soft_geometry_pair(outer, inner) -> bool:
         return False
     outer_area = ow * oh
     inner_area = iw * ih
-    if outer_area <= inner_area * 1.08:
+    # Inverse-fisheye mapping expands the four inner corners more than the
+    # axis-aligned outer rectangle.  A valid raw pair can therefore have an
+    # inner mapped box slightly larger than the mapped outer box.  Keep the
+    # overlap, centre and per-axis ratio gates below as the false-pair guard;
+    # rejecting on area alone made the first valid frame lose inner_screen and
+    # delayed plane locking until a later detector refresh.
+    if outer_area <= inner_area * 0.72:
         return False
     overlap_width = max(0.0, min(ox1, ix1) - max(ox0, ix0))
     overlap_height = max(0.0, min(oy1, iy1) - max(oy0, iy0))
@@ -759,7 +765,7 @@ def apply_geometry_lock(frame: np.ndarray, center: np.ndarray, zoom: float) -> t
     return locked, matrix
 
 
-def geometry_reference(inner, width: int, height: int, lock_fill: float = 0.64) -> tuple[float, float] | tuple[None, None]:
+def geometry_reference(inner, width: int, height: int, lock_fill: float = 0.71) -> tuple[float, float] | tuple[None, None]:
     """Return the first-lock screen size and crop zoom used for distance lock."""
     if inner is None:
         return None, None
@@ -779,7 +785,7 @@ def update_geometry_lock_state(
     inner,
     width: int,
     height: int,
-    lock_fill: float = 0.64,
+    lock_fill: float = 0.71,
     snap: bool = False,
     reference_target_size: float | None = None,
     reference_zoom: float | None = None,
@@ -1112,6 +1118,31 @@ class PlaneLockTracker:
             return None
         matrix = self.reference_to_output @ self.current_to_reference
         return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
+
+    def reacquire_if_stale(
+        self,
+        gray: np.ndarray,
+        box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None,
+        width: int,
+        height: int,
+        lock_fill: float,
+        fresh_detection: bool,
+    ) -> bool:
+        """Re-center from a fresh model box after optical flow has gone stale.
+
+        ``output_homography`` stops using a transform after a short grace
+        period, but the tracker used to keep its old reference much longer.
+        A later flow recovery could therefore resume an accumulated, drifting
+        transform.  A fresh, accepted detector result is an absolute anchor:
+        initialize from it again so the visible screen returns to the fixed
+        output target.
+        """
+        stale_after = max(3, self.detect_every // 2)
+        if (not fresh_detection or not self.locked or self.age_frames <= stale_after
+                or box is None):
+            return False
+        return self.initialize(gray, box, outer_box, width, height, lock_fill)
 
     def _feature_mask(
         self,
@@ -1634,6 +1665,8 @@ def process(args: argparse.Namespace) -> Path:
                     previous_lock_source = "searching"
                 if not plane_tracker.locked:
                     lock_tracker.update_flow(previous_gray, current_gray)
+                fresh_inner_detection = False
+                plane_reacquired = False
                 if args.model and index % args.detect_every == 0:
                     detected_outer_raw, detected_inner_raw = detector.detect(frame)
                     if lens_fix:
@@ -1654,6 +1687,11 @@ def process(args: argparse.Namespace) -> Path:
                         height,
                         allow_soft_pair=True,
                     )
+                    fresh_inner_detection = (
+                        detected_inner is not None
+                        and lock_tracker.outer_age_frames == 0
+                        and lock_tracker.inner_age_frames == 0
+                    )
                 outer, inner = lock_tracker.boxes()
                 plane_locked = plane_tracker.update(
                     current_gray,
@@ -1661,8 +1699,22 @@ def process(args: argparse.Namespace) -> Path:
                     outer,
                     width,
                     height,
-                    getattr(args, "lock_fill", 0.64),
+                    getattr(args, "lock_fill", 0.71),
                 )
+                plane_reacquired = plane_tracker.reacquire_if_stale(
+                    current_gray,
+                    inner,
+                    outer,
+                    width,
+                    height,
+                    getattr(args, "lock_fill", 0.71),
+                    fresh_detection=fresh_inner_detection,
+                )
+                if plane_reacquired:
+                    plane_locked = True
+                    plane_smooth_corners = None
+                    plane_hold_matrix = None
+                    plane_hold_frames = 0
                 if lock_tracker.box is None:
                     reference_target_size = None
                     reference_zoom = None
@@ -1677,7 +1729,7 @@ def process(args: argparse.Namespace) -> Path:
                     inner,
                     width,
                     height,
-                    getattr(args, "lock_fill", 0.64),
+                    getattr(args, "lock_fill", 0.71),
                     snap=previous_lock_source in ("none", "searching") and lock_tracker.box is not None,
                     reference_target_size=reference_target_size,
                     reference_zoom=reference_zoom,
@@ -1777,6 +1829,7 @@ def process(args: argparse.Namespace) -> Path:
                     "lock_source": lock_source,
                     "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
                     "plane_lock": plane_matrix is not None,
+                    "plane_reacquired": plane_reacquired,
                     "plane_age_frames": plane_tracker.age_frames,
                     "plane_inliers": plane_tracker.inliers,
                     "plane_inlier_ratio": plane_tracker.inlier_ratio,
@@ -1808,8 +1861,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--detect-every", type=int, default=12,
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
-    parser.add_argument("--lock-fill", type=float, default=0.64,
-                        help="内屏锁定后占画面短边的比例，默认 0.64")
+    parser.add_argument("--lock-fill", type=float, default=0.71,
+                        help="内屏锁定后占画面短边的比例，默认 0.71（按近景校准参考）")
     parser.add_argument("--no-fisheye", action="store_true",
                         help="不做鱼眼→直线矫正，直接在原始帧上锁机台（没有标定的素材用这个）")
     parser.add_argument("--max-frames", type=int,

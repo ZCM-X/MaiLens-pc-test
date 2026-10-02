@@ -31,6 +31,53 @@ iPhone 本地录制（App 内“开始录制”）
 
 视频和姿态被放在同一个 TCP 数据包里，电脑端不需要猜测两条流的对应关系。发送端使用有限缓冲，只保留最新待发送帧；电脑或网络变慢时会丢弃旧帧，不会把延迟越积越大。
 
+## 机台锁定（pc/machine_lock.py）
+
+这是对标参考视频里“机台在画面中间完全不动”的离线管线，也是移植回 iPhone 之前的验证台。它不依赖 YOLO 权重，直接在同一套鱼眼矫正后的画面上做几何测量：
+
+```text
+每一帧
+  ├─ 鱼眼矫正（fov 106.4583 / k1 0.0893163 / k2 -0.0174637 / crop 0.74）
+  ├─ 内屏：青色掩膜 H70–115 S>60 V>40 → 最大圆盘连通域 → fitEllipse
+  ├─ 外键：紫色掩膜 H125–145 S>80 V>60 → 最多 12 个连通域质心 → 圆拟合
+  └─ 8 个按键的 8 次谐波相位 → 机台横滚
+        │
+        ▼
+  零相位平滑（对称高斯核 + 5 帧中值预滤，无时间滞后）
+        │
+        ▼
+  单次仿射变换：内屏中心 → 画面正中，内屏长轴 → 固定像素直径
+```
+
+内屏的**长轴**当作距离信号（它在俯仰时不会像短轴那样被压缩），所以手机前后移动时画面会自动反向缩放，机台在屏幕上的大小保持不变；缩放只放大不缩小，永远不会露出黑边。
+
+在 `IMG_8901.MOV`（2160×3840，801 帧）上的实测：
+
+```text
+机台中心偏离画面正中   均值 17.2 px   中位 14.7 px   p95 39.8 px   （1080 宽输出）
+内屏在画面上的直径     746–821 px（中位 776 px = 画面宽度的 71.8%）
+自动补偿的缩放范围     1.22–1.61
+原始检测噪声           0.8 px（1080 下约 1.6 px）
+```
+
+检测噪声只有 0.8 px，所以平滑强度必须**很小**：`--smooth-sigma` 取 12 会让机台自己漂 95 px，取 3 才是既有锁定又不抖的正确工作点。
+
+```powershell
+# 1:1 输出 2160×3840
+.\.venv\Scripts\python.exe pc\machine_lock.py "C:\Users\93543\Downloads\IMG_8901.MOV" `
+  --output "C:\Users\93543\Downloads\IMG_8901_机台锁定_v1.mp4" `
+  --output-scale 1.0 --smooth-sigma 3
+
+# 快速预览 + 12 格拼图 + 逐帧诊断数据
+.\.venv\Scripts\python.exe pc\machine_lock.py "C:\Users\93543\Downloads\IMG_8901.MOV" `
+  --output work\locked.mp4 --output-scale 0.5 `
+  --contact work\locked_contact.jpg --trace work\locked.jsonl --draw
+```
+
+`--draw` 会在画面正中画绿色十字，并画一个红圈标出机台实际落点，两者重合就说明锁定成立；左上角 `lock err` 是这一帧的残差像素。`--trace` 里的 `resid_x / resid_y` 是同一件事的逐帧数值。
+
+`--roll-gain`（默认 0）打开后会用按键环的相位抵消手机横滚，相位每 45° 一个周期，管线里先解缠再平滑。这一路信号噪声约 2.3°/帧，比中心弱，所以默认不开。
+
 ## 电脑端启动
 
 在 Windows PowerShell 中（先 `cd` 到项目根目录，也就是放着 `.venv`、`pc`、`models` 的那一层；不在这一层会直接报「无法将`.\.venv\Scripts\python.exe`项识别为...」）：
@@ -74,7 +121,7 @@ sessions/20261001-153012
 
 处理器默认载入当前 MaiLens 的鱼眼参数（中心 `0.501753869, 0.499423644`、`k1=0.0893163`、`k2=-0.0174637`、输出视场角 `106.4583°`），所以电脑生成的结果会先做鱼眼反变换，再做姿态稳定。参数可以直接用 `--center-x`、`--center-y`、`--k1`、`--k2` 和 `--fov` 覆盖。
 
-如果要让实时模式同时做机台外框/内屏锁定，直接使用仓库内的 ONNX 模型。当前实时默认使用 v2，因为它在现有视频上能连续检测内屏；v3 先保留作重新训练实验。电脑端优先用 OpenCV DNN 推理，不需要安装 PyTorch：
+如果要让实时模式同时做机台外框/内屏锁定，直接使用仓库内的 ONNX 模型。实时接收端和标注工具预标注默认都使用 v4；它们在 App 中处理的是手机送来的原始鱼眼帧，普通照片上看起来正确的框不代表鱼眼帧也能识别。电脑端优先用 OpenCV DNN 推理，不需要安装 PyTorch：
 
 ```powershell
 .\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
@@ -85,7 +132,7 @@ sessions/20261001-153012
 
 实时检测默认每 12 帧运行一次，模型在原始鱼眼帧上检测，再映射到鱼眼矫正后的输出坐标。首次同时得到有效 `outer_buttons` 和 `inner_screen` 后，处理器会在外圈按键与内屏组成的机台区域内取特征点，用 LK 光流和 RANSAC `findHomography` 估计每帧的平面运动，把整台机台平面反向映射到一个固定的中央目标；这个变换同时补偿横移、横滚、倾斜和中等幅度的前后移动，八个按键与内屏保持同一相对位置，不再把检测框中心和面积当作唯一稳定信号。特征点暂时不足时保持上一张可靠的单应矩阵，超过丢失时限才回到搜索状态。
 
-调试画面用黄色框标外圈按键区域、绿色框标内屏，白色十字是输出中心；`processed.jsonl` / `debug.jsonl` 会额外记录 `plane_lock`、内点数、内点比例和重投影误差。`--lock-fill 0.64` 调整首次锁定时内屏在画面中的大小。当前版本仍需要内屏在鱼眼有效视野内且保留可跟踪纹理；完全无纹理或被遮挡时会安全保持上一帧，不会用错误框跳走。
+调试画面用黄色框标外圈按键区域、绿色框标内屏，白色十字是输出中心；`processed.jsonl` / `debug.jsonl` 会额外记录 `plane_lock`、内点数、内点比例和重投影误差。`--lock-fill` 调整首次锁定时内屏在画面短边中的占比，默认 `0.71`，对应近景校准参考中内屏约占短边 71% 的构图；数值越大，机台越近。这个比例依赖正确的 `inner_screen` 框，当前模型的外框/内屏定位仍需人工校正，暂时不要把错误预测当成最终输出验收。当前版本仍需要内屏在鱼眼有效视野内且保留可跟踪纹理；完全无纹理或被遮挡时会安全保持上一帧，不会用错误框跳走。
 
 ## 标注自己的机台数据
 
@@ -94,25 +141,27 @@ sessions/20261001-153012
 1. 几何模型：`outer_buttons` + `inner_screen`，负责识别外圈按键区域、内屏以及两者的距离关系，用于机台居中和裁切。
 2. 按键模型：`button` + `inner_screen`，负责在内屏坐标系中识别谱面按键；它的结果不参与机台居中。
 
-当前内置模型经常框到内屏而不是外圈按键区域，因此建议先用自己的鱼眼照片标这两套数据，再训练新的模型。运行标注工具：
+当前内置模型会把部分机台外框和内屏框错，工具支持先用模型生成可修改的建议框，再由人确认修正。运行几何数据标注工具：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
-  --input sessions\你的会话目录 --output datasets\geometry `
-  --preset geometry --every 6 --val-every 10
+  --input sessions\你的会话目录 --output datasets\geometry-review `
+  --preset geometry --every 6 --val-every 10 `
+  --model models\frame-geometry-yolo11n-v5.onnx
 ```
 
-`--input` 可以是实时会话目录、视频、单张图或图片目录。视频默认每 6 帧取一帧，避免连续相似帧占满数据；`--max-frames 120` 可限制本次数量。窗口里用 `1`、`2` 切换类别，拖动矩形，按 `s` 保存，`n`/空格下一张，`p` 上一张，`x` 删除当前类别框，`r` 清除此图，`q` 退出。下一次以相同 `--output` 打开会继续已有标注。
+`--model` 是可选项；打开图片后会用模型自动画出黄色 `outer_buttons [AI]` 和绿色 `inner_screen [AI]` 建议框。先检查位置，再用 `1`/`2` 选类别并拖出正确矩形，新的框会替换该类别的 AI 框；`x` 删除当前类别，`s` 保存，`n`/空格切下一张时会自动保存当前 AI 建议和人工修改，`p` 上一张，`r` 清除此图，`q` 退出。中文目录和文件名可以直接读写；重新打开同一 `--output` 会跳到第一个未标注帧。首次校正建议用独立的 `--output` 目录，避免覆盖之前的人工数据。
 
 iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张都看，所以把 `--every` 设为 `1`，例如：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\annotate_geometry.py `
   --input "C:\Users\93543\Downloads\maimoller训练" `
-  --output datasets\maimoller-geometry --preset geometry --every 1
+  --output datasets\maimoller-geometry-review --preset geometry --every 1 `
+  --model models\frame-geometry-yolo11n-v5.onnx
 ```
 
-几何模型按截图中的方式标：`outer_buttons` 只画一个整体框，覆盖外圈 8 个实体按键和它们所在的环形区域；不要拆成 8 个小框。`inner_screen` 沿圆形游戏屏幕边缘画一个整体矩形。
+几何模型按截图中的方式标：`outer_buttons` 只画一个整体框，覆盖外圈 8 个实体按键和它们所在的环形区域；不要拆成 8 个小框。`inner_screen` 沿圆形游戏屏幕边缘画一个整体矩形。若静态照片上的框看似正确、实时推流中仍错，优先用手机推流会话目录作 `--input` 并按 `--every 12` 抽帧校正；App 的检测器直接吃这些原始鱼眼帧，训练数据也要包含这种输入。
 
 按键模型单独使用另一份输出目录：
 
@@ -160,13 +209,25 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
 
 新模型是 `models/frame-geometry-yolo11n-v4.onnx`（354 张训练图，验证集 5 张手标：mAP50 0.97，outer 0.995 / inner 0.945）。同一批真实素材上，`inner_screen` 置信度：矫正片段 0.24→0.76（35/40→40/40），手机原始鱼眼帧 0.78→0.87（47/48→48/48），训练照片 0.65→0.95。手标验证集只有 5 张，所以这个数字只说明标注闭环没崩，真正的验收还是看实拍锁定效果。
 
+针对“标注工具里框正确、手机实时输入却框偏”的差异，v5 从 v4 权重继续微调，训练数据合并了 `training2-geometry-review-20261002` 与 20 张本次真实手机鱼眼帧（18 train / 2 val）。ONNX 使用 PC 接收端同一套 OpenCV DNN 前后处理，在这 20 张手机帧上外框平均 IoU 从 v4 的 0.259 升到 0.920，内屏从 0.356 升到 0.929；该检查含训练帧，主要证明输入域适配，不能当作独立测试成绩。v5 文件为 `models/frame-geometry-yolo11n-v5.onnx`，PC 实时接收和收到录制后的处理现已默认选它，v4 仍保留可手动回退。
+
+这轮 v5 的训练可在项目根目录复现：
+
+```powershell
+.\.venv\Scripts\python.exe tools\train_detector.py `
+  --dataset datasets\live-phone-finetune-20261002\dataset.yaml `
+  --weights Training\machine-detector.pt --device 0 --epochs 80 `
+  --imgsz 640 --batch 8 --patience 15 --project runs `
+  --name geometry-live-phone-v5 --disable-amp --export onnx
+```
+
 如果要把模型用在离线处理上：
 
 如果要把模型用在离线处理上（下面都用新模型 v4）：
 
 ```powershell
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
-  --model models\frame-geometry-yolo11n-v4.onnx --output processed-machine.mp4 --debug
+  --model models\frame-geometry-yolo11n-v5.onnx --output processed-machine.mp4 --debug
 ```
 
 检测器锁定只使用几何模型的 `outer_buttons` 和 `inner_screen`；按键模型的结果不会把机台锁到某个谱面元素。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
@@ -193,11 +254,13 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 # 所有命令都在项目根目录运行
 
 # 电脑端接收 + 直接处理（另开一个终端，手机点“发到电脑”之前先跑起来）
-.\.venv\Scripts\python.exe pc\session_server.py --process --model models\frame-geometry-yolo11n-v4.onnx
+.\.venv\Scripts\python.exe pc\session_server.py --process --debug
+
+# 默认自动使用 models\frame-geometry-yolo11n-v5.onnx；需要时可用 --model 覆盖
 
 # 也可以事后处理收到的会话：直接读 video.mp4 + pose.jsonl，不抽帧
 .\.venv\Scripts\python.exe pc\process_session.py phone_sessions\20261002-153000 `
-  --model models\frame-geometry-yolo11n-v4.onnx --output processed-phone.mp4 --debug
+  --model models\frame-geometry-yolo11n-v5.onnx --output processed-phone.mp4 --debug
 
 # 只有要标注 JPEG 帧时才抽帧
 .\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"

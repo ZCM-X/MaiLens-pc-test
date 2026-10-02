@@ -5,7 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from .session_server import create_server, safe_component, serve_forever
+from .session_server import DEFAULT_MODEL, create_server, safe_component, serve_forever
 from .test_import_phone_session import write_phone_session
 
 
@@ -118,12 +118,16 @@ class SessionServerTests(unittest.TestCase):
 
         server = create_server("127.0.0.1", 0)
         port = server.getsockname()[1]
+        logs = []
         thread = threading.Thread(target=serve_forever,
                                   args=(server, root / "phone_sessions"),
                                   kwargs={"once": True,
                                           "run_process": True,
-                                          "background_tasks": False,
-                                          "log": lambda *_: None},
+                                          "background_tasks": True,
+                                          "extra_args": ("--plane-smooth", "0.2",
+                                                         "--plane-model", "similarity",
+                                                         "--plane-full"),
+                                          "log": logs.append},
                                   daemon=True)
         thread.start()
         self.addCleanup(server.close)
@@ -137,6 +141,7 @@ class SessionServerTests(unittest.TestCase):
         received = root / "phone_sessions" / "20261002-150500"
         self.assertGreater((received / "processed.mp4").stat().st_size, 0)
         self.assertEqual(len((received / "debug.jsonl").read_text(encoding="utf-8").splitlines()), 12)
+        self.assertIn(f"using geometry detector: {DEFAULT_MODEL}", logs)
 
     def test_bad_magic_is_answered_with_an_error(self):
         workspace = tempfile.TemporaryDirectory()

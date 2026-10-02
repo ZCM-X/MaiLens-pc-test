@@ -62,7 +62,7 @@ class LiveProcessor:
         k2: float = -0.0174637,
         model: Path | None = None,
         detect_every: int = 12,
-        lock_fill: float = 0.64,
+        lock_fill: float = 0.71,
         debug: bool = False,
     ) -> None:
         self.crop = crop
@@ -130,6 +130,7 @@ class LiveProcessor:
             self.lock_tracker.update_flow(self.previous_gray, current_gray)
 
         detector_ran = False
+        fresh_inner_detection = False
         if self.detector.enabled and self.frame_index % self.detect_every == 0:
             detector_ran = True
             # The model was trained on the raw clip-on-lens geometry. Detect
@@ -154,6 +155,11 @@ class LiveProcessor:
                 height,
                 allow_soft_pair=True,
             )
+            fresh_inner_detection = (
+                detected_inner is not None
+                and self.lock_tracker.outer_age_frames == 0
+                and self.lock_tracker.inner_age_frames == 0
+            )
 
         if not self.detector.enabled:
             self.lock_tracker.reset()
@@ -168,6 +174,19 @@ class LiveProcessor:
             height,
             self.lock_fill,
         )
+        plane_reacquired = self.plane_tracker.reacquire_if_stale(
+            current_gray,
+            inner,
+            outer,
+            width,
+            height,
+            self.lock_fill,
+            fresh_detection=fresh_inner_detection,
+        )
+        if plane_reacquired:
+            plane_locked = True
+            self.plane_hold = None
+            self.plane_hold_frames = 0
         if self.lock_tracker.box is None:
             # Keep the last displayed transform until a new target is found,
             # but do not carry its distance reference to a different target.
@@ -253,6 +272,7 @@ class LiveProcessor:
             "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
             "plane_lock": plane_matrix is not None,
+            "plane_reacquired": plane_reacquired,
             "plane_age_frames": self.plane_tracker.age_frames,
             "plane_inliers": self.plane_tracker.inliers,
             "plane_inlier_ratio": self.plane_tracker.inlier_ratio,

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -95,6 +96,32 @@ class LiveProcessorTests(unittest.TestCase):
         for _ in range(8):
             processor.process(frame, metadata)
         self.assertEqual(detector.calls, 3)
+
+    def test_live_lock_recenters_after_stale_flow_and_fresh_detection(self):
+        class FixedDetector:
+            enabled = True
+
+            def detect(self, _frame):
+                return (30, 15, 290, 170), (95, 45, 225, 135)
+
+        processor = LiveProcessor(detect_every=1)
+        processor.detector = FixedDetector()
+        frame = np.random.default_rng(21).integers(0, 256, (180, 320, 3), dtype=np.uint8)
+        metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}
+
+        with patch("pc.live_processor.map_fisheye_box_to_output", side_effect=lambda box, *_args: box):
+            processor.process(frame, metadata)
+            processor.plane_tracker.current_to_reference = np.array(
+                [[1.0, 0.0, 18.0], [0.0, 1.0, -9.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            processor.plane_tracker.age_frames = 4
+            processor.plane_tracker.points = None
+            _output, debug = processor.process(frame, metadata)
+
+        self.assertTrue(debug["plane_reacquired"])
+        self.assertEqual(processor.plane_tracker.age_frames, 0)
+        np.testing.assert_allclose(processor.plane_tracker.current_to_reference, np.eye(3), atol=1e-6)
 
 
 if __name__ == "__main__":

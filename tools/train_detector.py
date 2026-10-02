@@ -398,6 +398,11 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", default="mailens-detector", help="训练运行名称")
     parser.add_argument("--batch", type=int, default=-1, help="batch size，默认 Ultralytics 自动设置")
     parser.add_argument("--workers", type=int, default=0, help="数据加载进程数；Windows 默认 0")
+    parser.add_argument(
+        "--disable-amp",
+        action="store_true",
+        help="关闭自动混合精度；离线环境中可避免 Ultralytics 下载 AMP 检查权重",
+    )
     parser.add_argument("--patience", type=int, default=50, help="早停 patience，默认 50")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--exist-ok", action="store_true", help="允许复用已有 project/name 目录")
@@ -448,6 +453,7 @@ def train(args: argparse.Namespace, summary: DatasetSummary, weights: Path) -> P
         "project": str(args.project),
         "name": args.name,
         "workers": args.workers,
+        "amp": not args.disable_amp,
         "patience": args.patience,
         "seed": args.seed,
         "exist_ok": args.exist_ok,

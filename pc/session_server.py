@@ -23,6 +23,8 @@ VERSION = 1
 MAX_FIELD = 4096
 MAX_FILE = 1 << 40
 READ_CHUNK = 1 << 20
+DEFAULT_MODEL = (Path(__file__).resolve().parent.parent
+                 / "models" / "frame-geometry-yolo11n-v5.onnx")
 
 
 class ProtocolError(RuntimeError):
@@ -84,7 +86,10 @@ def receive_session(connection: socket.socket,
                 "upload port. Set it back to 8765: the app derives the upload port (8765 + 1) "
                 "by itself, and this server only accepts finished recordings."
             )
-        raise ProtocolError(f"bad magic {magic!r}; is that really the phone uploader?")
+        raise ProtocolError(
+            f"unexpected protocol signature {magic!r}; this port accepts finished MLSF recordings only. "
+            "Use the phone app's 发送到电脑 action instead of sending live frames to the upload port."
+        )
     version = reader.read_exactly(1)[0]
     if version != VERSION:
         raise ProtocolError(f"unsupported protocol version {version}")
@@ -155,18 +160,23 @@ def handle_client(connection: socket.socket,
 def process_session_folder(directory: Path,
                            model: Path | None = None,
                            debug: bool = False,
+                           extra_args: tuple[str, ...] = (),
                            log=print) -> Path:
     """Run the offline stabiliser straight on the received movie and logs."""
     try:
         from .process_session import parse_args, process
     except ImportError:  # Running as `python pc/session_server.py`.
         from process_session import parse_args, process
+    selected_model = Path(model) if model else DEFAULT_MODEL
+    if not selected_model.is_file():
+        raise FileNotFoundError(f"geometry detector model not found: {selected_model}")
     argv = [str(directory)]
-    if model:
-        argv += ["--model", str(model)]
+    argv += ["--model", str(selected_model)]
     if debug:
         argv.append("--debug")
+    argv += [str(item) for item in extra_args]
     log(f"processing {directory} ...")
+    log(f"using geometry detector: {selected_model}")
     return process(parse_args(argv))
 
 
@@ -175,12 +185,14 @@ def post_process(directory: Path,
                  run_process: bool = False,
                  model: Path | None = None,
                  debug: bool = False,
+                 extra_args: tuple[str, ...] = (),
                  sessions_root: Path | None = None,
                  log=print) -> None:
     if run_process:
         try:
-            processed = process_session_folder(directory, model=model, debug=debug, log=log)
-        except FileNotFoundError as error:
+            processed = process_session_folder(directory, model=model, debug=debug,
+                                               extra_args=extra_args, log=log)
+        except (FileNotFoundError, RuntimeError) as error:
             log(f"processing skipped: {error}")
         else:
             log(f"processed video: {processed}")
@@ -211,6 +223,7 @@ def serve_forever(server: socket.socket,
                   run_process: bool = False,
                   model: Path | None = None,
                   debug: bool = False,
+                  extra_args: tuple[str, ...] = (),
                   sessions_root: Path | None = None,
                   background_tasks: bool = True,
                   once: bool = False,
@@ -228,9 +241,10 @@ def serve_forever(server: socket.socket,
                                             run_process=run_process,
                                             model=model,
                                             debug=debug,
+                                            extra_args=extra_args,
                                             sessions_root=sessions_root,
                                             log=log)
-                if background_tasks:
+                if background_tasks and not once:
                     # A long session takes minutes to process; keep accepting.
                     threading.Thread(target=task, daemon=True).start()
                 else:
@@ -250,6 +264,7 @@ def serve(host: str,
           run_process: bool = False,
           model: Path | None = None,
           debug: bool = False,
+          extra_args: tuple[str, ...] = (),
           sessions_root: Path | None = None,
           once: bool = False,
           log=print) -> None:
@@ -258,14 +273,15 @@ def serve(host: str,
         bound = server.getsockname()[1]
         log(f"MaiLens session upload listening on {host}:{bound}")
         log("This port takes finished recordings only.")
-        log(f"Keep the port in the phone app at {max(bound - 1, 1)} for the frame stream;")
-        log("the app adds one for uploads, and tapping 发送到电脑 does the rest.")
+        log(f"In the phone app, keep the frame-stream port at {max(bound - 1, 1)};")
+        log("the app adds one for this upload port when you tap 发送到电脑.")
         try:
             serve_forever(server, output_root,
                           run_import=run_import,
                           run_process=run_process,
                           model=model,
                           debug=debug,
+                          extra_args=extra_args,
                           sessions_root=sessions_root,
                           once=once,
                           log=log)
@@ -285,17 +301,41 @@ def main() -> None:
                         help="run process_session.py on the movie as soon as a session arrives")
     parser.add_argument("--model", type=Path, help="detector used by --process")
     parser.add_argument("--debug", action="store_true", help="write debug.jsonl during --process")
+    parser.add_argument("--plane-smooth", type=float,
+                        help="plane-warp smoothing (0-1); uses processor default when omitted")
+    parser.add_argument("--plane-model", choices=("homography", "similarity"),
+                        help="plane motion model; uses processor default when omitted")
+    parser.add_argument("--plane-full", action="store_true",
+                        help="warp the full frame onto the detected machine plane")
+    parser.add_argument("--plane-hold", type=int,
+                        help="hold the last plane transform for this many missed frames")
     parser.add_argument("--sessions-root", type=Path, default=Path("sessions"),
                         help="where --import writes the offline session")
     parser.add_argument("--once", action="store_true", help="accept a single session and exit")
     args = parser.parse_args()
     if not (0 < args.port < 65536):
         parser.error("--port must be between 1 and 65535")
+    if args.plane_smooth is not None and not 0.0 <= args.plane_smooth <= 1.0:
+        parser.error("--plane-smooth must be between 0 and 1")
+    if args.plane_hold is not None and args.plane_hold < 0:
+        parser.error("--plane-hold cannot be negative")
+    selected_model = args.model or DEFAULT_MODEL
+    if args.run_process and not selected_model.is_file():
+        parser.error(f"detector model not found: {selected_model}")
+    extra_args: list[str] = []
+    for option, value in (("--plane-smooth", args.plane_smooth),
+                          ("--plane-model", args.plane_model),
+                          ("--plane-hold", args.plane_hold)):
+        if value is not None:
+            extra_args.extend((option, str(value)))
+    if args.plane_full:
+        extra_args.append("--plane-full")
     serve(args.host, args.port, args.output_dir,
           run_import=args.run_import,
           run_process=args.run_process,
           model=args.model,
           debug=args.debug,
+          extra_args=tuple(extra_args),
           sessions_root=args.sessions_root,
           once=args.once)
 

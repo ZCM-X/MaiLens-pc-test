@@ -85,6 +85,43 @@ class ProcessSessionTests(unittest.TestCase):
         np.testing.assert_allclose(tracker.output_homography, before, atol=1e-6)
         self.assertFalse(tracker.last_success)
 
+    def test_stale_plane_lock_reacquires_and_recenters_from_fresh_detection(self):
+        width, height = 320, 240
+        frame = np.zeros((height, width), dtype=np.uint8)
+        for y in range(40, 201, 12):
+            for x in range(60, 261, 12):
+                cv2.circle(frame, (x, y), 2, 160 + (x + y) % 90, -1)
+        original_box = (80, 65, 240, 175)
+        fresh_box = (90, 70, 250, 180)
+        outer = (45, 30, 275, 210)
+        tracker = PlaneLockTracker(detect_every=12)
+        self.assertTrue(tracker.initialize(frame, original_box, outer, width, height, 0.64))
+        tracker.current_to_reference = np.array(
+            [[1.0, 0.0, 24.0], [0.0, 1.0, -13.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        tracker.age_frames = 7  # beyond output_homography's grace period
+        self.assertTrue(tracker.reacquire_if_stale(
+            frame, fresh_box, outer, width, height, 0.64, fresh_detection=True,
+        ))
+        self.assertEqual(tracker.reference_box, fresh_box)
+        self.assertEqual(tracker.age_frames, 0)
+        np.testing.assert_allclose(tracker.current_to_reference, np.eye(3), atol=1e-6)
+
+    def test_stale_plane_lock_ignores_unaccepted_detector_result(self):
+        width, height = 320, 240
+        frame = np.zeros((height, width), dtype=np.uint8)
+        cv2.rectangle(frame, (60, 40), (260, 200), 180, 3)
+        box = (80, 65, 240, 175)
+        outer = (45, 30, 275, 210)
+        tracker = PlaneLockTracker(detect_every=12)
+        self.assertTrue(tracker.initialize(frame, box, outer, width, height, 0.64))
+        tracker.age_frames = 7
+        self.assertFalse(tracker.reacquire_if_stale(
+            frame, box, outer, width, height, 0.64, fresh_detection=False,
+        ))
+        self.assertEqual(tracker.age_frames, 7)
+
     def test_geometry_margins_are_derived_from_two_boxes(self):
         self.assertEqual(
             geometry_margins((10, 20, 390, 280), (85, 95, 315, 205)),
