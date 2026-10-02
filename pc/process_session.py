@@ -1553,6 +1553,7 @@ def process(args: argparse.Namespace) -> Path:
     lens_fix = not getattr(args, "no_fisheye", False)
     max_frames = getattr(args, "max_frames", None)
     plane_smooth = float(getattr(args, "plane_smooth", 0.35))
+    plane_full = bool(getattr(args, "plane_full", False))
     plane_smooth_corners: np.ndarray | None = None
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
@@ -1664,7 +1665,19 @@ def process(args: argparse.Namespace) -> Path:
                         )
                     else:
                         matrix = plane_matrix
-                    stabilized = apply_plane_lock(stabilized, matrix, fixed_inner)
+                    if plane_full:
+                        # Warp the complete frame with the same machine-plane
+                        # transform.  No feathered seam, and the background moves
+                        # with the machine instead of staying live behind it.
+                        stabilized = cv2.warpPerspective(
+                            stabilized,
+                            np.asarray(matrix, dtype=np.float32),
+                            (width, height),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REPLICATE,
+                        )
+                    else:
+                        stabilized = apply_plane_lock(stabilized, matrix, fixed_inner)
                     outer = expand_box(fixed_inner, 1.45)
                     inner = fixed_inner
                     center = np.array([0.5, 0.5], dtype=np.float32)
@@ -1741,6 +1754,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plane-model", choices=("homography", "similarity"),
                         default="homography",
                         help="机台运动模型：homography 允许透视，similarity 只做旋转/等比缩放/平移，后者更不容易显扁")
+    parser.add_argument("--plane-full", action="store_true",
+                        help="整帧都按机台平面 warp，而不是只在中间合成机台区域")
     return parser
 
 
