@@ -278,6 +278,10 @@ def state_series(rows: list[dict]) -> dict:
     cx = np.full(count, np.nan)
     cy = np.full(count, np.nan)
     size = np.full(count, np.nan)
+    minor = np.full(count, np.nan)
+    angle = np.full(count, np.nan)
+    outer_cx = np.full(count, np.nan)
+    outer_cy = np.full(count, np.nan)
     roll = np.full(count, np.nan)
     for i, row in enumerate(rows):
         inner, outer = row["inner"], row["outer"]
@@ -285,12 +289,17 @@ def state_series(rows: list[dict]) -> dict:
             cx[i], cy[i] = inner["center"]
             # The major axis is the tilt-invariant distance signal.
             size[i] = inner["major"]
+            minor[i] = inner["minor"]
+            angle[i] = inner["angle"]
         elif outer is not None and ratio:
             cx[i], cy[i] = outer["center"]
             size[i] = outer_major[i] / ratio
-        if outer is not None and outer.get("roll") is not None:
-            roll[i] = outer["roll"]
-    return dict(cx=cx, cy=cy, size=size, roll=roll, ratio=ratio)
+        if outer is not None:
+            outer_cx[i], outer_cy[i] = outer["center"]
+            if outer.get("roll") is not None:
+                roll[i] = outer["roll"]
+    return dict(cx=cx, cy=cy, size=size, minor=minor, angle=angle, roll=roll,
+                outer_cx=outer_cx, outer_cy=outer_cy, ratio=ratio)
 
 
 def lock_matrices(series: dict, small_w: int, small_h: int, lock_fill: float,
@@ -360,6 +369,114 @@ def scale_matrix(matrix: np.ndarray, scale: float) -> np.ndarray:
     out[0, 2] *= scale
     out[1, 2] *= scale
     return out
+
+
+def scale_homography(matrix: np.ndarray, scale: float) -> np.ndarray:
+    """Conjugate a source->dest homography by a uniform pixel rescale."""
+    out = matrix.copy()
+    out[0, 2] *= scale
+    out[1, 2] *= scale
+    out[2, 0] /= scale
+    out[2, 1] /= scale
+    return out
+
+
+def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
+                     lock_fill: float, sigma: float,
+                     rectify: float, roll_gain: float, roll_sign: float,
+                     max_k: float = 8.0):
+    """Turn the inner play field back into a circle and pin it to the middle.
+
+    The screen is a circle on the cabinet face, so its image is an ellipse
+    whose aspect ratio is the cosine of the tilt.  Undoing that ellipse is the
+    whole tilt correction: the two-concentric-circle pencil in the same clip
+    reports its rank-1 member at (0, 0, 1) on every frame, which is exactly the
+    statement that the remaining perspective term is zero and only the affine
+    squash needs removing.
+
+    ``rectify`` blends between the plain similarity lock (0) and the full
+    un-squash (1).  The blend interpolates the *inverse* semi-axes so the
+    linear part stays positive definite for every value in between.
+    """
+    count = len(series["size"])
+    a = smooth(series["size"] * 0.5, sigma)
+    if not np.isfinite(a).any():
+        return None, None
+    semi_minor = smooth(series["minor"] * 0.5, sigma)
+    angle = smooth_periodic(series["angle"], sigma, 180.0)
+    cx = smooth(series["cx"], sigma)
+    cy = smooth(series["cy"], sigma)
+    roll = smooth_periodic(series["roll"], sigma) if roll_gain else np.zeros(count)
+
+    usable = np.isfinite(series["minor"]) & np.isfinite(series["angle"])
+    blend = np.where(usable, float(np.clip(rectify, 0.0, 1.0)), 0.0)
+    semi_minor = np.where(np.isfinite(semi_minor), semi_minor, a)
+    geometric = 1.0 / np.sqrt(np.maximum(a * semi_minor, 1e-9))
+    inv_a = blend / np.maximum(a, 1e-6) + (1.0 - blend) * geometric
+    inv_b = blend / np.maximum(semi_minor, 1e-6) + (1.0 - blend) * geometric
+
+    # Everything here lives in the measured frame's units.  The delivered
+    # frame is the centre 1/margin of the canvas, so a lock_fill wide screen
+    # is lock_fill * small_w / margin pixels across in this frame.
+    margin = max(float(margin), 1.0)
+    base_k = float(lock_fill) * small_w * 0.5 / margin
+    half_out = (small_w / (2.0 * margin), small_h / (2.0 * margin))
+    corners = [(-half_out[0], -half_out[1]), (half_out[0], -half_out[1]),
+               (-half_out[0], half_out[1]), (half_out[0], half_out[1])]
+
+    linear = np.zeros((count, 2, 2))
+    offset = np.zeros((count, 2))
+    need = np.ones(count)
+    ok = np.zeros(count, dtype=bool)
+    for i in range(count):
+        if not (np.isfinite(cx[i]) and np.isfinite(cy[i]) and np.isfinite(angle[i])):
+            linear[i] = np.eye(2)
+            continue
+        ok[i] = True
+        radians = math.radians(float(angle[i]))
+        cos_a, sin_a = math.cos(radians), math.sin(radians)
+        # cv2.fitEllipse: `angle` is the rotation of the width axis.
+        rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
+        m0 = np.diag([inv_a[i], inv_b[i]]) @ rotate
+        centre = np.array([cx[i], cy[i]])
+        t0 = -m0 @ centre
+        down = m0 @ np.array([0.0, 1.0])
+        # Keep the cabinet's own up direction pointing up the delivered frame.
+        phi = math.radians(90.0 - math.degrees(math.atan2(down[1], down[0])))
+        cos_p, sin_p = math.cos(phi), math.sin(phi)
+        upright = np.array([[cos_p, -sin_p], [sin_p, cos_p]])
+        if roll_gain:
+            spin = math.radians(-float(roll_gain) * roll_sign * float(roll[i]))
+            cos_s, sin_s = math.cos(spin), math.sin(spin)
+            upright = np.array([[cos_s, -sin_s], [sin_s, cos_s]]) @ upright
+        linear[i] = upright @ m0
+        offset[i] = upright @ t0
+        # How far the crop corners reach, expressed as the scale they need.
+        inverse = np.linalg.inv(linear[i])
+        for dx, dy in corners:
+            reach = inverse @ np.array([dx, dy])
+            if reach[0] > 0 and small_w - centre[0] > 1e-6:
+                need[i] = max(need[i], reach[0] / (small_w - centre[0]))
+            elif reach[0] < 0 and centre[0] > 1e-6:
+                need[i] = max(need[i], -reach[0] / centre[0])
+            if reach[1] > 0 and small_h - centre[1] > 1e-6:
+                need[i] = max(need[i], reach[1] / (small_h - centre[1]))
+            elif reach[1] < 0 and centre[1] > 1e-6:
+                need[i] = max(need[i], -reach[1] / centre[1])
+
+    need = rolling_max(need, int(max(2.0 * sigma, 4.0))) * 1.03
+    scale = smooth(np.maximum(base_k, need), 2.0)
+    scale = np.maximum(scale, np.minimum(need, max_k * base_k))
+    scale = np.clip(scale, base_k * 0.25, max_k * base_k)
+
+    centre_small = np.array([small_w * 0.5, small_h * 0.5])
+    matrices = np.zeros((count, 3, 3))
+    for i in range(count):
+        matrices[i, :2, :2] = scale[i] * linear[i]
+        matrices[i, :2, 2] = scale[i] * offset[i] + centre_small
+        matrices[i, 2, 2] = 1.0
+    return matrices, dict(scale=scale, need=need, usable=ok, cx=cx, cy=cy,
+                          angle=angle, semi_major=a, semi_minor=semi_minor)
 
 
 # ------------------------------------------------------------------------- io
@@ -442,7 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measure-scale", type=float, default=0.25)
     parser.add_argument("--output-scale", type=float, default=1.0)
     parser.add_argument("--lock-fill", type=float, default=0.72)
-    parser.add_argument("--margin", type=float, default=1.25)
+    parser.add_argument("--margin", type=float, default=1.4)
+    parser.add_argument("--rectify", type=float, default=1.0)
     parser.add_argument("--smooth-sigma", type=float, default=3.0)
     parser.add_argument("--roll-gain", type=float, default=0.0)
     parser.add_argument("--roll-sign", type=float, default=1.0)
@@ -459,46 +577,67 @@ def main() -> None:
     meta = measure_clip(args.input, args.measure_scale, args.max_frames, margin)
     rows = meta["rows"]
     series = state_series(rows)
-    matrices, info = lock_matrices(
-        series, meta["small_w"], meta["small_h"], args.lock_fill,
-        args.smooth_sigma, args.roll_gain, args.roll_sign, args.max_zoom, margin,
-    )
-
-    if args.trace is not None:
-        args.trace.parent.mkdir(parents=True, exist_ok=True)
-        out_cx, out_cy = meta["small_w"] * 0.5, meta["small_h"] * 0.5
-        with args.trace.open("w", encoding="utf-8") as handle:
-            for i in range(len(rows)):
-                raw_cx = series["cx"][i]
-                raw_cy = series["cy"][i]
-                if np.isfinite(raw_cx) and np.isfinite(raw_cy):
-                    matrix = matrices[i]
-                    resid_x = (matrix[0, 0] * raw_cx + matrix[0, 1] * raw_cy
-                               + matrix[0, 2]) - out_cx
-                    resid_y = (matrix[1, 0] * raw_cx + matrix[1, 1] * raw_cy
-                               + matrix[1, 2]) - out_cy
-                else:
-                    resid_x = resid_y = None
-                handle.write(json.dumps({
-                    "frame": i,
-                    "cx": float(raw_cx) if np.isfinite(raw_cx) else None,
-                    "cy": float(raw_cy) if np.isfinite(raw_cy) else None,
-                    "cx_smooth": float(info["cx"][i]),
-                    "cy_smooth": float(info["cy"][i]),
-                    "size": float(series["size"][i]) if np.isfinite(series["size"][i]) else None,
-                    "zoom": float(info["zoom"][i]),
-                    "roll": float(info["roll"][i]),
-                    "roll_meas": float(series["roll"][i]) if np.isfinite(series["roll"][i]) else None,
-                    "resid_x": None if resid_x is None else float(resid_x),
-                    "resid_y": None if resid_y is None else float(resid_y),
-                    "outer_ratio": series["ratio"],
-                }) + "\n")
-
     out_w = max(2, int(round(meta["raw_w"] * args.output_scale)))
     out_h = max(2, int(round(meta["raw_h"] * args.output_scale)))
     canvas_w = max(out_w, int(round(out_w * margin)))
     canvas_h = max(out_h, int(round(out_h * margin)))
     scale = canvas_w / meta["small_w"]
+    crop_x = (canvas_w - out_w) // 2
+    crop_y = (canvas_h - out_h) // 2
+    base_k = float(args.lock_fill) * out_w * 0.5
+
+    rectified, rect_info = None, None
+    if args.rectify > 0.0:
+        rectified, rect_info = rectify_matrices(
+            series, meta["small_w"], meta["small_h"], margin,
+            args.lock_fill, args.smooth_sigma, args.rectify,
+            args.roll_gain, args.roll_sign)
+    matrices = info = None
+    if rectified is None:
+        matrices, info = lock_matrices(
+            series, meta["small_w"], meta["small_h"], args.lock_fill,
+            args.smooth_sigma, args.roll_gain, args.roll_sign, args.max_zoom,
+            margin)
+
+    def project(index: int, x: float, y: float) -> np.ndarray:
+        """Map a point of the measured frame into the delivered frame."""
+        if rectified is not None:
+            point = rectified[index] @ np.array([x, y, 1.0])
+            point = point[:2] / point[2]
+        else:
+            point = matrices[index] @ np.array([x, y, 1.0])
+        return point * scale - np.array([crop_x, crop_y])
+
+    if args.trace is not None:
+        args.trace.parent.mkdir(parents=True, exist_ok=True)
+        middle = np.array([out_w, out_h], dtype=np.float64) * 0.5
+        with args.trace.open("w", encoding="utf-8") as handle:
+            for i in range(len(rows)):
+                raw_cx, raw_cy = series["cx"][i], series["cy"][i]
+                resid = None
+                if np.isfinite(raw_cx) and np.isfinite(raw_cy):
+                    resid = project(i, raw_cx, raw_cy) - middle
+                ring = None
+                if np.isfinite(series["outer_cx"][i]):
+                    ring = project(i, series["outer_cx"][i],
+                                   series["outer_cy"][i]) - middle
+                handle.write(json.dumps({
+                    "frame": i,
+                    "cx": float(raw_cx) if np.isfinite(raw_cx) else None,
+                    "cy": float(raw_cy) if np.isfinite(raw_cy) else None,
+                    "size": float(series["size"][i]) if np.isfinite(series["size"][i]) else None,
+                    "minor": float(series["minor"][i]) if np.isfinite(series["minor"][i]) else None,
+                    "angle": float(series["angle"][i]) if np.isfinite(series["angle"][i]) else None,
+                    "zoom": (float(rect_info["scale"][i] / base_k) if rect_info
+                             else float(info["zoom"][i])),
+                    "roll_meas": float(series["roll"][i]) if np.isfinite(series["roll"][i]) else None,
+                    "resid_x": None if resid is None else float(resid[0]),
+                    "resid_y": None if resid is None else float(resid[1]),
+                    "ring_dx": None if ring is None else float(ring[0]),
+                    "ring_dy": None if ring is None else float(ring[1]),
+                    "outer_ratio": series["ratio"],
+                }) + "\n")
+
     capture = cv2.VideoCapture(str(args.input))
     lens = dict(LENS, crop=LENS["crop"] / margin)
     remap = None if args.no_fisheye else build_remap(
@@ -508,8 +647,6 @@ def main() -> None:
                              meta["fps"], (out_w, out_h))
     if not writer.isOpened():
         raise RuntimeError(f"cannot write {args.output}")
-    crop_x = (canvas_w - out_w) // 2
-    crop_y = (canvas_h - out_h) // 2
 
     index = 0
     while index < len(rows):
@@ -519,21 +656,26 @@ def main() -> None:
         base = frame if remap is None else unwarp(frame, remap)
         if base.shape[1] != canvas_w or base.shape[0] != canvas_h:
             base = cv2.resize(base, (canvas_w, canvas_h))
-        matrix = scale_matrix(matrices[index], scale)
-        locked = cv2.warpAffine(base, matrix, (canvas_w, canvas_h),
-                                flags=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_REFLECT101)
+        if rectified is not None:
+            matrix = scale_homography(rectified[index], scale)
+            locked = cv2.warpPerspective(base, matrix, (canvas_w, canvas_h),
+                                         flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_REFLECT101)
+        else:
+            matrix = scale_matrix(matrices[index], scale)
+            locked = cv2.warpAffine(base, matrix, (canvas_w, canvas_h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REFLECT101)
         locked = locked[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
         if args.draw:
             row = rows[index]
             source = (row["inner"]["center"] if row["inner"] is not None
                       else (row["outer"]["center"] if row["outer"] is not None else None))
             if source is not None:
-                point = matrices[index] @ np.array([source[0], source[1], 1.0])
-                target = (point[0] * scale - crop_x, point[1] * scale - crop_y)
-                error = float(np.hypot(point[0] - meta["small_w"] * 0.5,
-                                       point[1] - meta["small_h"] * 0.5) * scale)
-                _draw_overlay(locked, target, error)
+                target = project(index, source[0], source[1])
+                error = float(np.hypot(target[0] - out_w * 0.5,
+                                       target[1] - out_h * 0.5))
+                _draw_overlay(locked, (target[0], target[1]), error)
         writer.write(locked)
         index += 1
     capture.release()
