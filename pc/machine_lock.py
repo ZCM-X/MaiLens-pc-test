@@ -876,7 +876,12 @@ def lock_report(rows: list[dict], project, middle: np.ndarray) -> dict:
         outer_points = np.array([project(i, p[0], p[1]) for p in outer["points"]])
         inner_radius = np.linalg.norm(inner_points - middle, axis=1)
         outer_radius = np.linalg.norm(outer_points - middle, axis=1)
-        machine.append(float(np.linalg.norm(inner_points.mean(axis=0) - middle)))
+        # The contour's own centroid is biased by the hole the character art
+        # punches in the mask, so the cabinet's position comes from the fitted
+        # centre instead -- the same point the warp actually pins down.
+        anchor = row.get("joint") or inner
+        machine.append(float(np.linalg.norm(
+            project(i, anchor["center"][0], anchor["center"][1]) - middle)))
         ring_cv.append(float(outer_radius.std() / max(outer_radius.mean(), 1e-6)))
         screen_cv.append(float(inner_radius.std() / max(inner_radius.mean(), 1e-6)))
         gap = outer_radius - inner_radius.mean()
@@ -954,7 +959,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="joint: two-ring fit; ellipse: inner screen only")
     parser.add_argument("--ring-weight", type=float, default=RING_WEIGHT,
                         help="button-ring pull on the shared shape (0.15..2)")
-    parser.add_argument("--smooth-sigma", type=float, default=1.0,
+    parser.add_argument("--smooth-sigma", type=float, default=0.5,
                         help="centre window; keep it short so the cabinet stays put")
     parser.add_argument("--shape-sigma", type=float, default=14.0,
                         help="squash/scale window; long enough to kill the pulse")
