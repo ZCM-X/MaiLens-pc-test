@@ -117,7 +117,37 @@ def ring_roll(angles, step: float = 45.0) -> float | None:
     return float(math.degrees(phase) / order)
 
 
-def measure_button_ring(frame: np.ndarray) -> dict | None:
+def ellipse_frame(inner: dict):
+    """Map image points into the inner screen's own unit-circle frame."""
+    radians = math.radians(inner["angle"])
+    cos_a, sin_a = math.cos(radians), math.sin(radians)
+    rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
+    scale = np.array([2.0 / inner["major"], 2.0 / inner["minor"]])
+    centre = np.array(inner["center"], dtype=np.float64)
+
+    def normalise(points):
+        delta = np.asarray(points, dtype=np.float64) - centre
+        return (delta @ rotate.T) * scale
+    return normalise
+
+
+# The buttons ring sits at roughly 1.25 screen radii; artwork specks live well
+# inside that and other purple cabinets well outside it, so a radial band in
+# the screen's own frame is what separates the eight real buttons from the
+# junk.  A raw pixel-space band cannot do this, because the ring is about 30%
+# wider along one axis than the other.
+BUTTON_BAND = (0.85, 1.95)
+
+# How hard the eight button centres pull on the shared shape against the 72
+# screen-contour samples.  Sweeping it on the hand-held clip gives:
+#   0.15 -> buttons round (3.7%), screen squash visible (7.6% radius error)
+#   0.50 -> buttons 7.7%, screen 3.5%     <- the balanced default
+#   2.00 -> buttons 9.1%, screen 2.5%
+# The two rings genuinely disagree this much, so it has to be a taste call.
+RING_WEIGHT = 0.5
+
+
+def measure_button_ring(frame: np.ndarray, inner: dict | None = None) -> dict | None:
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, PURPLE_LOW, PURPLE_HIGH)
@@ -126,7 +156,17 @@ def measure_button_ring(frame: np.ndarray) -> dict | None:
     blobs = [(int(stats[i, cv2.CC_STAT_AREA]), centroids[i])
              for i in range(1, count)]
     blobs.sort(key=lambda item: -item[0])
-    blobs = [b for b in blobs if b[0] >= 12][:12]
+    blobs = [b for b in blobs if b[0] >= 12]
+    if inner is not None:
+        normalise = ellipse_frame(inner)
+        banded = []
+        for area, point in blobs:
+            radius = float(np.linalg.norm(normalise(point)))
+            if BUTTON_BAND[0] < radius < BUTTON_BAND[1]:
+                banded.append((area, point))
+        if len(banded) >= 5:
+            blobs = banded
+    blobs = blobs[:12]
     if len(blobs) < 5:
         return None
     points = np.array([b[1] for b in blobs], dtype=np.float64)
@@ -152,8 +192,36 @@ def measure_button_ring(frame: np.ndarray) -> dict | None:
         "rms": rms,
         "count": int(len(points)),
         "angles": [float(a) for a in angles],
+        "points": points.tolist(),
         "roll": ring_roll(angles),
     }
+
+
+def fit_ellipse_robust(contour: np.ndarray, rounds: int = 3, band: float = 0.06):
+    """Ellipse fit that survives the character art punching holes in the mask.
+
+    A missing chunk of the cyan mask drags ``cv2.fitEllipse`` towards itself,
+    which is what makes the screen centre wander while a song plays.  Points
+    are scored by their radius in the current ellipse's own frame and the
+    stragglers are dropped before refitting.
+    """
+    points = np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2)
+    (ex, ey), (axis_a, axis_b), angle = cv2.fitEllipse(points)
+    for _ in range(rounds):
+        if len(points) < 60:
+            break
+        radians = math.radians(angle)
+        cos_a, sin_a = math.cos(radians), math.sin(radians)
+        rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
+        scale = np.array([2.0 / max(axis_a, 1e-6), 2.0 / max(axis_b, 1e-6)])
+        delta = points[:, 0, :].astype(np.float64) - np.array([ex, ey])
+        radius = np.linalg.norm((delta @ rotate.T) * scale, axis=1)
+        keep = np.abs(radius - 1.0) <= band
+        if keep.sum() < max(24, int(0.5 * len(points))) or keep.all():
+            break
+        points = points[keep]
+        (ex, ey), (axis_a, axis_b), angle = cv2.fitEllipse(points)
+    return points[:, 0, :].astype(np.float64), (ex, ey), (axis_a, axis_b), angle
 
 
 def measure_inner_screen(frame: np.ndarray) -> dict | None:
@@ -186,20 +254,173 @@ def measure_inner_screen(frame: np.ndarray) -> dict | None:
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
-    (ex, ey), (axis_a, axis_b), angle = cv2.fitEllipse(contour)
+    contour, (ex, ey), (axis_a, axis_b), angle = fit_ellipse_robust(contour)
     major, minor = max(axis_a, axis_b), min(axis_a, axis_b)
+    step = max(1, len(contour) // 72)
     return {
         "center": [float(ex), float(ey)],
         "major": float(major),
         "minor": float(minor),
         "angle": float(angle),
-        "area": float(cv2.contourArea(contour)),
+        "area": float(len(contour)),
+        # Kept for the joint two-ring fit: the screen edge on its own cannot
+        # pin down the ellipse orientation, because it is nearly circular.
+        "points": contour[::step].astype(np.float64).tolist(),
     }
 
 
 def measure_frame(frame: np.ndarray) -> dict:
-    return {"inner": measure_inner_screen(frame),
-            "outer": measure_button_ring(frame)}
+    inner = measure_inner_screen(frame)
+    outer = measure_button_ring(frame, inner)
+    joint = None
+    if inner is not None and outer is not None:
+        joint = fit_two_ring(inner["points"], outer["points"])
+    return {"inner": inner, "outer": outer, "joint": joint}
+
+
+# ------------------------------------------------------------ joint two-ring
+#
+# The blogger's own correction rule -- "a distortion free picture has equal
+# gaps between the outer buttons and the inner screen on all four sides" -- is
+# exactly the statement that the button circle and the screen circle are
+# concentric after the warp.  The screen edge alone cannot deliver that: it is
+# almost a circle, so its ellipse orientation is barely observable and the
+# buttons come out skewed.  Fitting both rings *at once* against one affine
+# pins the squash direction down, which is what straightens the buttons.
+
+
+def _chol_q(params: np.ndarray) -> np.ndarray:
+    """Shape matrix Q = L L^T from an unconstrained parameter triple."""
+    l1 = math.exp(float(params[0]))
+    off = float(params[1])
+    l2 = math.exp(float(params[2]))
+    return np.array([[l1 * l1, l1 * off],
+                     [l1 * off, off * off + l2 * l2]])
+
+
+def _q_chol_params(q: np.ndarray) -> np.ndarray:
+    l1 = math.sqrt(max(float(q[0, 0]), 1e-12))
+    off = float(q[0, 1]) / l1
+    l2 = math.sqrt(max(float(q[1, 1]) - off * off, 1e-12))
+    return np.array([math.log(l1), off, math.log(l2)])
+
+
+def _lm_solve(func, x0: np.ndarray, iterations: int = 40, lam0: float = 1e-3):
+    """Small Levenberg-Marquardt with a numeric Jacobian."""
+    x = np.asarray(x0, dtype=np.float64).copy()
+    residual = func(x)
+    cost = float(residual @ residual)
+    lam = lam0
+    for _ in range(iterations):
+        jacobian = np.empty((len(residual), len(x)))
+        for k in range(len(x)):
+            step = 1e-6 * max(1.0, abs(x[k]))
+            trial = x.copy()
+            trial[k] += step
+            jacobian[:, k] = (func(trial) - residual) / step
+        normal = jacobian.T @ jacobian
+        gradient = jacobian.T @ residual
+        improved = False
+        for _ in range(8):
+            damped = normal + lam * np.diag(np.maximum(np.diag(normal), 1e-9))
+            try:
+                delta = np.linalg.solve(damped, -gradient)
+            except np.linalg.LinAlgError:
+                lam *= 10.0
+                continue
+            trial = x + delta
+            trial_residual = func(trial)
+            trial_cost = float(trial_residual @ trial_residual)
+            if trial_cost < cost:
+                x, residual, cost = trial, trial_residual, trial_cost
+                lam = max(lam * 0.3, 1e-9)
+                improved = True
+                break
+            lam *= 10.0
+        if not improved or cost < 1e-13:
+            break
+    return x, cost, residual
+
+
+def matrix_sqrt(q: np.ndarray) -> np.ndarray:
+    values, vectors = np.linalg.eigh(np.asarray(q, dtype=np.float64))
+    values = np.maximum(values, 1e-12)
+    return (vectors * np.sqrt(values)) @ vectors.T
+
+
+def fit_two_ring(inner_points, outer_points, inner_weight: float | None = None,
+                 robust_rounds: int = 3):
+    """One affine that makes the screen a circle and the buttons concentric.
+
+    Unknowns are the shape matrix Q = M^T M, the shared centre and the squared
+    button radius.  The screen radius is normalised to one, so ``M`` maps the
+    measured frame into the cabinet's own metric up to a rotation.
+
+    The screen contour is redrawn every frame, so a few of its samples always
+    sit on a missing chunk of the mask or on the character art.  Those rounds
+    of reweighting are what keep one bad sample from tilting the cabinet.
+    """
+    inner = np.asarray(inner_points, dtype=np.float64)
+    outer = np.asarray(outer_points, dtype=np.float64)
+    if len(inner) < 12 or len(outer) < 5:
+        return None
+    if inner_weight is None:
+        inner_weight = RING_WEIGHT * math.sqrt(len(outer) / len(inner))
+
+    centre = inner.mean(axis=0)
+    delta = inner - centre
+    covariance = (delta.T @ delta) / len(delta)
+    q0 = 2.0 * np.linalg.inv(covariance + 1e-9 * np.eye(2))
+    q0 /= np.mean(np.einsum("ij,jk,ik->i", delta, q0, delta))
+    outer_delta = outer - centre
+    rho0 = max(float(np.mean(np.einsum("ij,jk,ik->i", outer_delta, q0, outer_delta))), 1e-6)
+    x0 = np.concatenate([_q_chol_params(q0), centre, [math.log(rho0)]])
+
+    inner_scale = np.ones(len(inner))
+    outer_scale = np.ones(len(outer))
+
+    def make_residuals():
+        def residuals(params):
+            q = _chol_q(params)
+            shared = params[3:5]
+            rho2 = math.exp(float(params[5]))
+            inner_delta = inner - shared
+            values = np.einsum("ij,jk,ik->i", inner_delta, q, inner_delta)
+            inner_residual = (values - 1.0) * inner_weight * inner_scale
+            outer_delta = outer - shared
+            values = np.einsum("ij,jk,ik->i", outer_delta, q, outer_delta)
+            return np.concatenate([inner_residual,
+                                   (values / rho2 - 1.0) * outer_scale])
+        return residuals
+
+    solution = x0
+    for _ in range(max(1, robust_rounds)):
+        inner_scale = np.ones(len(inner))
+        outer_scale = np.ones(len(outer))
+        solution, cost, residual = _lm_solve(make_residuals(), solution)
+        # Tukey-style hard rejection against the spread of each block.
+        inner_residual = residual[:len(inner)]
+        outer_residual = residual[len(inner):]
+        inner_limit = max(4.0 * float(np.median(np.abs(inner_residual))), 0.02)
+        outer_limit = max(4.0 * float(np.median(np.abs(outer_residual))), 0.02)
+        inner_scale = (np.abs(inner_residual) <= inner_limit).astype(np.float64)
+        outer_scale = (np.abs(outer_residual) <= outer_limit).astype(np.float64)
+        if inner_scale.sum() < 12 or outer_scale.sum() < 5:
+            break
+
+    solution, cost, residual = _lm_solve(make_residuals(), solution)
+    q = _chol_q(solution)
+    count = len(residual)
+    return {
+        # Only the three shape parameters: the centre and the button radius are
+        # carried separately so the series can be filtered on their own.
+        "chol": [float(v) for v in solution[:3]],
+        "q": q.tolist(),
+        "center": [float(solution[3]), float(solution[4])],
+        "rho": float(math.sqrt(math.exp(float(solution[5])))),
+        "rms": float(math.sqrt(cost / count)),
+        "buttons": int(len(outer)),
+    }
 
 
 # ------------------------------------------------------------------- smoothing
@@ -381,10 +602,134 @@ def scale_homography(matrix: np.ndarray, scale: float) -> np.ndarray:
     return out
 
 
+def world_lock(values: np.ndarray, deadband, tau: float, tau_fast: float,
+               fast_ratio: float = 4.0, dt: float = 1.0 / 60.0) -> np.ndarray:
+    """Hold the machine in the world instead of chasing every measurement.
+
+    Anything inside ``deadband`` is detector noise and is ignored outright, so
+    the cabinet sits dead still while the operator's hands shake.  Bigger
+    errors are followed -- gently while they are ambiguous, briskly once they
+    clearly mean the operator moved rather than the detector twitched.
+    """
+    values = fill_nan(values)
+    if len(values) < 2 or not np.isfinite(values).all():
+        return values
+    band = np.broadcast_to(np.asarray(deadband, dtype=np.float64), values.shape)
+    out = np.empty_like(values)
+    anchor = float(values[0])
+    for i in range(len(values)):
+        error = float(values[i]) - anchor
+        excess = math.copysign(max(abs(error) - float(band[i]), 0.0), error)
+        if excess:
+            rate = tau if abs(excess) <= fast_ratio * float(band[i]) else tau_fast
+            anchor += excess * (1.0 - math.exp(-dt / max(rate, 1e-4)))
+        out[i] = anchor
+    return out
+
+
+def stabilise(values: np.ndarray, sigma: float, lock: dict | None = None,
+              dt: float = 1.0 / 60.0, deadband=0.0) -> np.ndarray:
+    if lock is None:
+        return smooth(values, sigma)
+    return world_lock(values, deadband, lock["tau"], lock["tau_fast"],
+                      lock["fast_ratio"], dt)
+
+
+def joint_position(rows: list[dict]) -> dict:
+    """Pull the per-frame two-ring solution out of the raw measurements."""
+    count = len(rows)
+    cx = np.full(count, np.nan)
+    cy = np.full(count, np.nan)
+    chol = np.full((count, 3), np.nan)
+    rho = np.full(count, np.nan)
+    for i, row in enumerate(rows):
+        joint = row.get("joint")
+        if joint is None:
+            continue
+        cx[i], cy[i] = joint["center"]
+        chol[i] = joint["chol"]
+        rho[i] = joint["rho"]
+    return dict(cx=cx, cy=cy, chol=chol, rho=rho)
+
+
+def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
+               lock: dict | None, dt: float, deadband_frac: float,
+               shape_sigma: float | None = None):
+    """Per-frame centre plus the linear map from measurement to screen metric.
+
+    With ``joint`` the shape comes from the two-ring fit, so the button ring
+    lands concentric with the screen.  Without it the old single-ellipse path
+    is kept as the fallback.
+
+    The two halves of the warp are filtered differently on purpose.  Where the
+    cabinet *is* has to follow the measurement, otherwise the cabinet slides
+    around inside the frame.  How the cabinet is *squashed*, on the other hand,
+    barely changes while the operator moves, so it is worth a much longer
+    window: that is what stops the cabinet from pulsing and rolling with the
+    detector noise.
+    """
+    count = len(series["size"])
+    cx = np.full(count, np.nan)
+    cy = np.full(count, np.nan)
+    maps = np.tile(np.eye(2), (count, 1, 1))
+    radius = np.full(count, np.nan)
+    blend = float(np.clip(rectify, 0.0, 1.0))
+    shape_sigma = float(shape_sigma) if shape_sigma else max(sigma, 12.0)
+
+    if joint is not None and np.isfinite(joint["rho"]).any():
+        chol = np.column_stack([
+            stabilise(joint["chol"][:, k], shape_sigma, lock, dt)
+            for k in range(3)
+        ])
+        raw = np.array([_chol_q(joint["chol"][i])
+                        if np.isfinite(joint["chol"][i]).all() else np.eye(2)
+                        for i in range(count)])
+        # Geometric mean screen radius in measured pixels, used to size the
+        # deadband in units the operator would recognise.
+        spread = np.array([math.sqrt(abs(np.linalg.det(m))) for m in raw])
+        radius = np.where(spread > 0.0, 1.0 / np.sqrt(np.maximum(spread, 1e-9)), np.nan)
+        band = np.where(np.isfinite(radius), deadband_frac * radius, 0.0)
+        cx = stabilise(joint["cx"], sigma, None, dt, band)
+        cy = stabilise(joint["cy"], sigma, None, dt, band)
+        for i in range(count):
+            if not np.isfinite(chol[i]).all():
+                continue
+            m = matrix_sqrt(_chol_q(chol[i]))
+            isotropic = math.sqrt(abs(np.linalg.det(m)))
+            maps[i] = blend * m + (1.0 - blend) * isotropic * np.eye(2)
+        usable = np.isfinite(chol).all(axis=1)
+        return maps, cx, cy, radius, usable
+
+    a = stabilise(series["size"] * 0.5, shape_sigma, lock, dt,
+                  deadband_frac * series["size"] * 0.5)
+    semi_minor = stabilise(series["minor"] * 0.5, shape_sigma, lock, dt)
+    angle = smooth_periodic(series["angle"], shape_sigma, 180.0)
+    cx = stabilise(series["cx"], sigma, None, dt, deadband_frac * series["size"] * 0.5)
+    cy = stabilise(series["cy"], sigma, None, dt, deadband_frac * series["size"] * 0.5)
+    radius = a
+    usable = np.isfinite(series["minor"]) & np.isfinite(series["angle"])
+    semi_minor = np.where(np.isfinite(semi_minor), semi_minor, a)
+    geometric = 1.0 / np.sqrt(np.maximum(a * semi_minor, 1e-9))
+    inv_a = blend / np.maximum(a, 1e-6) + (1.0 - blend) * geometric
+    inv_b = blend / np.maximum(semi_minor, 1e-6) + (1.0 - blend) * geometric
+    for i in range(count):
+        if not (np.isfinite(inv_a[i]) and np.isfinite(inv_b[i]) and np.isfinite(angle[i])):
+            continue
+        radians = math.radians(float(angle[i]))
+        cos_a, sin_a = math.cos(radians), math.sin(radians)
+        # cv2.fitEllipse: `angle` is the rotation of the width axis.
+        rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
+        maps[i] = np.diag([inv_a[i], inv_b[i]]) @ rotate
+    return maps, cx, cy, radius, usable
+
+
 def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
                      lock_fill: float, sigma: float,
                      rectify: float, roll_gain: float, roll_sign: float,
-                     max_k: float = 8.0):
+                     max_k: float = 8.0, joint: dict | None = None,
+                     lock: dict | None = None, fps: float = 60.0,
+                     deadband_frac: float = 0.0,
+                     shape_sigma: float | None = None):
     """Turn the inner play field back into a circle and pin it to the middle.
 
     The screen is a circle on the cabinet face, so its image is an ellipse
@@ -399,21 +744,12 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     linear part stays positive definite for every value in between.
     """
     count = len(series["size"])
-    a = smooth(series["size"] * 0.5, sigma)
-    if not np.isfinite(a).any():
+    dt = 1.0 / max(float(fps), 1e-6)
+    maps, cx, cy, radius, usable = shape_maps(
+        series, joint, sigma, rectify, lock, dt, deadband_frac, shape_sigma)
+    if not np.isfinite(cx).any():
         return None, None
-    semi_minor = smooth(series["minor"] * 0.5, sigma)
-    angle = smooth_periodic(series["angle"], sigma, 180.0)
-    cx = smooth(series["cx"], sigma)
-    cy = smooth(series["cy"], sigma)
     roll = smooth_periodic(series["roll"], sigma) if roll_gain else np.zeros(count)
-
-    usable = np.isfinite(series["minor"]) & np.isfinite(series["angle"])
-    blend = np.where(usable, float(np.clip(rectify, 0.0, 1.0)), 0.0)
-    semi_minor = np.where(np.isfinite(semi_minor), semi_minor, a)
-    geometric = 1.0 / np.sqrt(np.maximum(a * semi_minor, 1e-9))
-    inv_a = blend / np.maximum(a, 1e-6) + (1.0 - blend) * geometric
-    inv_b = blend / np.maximum(semi_minor, 1e-6) + (1.0 - blend) * geometric
 
     # Everything here lives in the measured frame's units.  The delivered
     # frame is the centre 1/margin of the canvas, so a lock_fill wide screen
@@ -429,15 +765,11 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     need = np.ones(count)
     ok = np.zeros(count, dtype=bool)
     for i in range(count):
-        if not (np.isfinite(cx[i]) and np.isfinite(cy[i]) and np.isfinite(angle[i])):
+        if not (np.isfinite(cx[i]) and np.isfinite(cy[i]) and usable[i]):
             linear[i] = np.eye(2)
             continue
         ok[i] = True
-        radians = math.radians(float(angle[i]))
-        cos_a, sin_a = math.cos(radians), math.sin(radians)
-        # cv2.fitEllipse: `angle` is the rotation of the width axis.
-        rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
-        m0 = np.diag([inv_a[i], inv_b[i]]) @ rotate
+        m0 = maps[i]
         centre = np.array([cx[i], cy[i]])
         t0 = -m0 @ centre
         down = m0 @ np.array([0.0, 1.0])
@@ -476,18 +808,30 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
         matrices[i, :2, 2] = scale[i] * offset[i] + centre_small
         matrices[i, 2, 2] = 1.0
     return matrices, dict(scale=scale, need=need, usable=ok, cx=cx, cy=cy,
-                          angle=angle, semi_major=a, semi_minor=semi_minor)
+                          radius=radius, maps=maps)
 
 
 # ------------------------------------------------------------------------- io
 def measure_clip(path: Path, measure_scale: float, max_frames: int | None,
-                 margin: float = 1.0):
+                 margin: float = 1.0, ring_weight: float | None = None):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeError(f"cannot open {path}")
     raw_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     raw_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    ring_weight = RING_WEIGHT if ring_weight is None else float(ring_weight)
+    cache = path.with_suffix(path.suffix + ".measure.json")
+    if max_frames is None and cache.exists():
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        if (payload.get("scale") == measure_scale and payload.get("margin") == margin
+                and payload.get("raw_w") == raw_w and payload.get("raw_h") == raw_h
+                and payload.get("ring_weight") == ring_weight):
+            capture.release()
+            return dict(raw_w=raw_w, raw_h=raw_h, fps=payload["fps"],
+                        small_w=payload["small_w"], small_h=payload["small_h"],
+                        rows=payload["rows"], count=len(payload["rows"]),
+                        cached=True)
     small_w = max(2, int(round(raw_w * measure_scale)))
     small_h = max(2, int(round(raw_h * measure_scale)))
     # Measure on exactly the same (wider) field the render canvas uses, so a
@@ -503,8 +847,53 @@ def measure_clip(path: Path, measure_scale: float, max_frames: int | None,
         if max_frames and len(rows) >= max_frames:
             break
     capture.release()
-    return dict(raw_w=raw_w, raw_h=raw_h, fps=fps, small_w=small_w,
-                small_h=small_h, rows=rows, count=len(rows))
+    meta = dict(raw_w=raw_w, raw_h=raw_h, fps=fps, small_w=small_w,
+                small_h=small_h, rows=rows, count=len(rows), cached=False)
+    if max_frames is None:
+        cache.write_text(json.dumps(dict(name=str(path), scale=measure_scale,
+                                         margin=margin, fps=fps, raw_w=raw_w,
+                                         raw_h=raw_h, small_w=small_w,
+                                         small_h=small_h, ring_weight=ring_weight,
+                                         rows=rows)),
+                         encoding="utf-8")
+    return meta
+
+
+def lock_report(rows: list[dict], project, middle: np.ndarray) -> dict:
+    """How well the delivered frame holds up, measured on the warp itself.
+
+    ``ring cv`` is the spread of the button radii around the middle of the
+    frame: that is the number to watch when tuning ``--ring-weight``, because
+    it is exactly the "the buttons must not be skewed" criterion.  ``machine``
+    is how far the cabinet wanders from the middle of the frame.
+    """
+    machine, ring_cv, screen_cv, gap_lr, gap_tb = [], [], [], [], []
+    for i, row in enumerate(rows):
+        inner, outer = row["inner"], row["outer"]
+        if inner is None or outer is None:
+            continue
+        inner_points = np.array([project(i, p[0], p[1]) for p in inner["points"]])
+        outer_points = np.array([project(i, p[0], p[1]) for p in outer["points"]])
+        inner_radius = np.linalg.norm(inner_points - middle, axis=1)
+        outer_radius = np.linalg.norm(outer_points - middle, axis=1)
+        machine.append(float(np.linalg.norm(inner_points.mean(axis=0) - middle)))
+        ring_cv.append(float(outer_radius.std() / max(outer_radius.mean(), 1e-6)))
+        screen_cv.append(float(inner_radius.std() / max(inner_radius.mean(), 1e-6)))
+        gap = outer_radius - inner_radius.mean()
+        angles = np.degrees(np.arctan2(outer_points[:, 1] - middle[1],
+                                       outer_points[:, 0] - middle[0]))
+        side = dict(left=angles > 135, right=(angles <= 45) & ~(angles >= 45),
+                    top=(angles <= -45) & (angles > -135), bottom=angles >= 45)
+        if all(mask.any() for mask in side.values()):
+            edges = {name: float(gap[mask].mean()) for name, mask in side.items()}
+            gap_lr.append(abs(edges["left"] - edges["right"]))
+            gap_tb.append(abs(edges["top"] - edges["bottom"]))
+
+    def q(values):
+        return float(np.median(values)) if values else float("nan")
+
+    return dict(machine=q(machine), ring_cv=q(ring_cv), screen_cv=q(screen_cv),
+                gap_lr=q(gap_lr), gap_tb=q(gap_tb))
 
 
 def _draw_overlay(frame: np.ndarray, target: tuple[float, float],
@@ -561,7 +950,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-fill", type=float, default=0.72)
     parser.add_argument("--margin", type=float, default=1.4)
     parser.add_argument("--rectify", type=float, default=1.0)
-    parser.add_argument("--smooth-sigma", type=float, default=3.0)
+    parser.add_argument("--fit", choices=("joint", "ellipse"), default="joint",
+                        help="joint: two-ring fit; ellipse: inner screen only")
+    parser.add_argument("--ring-weight", type=float, default=RING_WEIGHT,
+                        help="button-ring pull on the shared shape (0.15..2)")
+    parser.add_argument("--smooth-sigma", type=float, default=1.0,
+                        help="centre window; keep it short so the cabinet stays put")
+    parser.add_argument("--shape-sigma", type=float, default=14.0,
+                        help="squash/scale window; long enough to kill the pulse")
+    parser.add_argument("--world-lock", action="store_true",
+                        help="causal anchor for the squash/scale (live-safe)")
+    parser.add_argument("--lock-deadband", type=float, default=0.01,
+                        help="ignored error, as a fraction of the screen radius")
+    parser.add_argument("--lock-tau", type=float, default=0.35)
+    parser.add_argument("--lock-tau-fast", type=float, default=0.10)
+    parser.add_argument("--lock-fast-ratio", type=float, default=3.0)
     parser.add_argument("--roll-gain", type=float, default=0.0)
     parser.add_argument("--roll-sign", type=float, default=1.0)
     parser.add_argument("--max-zoom", type=float, default=3.5)
@@ -573,8 +976,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    global RING_WEIGHT
+    RING_WEIGHT = float(args.ring_weight)
     margin = max(float(args.margin), 1.0)
-    meta = measure_clip(args.input, args.measure_scale, args.max_frames, margin)
+    meta = measure_clip(args.input, args.measure_scale, args.max_frames, margin,
+                        RING_WEIGHT)
     rows = meta["rows"]
     series = state_series(rows)
     out_w = max(2, int(round(meta["raw_w"] * args.output_scale)))
@@ -585,13 +991,22 @@ def main() -> None:
     crop_x = (canvas_w - out_w) // 2
     crop_y = (canvas_h - out_h) // 2
     base_k = float(args.lock_fill) * out_w * 0.5
+    base_k_small = float(args.lock_fill) * meta["small_w"] * 0.5 / margin
 
     rectified, rect_info = None, None
+    joint = joint_position(rows) if args.fit == "joint" else None
+    if joint is not None and not np.isfinite(joint["rho"]).any():
+        joint = None
+    lock = (dict(tau=float(args.lock_tau), tau_fast=float(args.lock_tau_fast),
+                 fast_ratio=float(args.lock_fast_ratio))
+            if args.world_lock else None)
     if args.rectify > 0.0:
         rectified, rect_info = rectify_matrices(
             series, meta["small_w"], meta["small_h"], margin,
             args.lock_fill, args.smooth_sigma, args.rectify,
-            args.roll_gain, args.roll_sign)
+            args.roll_gain, args.roll_sign, joint=joint, lock=lock,
+            fps=meta["fps"], deadband_frac=float(args.lock_deadband),
+            shape_sigma=float(args.shape_sigma))
     matrices = info = None
     if rectified is None:
         matrices, info = lock_matrices(
@@ -613,14 +1028,42 @@ def main() -> None:
         middle = np.array([out_w, out_h], dtype=np.float64) * 0.5
         with args.trace.open("w", encoding="utf-8") as handle:
             for i in range(len(rows)):
-                raw_cx, raw_cy = series["cx"][i], series["cy"][i]
+                row = rows[i]
+                if joint is not None and np.isfinite(joint["cx"][i]):
+                    raw_cx, raw_cy = joint["cx"][i], joint["cy"][i]
+                else:
+                    raw_cx, raw_cy = series["cx"][i], series["cy"][i]
                 resid = None
                 if np.isfinite(raw_cx) and np.isfinite(raw_cy):
                     resid = project(i, raw_cx, raw_cy) - middle
                 ring = None
-                if np.isfinite(series["outer_cx"][i]):
-                    ring = project(i, series["outer_cx"][i],
-                                   series["outer_cy"][i]) - middle
+                outer_points = row["outer"]["points"] if row["outer"] else []
+                inner_points = row["inner"]["points"] if row["inner"] else []
+                gaps = dict(gap_lr=None, gap_tb=None, ring_cv=None, screen_cv=None)
+                if outer_points and inner_points:
+                    outer = np.array([project(i, p[0], p[1]) for p in outer_points])
+                    inner = np.array([project(i, p[0], p[1]) for p in inner_points])
+                    outer_radius = np.linalg.norm(outer - middle, axis=1)
+                    inner_radius = np.linalg.norm(inner - middle, axis=1)
+                    angles = np.degrees(np.arctan2(outer[:, 1] - middle[1],
+                                                   outer[:, 0] - middle[0]))
+                    gap = outer_radius - inner_radius.mean()
+                    top = (angles <= -45) & (angles > -135)
+                    bottom = angles >= 45
+                    left = angles > 135
+                    right = angles <= 45
+                    right = right & ~bottom
+                    side = dict(left=left, right=right, top=top, bottom=bottom)
+                    if all(mask.any() for mask in side.values()):
+                        edges = {name: float(gap[mask].mean())
+                                 for name, mask in side.items()}
+                        gaps["gap_lr"] = abs(edges["left"] - edges["right"])
+                        gaps["gap_tb"] = abs(edges["top"] - edges["bottom"])
+                    gaps["ring_cv"] = float(outer_radius.std() / max(outer_radius.mean(), 1e-6))
+                    gaps["screen_cv"] = float(inner_radius.std() / max(inner_radius.mean(), 1e-6))
+                if outer_points:
+                    ring = np.array([project(i, p[0], p[1]) for p in outer_points])
+                    ring = ring.mean(axis=0) - middle
                 handle.write(json.dumps({
                     "frame": i,
                     "cx": float(raw_cx) if np.isfinite(raw_cx) else None,
@@ -628,7 +1071,7 @@ def main() -> None:
                     "size": float(series["size"][i]) if np.isfinite(series["size"][i]) else None,
                     "minor": float(series["minor"][i]) if np.isfinite(series["minor"][i]) else None,
                     "angle": float(series["angle"][i]) if np.isfinite(series["angle"][i]) else None,
-                    "zoom": (float(rect_info["scale"][i] / base_k) if rect_info
+                    "zoom": (float(rect_info["scale"][i] / base_k_small) if rect_info
                              else float(info["zoom"][i])),
                     "roll_meas": float(series["roll"][i]) if np.isfinite(series["roll"][i]) else None,
                     "resid_x": None if resid is None else float(resid[0]),
@@ -636,6 +1079,8 @@ def main() -> None:
                     "ring_dx": None if ring is None else float(ring[0]),
                     "ring_dy": None if ring is None else float(ring[1]),
                     "outer_ratio": series["ratio"],
+                    "buttons": int(row["outer"]["count"]) if row["outer"] else 0,
+                    **gaps,
                 }) + "\n")
 
     capture = cv2.VideoCapture(str(args.input))
@@ -681,6 +1126,13 @@ def main() -> None:
     capture.release()
     writer.release()
     print(f"wrote {args.output} ({index} frames, {out_w}x{out_h})")
+    report = lock_report(rows, project, np.array([out_w, out_h], dtype=np.float64) * 0.5)
+    print(f"  cabinet off centre : {report['machine']:6.2f}px  (of {out_w}px wide)")
+    print(f"  button ring cv     : {report['ring_cv'] * 100:6.2f}%  "
+          f"(0% = perfect circle, tune --ring-weight)")
+    print(f"  screen edge cv     : {report['screen_cv'] * 100:6.2f}%")
+    print(f"  four-side gap |L-R|: {report['gap_lr']:6.2f}px  "
+          f"|T-B|: {report['gap_tb']:6.2f}px")
     if args.contact is not None:
         contact_sheet(args.output, args.contact)
         print(f"wrote {args.contact}")
