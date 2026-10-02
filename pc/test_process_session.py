@@ -369,6 +369,35 @@ class VideoBackedSessionTests(unittest.TestCase):
             self.assertEqual(len(debug), 4)
 
 
+class PlaneSanityTests(unittest.TestCase):
+    def test_wild_plane_quads_are_rejected_before_they_reach_the_preview(self):
+        tracker = PlaneLockTracker(detect_every=3)
+        tracker.reference_box = (100, 100, 300, 300)
+        tracker.current_quad = np.float32([[100, 100], [300, 100], [300, 300], [100, 300]])
+
+        # A small, coherent move stays.
+        self.assertTrue(tracker._candidate_ok(
+            np.float32([[104, 102], [303, 99], [302, 304], [101, 302]])
+        ))
+        # A hand across the machine produces a leaning plank: opposite edges
+        # stop matching, so the plane must not be accepted.
+        self.assertFalse(tracker._candidate_ok(
+            np.float32([[100, 100], [300, 100], [240, 300], [160, 300]])
+        ))
+        # Bow-tie quads (self-intersecting) are garbage as well.
+        self.assertFalse(tracker._candidate_ok(
+            np.float32([[100, 100], [300, 300], [300, 100], [100, 300]])
+        ))
+        # A sudden jump larger than half the reference diagonal is rejected.
+        self.assertFalse(tracker._candidate_ok(
+            np.float32([[500, 500], [700, 500], [700, 700], [500, 700]])
+        ))
+        # Absurd scale changes are rejected too.
+        self.assertFalse(tracker._candidate_ok(
+            np.float32([[0, 0], [900, 0], [900, 900], [0, 900]])
+        ))
+
+
 class PoseLogTests(unittest.TestCase):
     def test_pose_log_covers_rows_that_carry_no_pose(self):
         with tempfile.TemporaryDirectory() as workspace:

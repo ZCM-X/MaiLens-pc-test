@@ -88,6 +88,12 @@ class LiveProcessor:
         self.previous_gray: np.ndarray | None = None
         self.detection_age = 0
         self.lock_source = "none"
+        # While a hand covers the machine the flow estimate is meaningless, so
+        # the last good warp is reused for a few frames instead of snapping to
+        # the detector box (which lurched the whole preview).
+        self.plane_hold: np.ndarray | None = None
+        self.plane_hold_frames = 0
+        self.plane_hold_limit = 12
 
     def process(self, frame: np.ndarray, metadata: dict) -> tuple[np.ndarray, dict]:
         height, width = frame.shape[:2]
@@ -195,11 +201,28 @@ class LiveProcessor:
             self.lock_source = "searching"
 
         plane_matrix = self.plane_tracker.output_homography if plane_locked else None
-        if plane_matrix is not None:
-            fixed_inner = transform_box_homography(
+        fixed_inner = (
+            transform_box_homography(
                 self.plane_tracker.reference_box,
                 self.plane_tracker.reference_to_output,
             )
+            if self.plane_tracker.locked else None
+        )
+        if plane_matrix is not None and fixed_inner is not None:
+            self.plane_hold = plane_matrix
+            self.plane_hold_frames = 0
+            self.lock_source = "plane_homography"
+        elif (self.plane_hold is not None and fixed_inner is not None
+              and self.plane_hold_frames < self.plane_hold_limit):
+            plane_matrix = self.plane_hold
+            self.plane_hold_frames += 1
+            self.lock_source = "plane_hold"
+        else:
+            plane_matrix = None
+            self.plane_hold = None
+            self.plane_hold_frames = 0
+
+        if plane_matrix is not None and fixed_inner is not None:
             stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
             outer = expand_box(fixed_inner, 1.45)
             # The current detector rectangle is allowed to jitter.  The
@@ -210,7 +233,6 @@ class LiveProcessor:
             # and tilt compensation.  Do not apply a second affine crop.
             center = np.array([0.5, 0.5], dtype=np.float32)
             zoom = 1.0
-            self.lock_source = "plane_homography"
         else:
             stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
             outer = transform_box(outer, geometry_matrix)

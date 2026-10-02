@@ -1096,6 +1096,8 @@ class PlaneLockTracker:
         self.last_success = False
         self.frame_shape: tuple[int, int] | None = None
         self.frames_since_refresh = 0
+        # Last accepted machine quad, used to reject wild homographies.
+        self.current_quad: np.ndarray | None = None
 
     @property
     def locked(self) -> bool:
@@ -1215,6 +1217,7 @@ class PlaneLockTracker:
         self.current_outer_box = tuple(int(value) for value in outer_box) if outer_box is not None else self.current_box
         self.reference_to_output = reference_to_output.astype(np.float32)
         self.current_to_reference = np.eye(3, dtype=np.float32)
+        self.current_quad = np.asarray(points, dtype=np.float32).reshape(4, 2)
         self.points = tracked
         self.age_frames = 0
         self.inliers = 0
@@ -1238,6 +1241,48 @@ class PlaneLockTracker:
         ratio = inlier_count / max(len(residual), 1)
         median_error = float(np.median(residual[inlier_mask])) if inlier_count else float("inf")
         return inlier_count >= 8 and ratio >= 0.52 and median_error <= 3.0, inlier_count, ratio, median_error
+
+    def _candidate_ok(self, projected: np.ndarray | None) -> bool:
+        """Reject transforms that would tilt or mangle the machine plane.
+
+        A hand or arm crossing the screen breaks optical flow, and RANSAC can
+        still return a confident-looking homography that squashes the whole
+        machine into a leaning plank.  Checking the quad shape and its motion
+        against the previous frame keeps that out of the preview.
+        """
+        if projected is None or len(projected) != 4 or not np.isfinite(projected).all():
+            return False
+        quad = np.asarray(projected, dtype=np.float32).reshape(4, 2)
+        reference = _box_points(self.reference_box)
+        if reference is None:
+            return False
+        reference = np.asarray(reference, dtype=np.float32).reshape(4, 2)
+        area = abs(float(cv2.contourArea(quad)))
+        reference_area = max(box_area(self.reference_box), 1.0)
+        if area <= 0 or not 0.30 <= area / reference_area <= 3.0:
+            return False
+        cross: list[float] = []
+        for index in range(4):
+            first = quad[(index + 1) % 4] - quad[index]
+            second = quad[(index + 2) % 4] - quad[(index + 1) % 4]
+            cross.append(float(first[0] * second[1] - first[1] * second[0]))
+        if not (all(value > 0 for value in cross) or all(value < 0 for value in cross)):
+            return False
+        edges = [float(np.linalg.norm(quad[index] - quad[(index + 1) % 4])) for index in range(4)]
+        if min(edges) <= 4.0:
+            return False
+        # Opposite edges must stay comparable, otherwise the plane reads as a
+        # board tilted away from the camera.
+        if not 0.45 <= edges[0] / max(edges[2], 1e-6) <= 2.2:
+            return False
+        if not 0.45 <= edges[1] / max(edges[3], 1e-6) <= 2.2:
+            return False
+        if self.current_quad is not None:
+            diagonal = float(np.linalg.norm(np.ptp(reference, axis=0)))
+            jump = float(np.max(np.linalg.norm(quad - self.current_quad, axis=1)))
+            if diagonal > 0 and jump > 0.45 * diagonal:
+                return False
+        return True
 
     def update(
         self,
@@ -1306,17 +1351,15 @@ class PlaneLockTracker:
                             candidate = self.current_to_reference @ inverse
                             ref_corners = _box_points(self.reference_box)
                             projected = _project_points(ref_corners, candidate) if ref_corners is not None else None
-                            if projected is not None:
-                                area = abs(float(cv2.contourArea(projected.astype(np.float32))))
-                                ref_area = max(box_area(self.reference_box), 1.0)
-                                if 0.08 <= area / ref_area <= 12.0:
-                                    self.current_to_reference = candidate
-                                    self.points = current_points.reshape(-1, 1, 2).astype(np.float32)
-                                    self.inliers = count
-                                    self.inlier_ratio = ratio
-                                    self.reprojection_error = error
-                                    self.frames_since_refresh += 1
-                                    success = True
+                            if self._candidate_ok(projected):
+                                self.current_to_reference = candidate
+                                self.current_quad = np.asarray(projected, dtype=np.float32).reshape(4, 2)
+                                self.points = current_points.reshape(-1, 1, 2).astype(np.float32)
+                                self.inliers = count
+                                self.inlier_ratio = ratio
+                                self.reprojection_error = error
+                                self.frames_since_refresh += 1
+                                success = True
         if not success:
             self.age_frames += 1
             self.last_success = False
@@ -1555,6 +1598,9 @@ def process(args: argparse.Namespace) -> Path:
     plane_smooth = float(getattr(args, "plane_smooth", 0.35))
     plane_full = bool(getattr(args, "plane_full", False))
     plane_smooth_corners: np.ndarray | None = None
+    plane_hold_limit = max(0, int(getattr(args, "plane_hold", 12)))
+    plane_hold_matrix: np.ndarray | None = None
+    plane_hold_frames = 0
     try:
         with debug_path.open("w", encoding="utf-8") as debug_file:
             for index, frame, row in source:
@@ -1640,11 +1686,15 @@ def process(args: argparse.Namespace) -> Path:
                     previous_center, previous_zoom = center, zoom
                     previous_lock_source = lock_source
                 plane_matrix = plane_tracker.output_homography if plane_locked else None
-                if plane_matrix is not None:
-                    fixed_inner = transform_box_homography(
+                fixed_inner = (
+                    transform_box_homography(
                         plane_tracker.reference_box,
                         plane_tracker.reference_to_output,
                     )
+                    if plane_tracker.locked else None
+                )
+                matrix = None
+                if plane_matrix is not None and fixed_inner is not None:
                     reference_corners = _box_points(plane_tracker.reference_box)
                     raw_corners = _project_points(reference_corners, plane_matrix)
                     if plane_smooth_corners is None or raw_corners is None:
@@ -1665,6 +1715,23 @@ def process(args: argparse.Namespace) -> Path:
                         )
                     else:
                         matrix = plane_matrix
+                    plane_hold_matrix = matrix
+                    plane_hold_frames = 0
+                    lock_source = "plane_homography"
+                elif (plane_hold_matrix is not None and fixed_inner is not None
+                      and plane_hold_frames < plane_hold_limit):
+                    # A hand crossing the machine breaks optical flow for a few
+                    # frames.  Freeze the last good warp instead of snapping to
+                    # the detector box, which used to lurch the whole picture.
+                    matrix = plane_hold_matrix
+                    plane_hold_frames += 1
+                    lock_source = "plane_hold"
+                else:
+                    plane_smooth_corners = None
+                    plane_hold_matrix = None
+                    plane_hold_frames = 0
+
+                if matrix is not None and fixed_inner is not None:
                     if plane_full:
                         # Warp the complete frame with the same machine-plane
                         # transform.  No feathered seam, and the background moves
@@ -1682,10 +1749,8 @@ def process(args: argparse.Namespace) -> Path:
                     inner = fixed_inner
                     center = np.array([0.5, 0.5], dtype=np.float32)
                     zoom = 1.0
-                    lock_source = "plane_homography"
                     previous_lock_source = lock_source
                 else:
-                    plane_smooth_corners = None
                     stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                     outer = transform_box(outer, geometry_matrix)
                     inner = transform_box(inner, geometry_matrix)
@@ -1756,6 +1821,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="机台运动模型：homography 允许透视，similarity 只做旋转/等比缩放/平移，后者更不容易显扁")
     parser.add_argument("--plane-full", action="store_true",
                         help="整帧都按机台平面 warp，而不是只在中间合成机台区域")
+    parser.add_argument("--plane-hold", type=int, default=12,
+                        help="机台被手或手臂挡住时，保持上一帧变换的帧数，默认 12")
     return parser
 
 
@@ -1770,6 +1837,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--lock-fill 应在 0.35 到 0.90 之间")
     if not 0.0 <= args.plane_smooth <= 1.0:
         parser.error("--plane-smooth 应在 0 到 1 之间")
+    if args.plane_hold < 0:
+        parser.error("--plane-hold 不能为负数")
     return args
 
 
