@@ -142,13 +142,31 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
   --export onnx
 ```
 
-当前 `models/frame-geometry-yolo11n-v3.onnx` 就是用 `maimoller-geometry` 数据集训练并导出的版本。验证集只有 5 张图，指标只能说明标注闭环和推理类别正常，后续还要用不同距离、角度和遮挡的手机视频验收。
+`maimoller-geometry` 是 51 张手标图的小数据集，`frame-geometry-yolo11n-v2.onnx` 就是它训出来的。手标图太少，`inner_screen` 在手机真实素材上经常只有 0.2-0.4 置信度，机台锁最吃的就是这个类别，所以又扩了一版：
 
-如果要把已有的 `frame-geometry-yolo11n-v2.onnx` 用在离线处理上：
+```powershell
+# 手标 51 张 + D:\桌面文件\训练2 的 97 张照片 + 22 段会话里抽 211 帧鱼眼图
+.\.venv\Scripts\python.exe tools\build_geometry_dataset.py `
+  --source-dataset datasets\maimoller-geometry --source-sessions sessions `
+  --photo-dir "D:\桌面文件\训练2" `
+  --model models\frame-geometry-yolo11n-v2.onnx `
+  --output datasets\maimoller-geometry-v3 --samples-per-session 12 --max-side 1600
+
+.\.venv\Scripts\python.exe tools\train_detector.py `
+  --dataset datasets\maimoller-geometry-v3\dataset.yaml `
+  --weights ..\..\yolo11n.pt --device 0 --epochs 100 --imgsz 640 --batch 16 `
+  --project runs --name geometry-v3 --export onnx
+```
+
+新模型是 `models/frame-geometry-yolo11n-v4.onnx`（354 张训练图，验证集 5 张手标：mAP50 0.97，outer 0.995 / inner 0.945）。同一批真实素材上，`inner_screen` 置信度：矫正片段 0.24→0.76（35/40→40/40），手机原始鱼眼帧 0.78→0.87（47/48→48/48），训练照片 0.65→0.95。手标验证集只有 5 张，所以这个数字只说明标注闭环没崩，真正的验收还是看实拍锁定效果。
+
+如果要把模型用在离线处理上：
+
+如果要把模型用在离线处理上（下面都用新模型 v4）：
 
 ```powershell
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
-  --model models\frame-geometry-yolo11n-v2.onnx --output processed-machine.mp4 --debug
+  --model models\frame-geometry-yolo11n-v4.onnx --output processed-machine.mp4 --debug
 ```
 
 检测器锁定只使用几何模型的 `outer_buttons` 和 `inner_screen`；按键模型的结果不会把机台锁到某个谱面元素。当前电脑算法保留了调试输出：`debug.jsonl` 中有姿态延迟、中心、缩放和检测框，便于先在电脑上调曲线。
@@ -175,11 +193,11 @@ App 里的“本地录制”和推流互相独立：不连电脑、不开 Wi‑F
 # 所有命令都在项目根目录运行
 
 # 电脑端接收 + 直接处理（另开一个终端，手机点“发到电脑”之前先跑起来）
-.\.venv\Scripts\python.exe pc\session_server.py --process --model models\frame-geometry-yolo11n-v2.onnx
+.\.venv\Scripts\python.exe pc\session_server.py --process --model models\frame-geometry-yolo11n-v4.onnx
 
 # 也可以事后处理收到的会话：直接读 video.mp4 + pose.jsonl，不抽帧
 .\.venv\Scripts\python.exe pc\process_session.py phone_sessions\20261002-153000 `
-  --model models\frame-geometry-yolo11n-v2.onnx --output processed-phone.mp4 --debug
+  --model models\frame-geometry-yolo11n-v4.onnx --output processed-phone.mp4 --debug
 
 # 只有要标注 JPEG 帧时才抽帧
 .\.venv\Scripts\python.exe pc\import_phone_session.py "D:\phone\20261002-153000"

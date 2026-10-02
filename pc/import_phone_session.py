@@ -177,7 +177,7 @@ def import_session(
         log(f"warning: {len(rows)} logged frames vs {index} decoded frames; kept the video length")
     log(f"imported {index} frames into {directory}")
     log(f"  {width}x{height}, nominal {nominal_fps:g} fps, {len(pose_rows)} pose samples")
-    log(f"next: python pc/process_session.py \"{directory}\" --model models/frame-geometry-yolo11n-v2.onnx --output \"{directory}/processed.mp4\"")
+    log(f"next: python pc/process_session.py \"{directory}\" --model models/frame-geometry-yolo11n-v4.onnx --output \"{directory}/processed.mp4\"")
     return directory
 
 
