@@ -219,6 +219,17 @@ def fill_nan(values: np.ndarray) -> np.ndarray:
     return np.interp(index, index[good], values[good])
 
 
+def rolling_max(values: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return values.copy()
+    out = np.empty_like(values)
+    for i in range(len(values)):
+        lo = max(0, i - radius)
+        hi = min(len(values), i + radius + 1)
+        out[i] = np.max(values[lo:hi])
+    return out
+
+
 def smooth(values: np.ndarray, sigma: float) -> np.ndarray:
     """Zero-phase smoothing: a symmetric FIR kernel has no group delay."""
     values = fill_nan(values)
@@ -284,7 +295,15 @@ def state_series(rows: list[dict]) -> dict:
 
 def lock_matrices(series: dict, small_w: int, small_h: int, lock_fill: float,
                   sigma: float, roll_gain: float, roll_sign: float,
-                  max_zoom: float) -> tuple[np.ndarray, dict]:
+                  max_zoom: float, margin: float = 1.0) -> tuple[np.ndarray, dict]:
+    """Place the machine in the middle of the working canvas.
+
+    ``margin`` is the extra fisheye field unwarped around the frame.  The
+    working canvas is ``margin`` times the delivered frame, and the final
+    result is its centre crop.  The headroom is what lets a cabinet sitting
+    near the raw frame edge be moved to the middle without the warp having to
+    invent pixels; ``need`` below is the fallback when even that is not enough.
+    """
     count = len(series["size"])
     if not np.isfinite(series["size"]).any():
         return np.zeros((count, 2, 3), dtype=np.float32), dict(zoom=np.zeros(count))
@@ -293,9 +312,24 @@ def lock_matrices(series: dict, small_w: int, small_h: int, lock_fill: float,
     size = smooth(series["size"], sigma)
     roll = smooth_periodic(series["roll"], sigma) if roll_gain else np.zeros(count)
 
-    zoom = float(lock_fill) * small_w / np.maximum(size, 1e-6)
+    frame_frac = 1.0 / max(float(margin), 1.0)
+    # The delivered frame is the centre crop, so the machine must fill
+    # lock_fill of that crop rather than of the whole canvas.
+    target = float(lock_fill) * small_w * frame_frac
+    zoom = target / np.maximum(size, 1e-6)
     zoom = np.clip(zoom, 1.0, max(max_zoom, 1.0))
     zoom = smooth(zoom, sigma)
+
+    half_w = small_w * frame_frac * 0.5
+    half_h = small_h * frame_frac * 0.5
+    room_x = np.minimum(cx, small_w - cx)
+    room_y = np.minimum(cy, small_h - cy)
+    need = np.maximum(half_w / np.maximum(room_x, 1e-3),
+                      half_h / np.maximum(room_y, 1e-3))
+    need = rolling_max(need, int(max(2.0 * sigma, 4.0)))
+    zoom = smooth(np.maximum(zoom, need * 1.03), 2.0)
+    zoom = np.maximum(zoom, need * 1.01)
+    zoom = np.clip(zoom, 1.0, max(max_zoom, 1.0))
 
     matrices = np.zeros((count, 2, 3), dtype=np.float32)
     out_cx, out_cy = small_w * 0.5, small_h * 0.5
@@ -312,7 +346,7 @@ def lock_matrices(series: dict, small_w: int, small_h: int, lock_fill: float,
         ty = out_cy - (linear[1, 0] * cx[i] + linear[1, 1] * cy[i])
         matrices[i] = np.array([[linear[0, 0], linear[0, 1], tx],
                                 [linear[1, 0], linear[1, 1], ty]], dtype=np.float32)
-    return matrices, dict(zoom=zoom, cx=cx, cy=cy, roll=roll)
+    return matrices, dict(zoom=zoom, cx=cx, cy=cy, roll=roll, need=need)
 
 
 def scale_matrix(matrix: np.ndarray, scale: float) -> np.ndarray:
@@ -324,7 +358,8 @@ def scale_matrix(matrix: np.ndarray, scale: float) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------- io
-def measure_clip(path: Path, measure_scale: float, max_frames: int | None):
+def measure_clip(path: Path, measure_scale: float, max_frames: int | None,
+                 margin: float = 1.0):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeError(f"cannot open {path}")
@@ -333,7 +368,10 @@ def measure_clip(path: Path, measure_scale: float, max_frames: int | None):
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
     small_w = max(2, int(round(raw_w * measure_scale)))
     small_h = max(2, int(round(raw_h * measure_scale)))
-    remap = build_remap(small_w, small_h, raw_w, raw_h)
+    # Measure on exactly the same (wider) field the render canvas uses, so a
+    # measured pixel means the same ray in both passes.
+    lens = dict(LENS, crop=LENS["crop"] / max(float(margin), 1.0))
+    remap = build_remap(small_w, small_h, raw_w, raw_h, lens)
     rows: list[dict] = []
     while True:
         ok, frame = capture.read()
@@ -347,8 +385,8 @@ def measure_clip(path: Path, measure_scale: float, max_frames: int | None):
                 small_h=small_h, rows=rows, count=len(rows))
 
 
-def _draw_overlay(frame: np.ndarray, row: dict, matrix: np.ndarray,
-                  scale: float = 1.0) -> None:
+def _draw_overlay(frame: np.ndarray, target: tuple[float, float],
+                  error_px: float) -> None:
     """Show where the measured machine actually lands after the lock.
 
     A red circle sitting on the green cross means the cabinet is glued to the
@@ -357,18 +395,10 @@ def _draw_overlay(frame: np.ndarray, row: dict, matrix: np.ndarray,
     height, width = frame.shape[:2]
     cv2.drawMarker(frame, (width // 2, height // 2), (0, 255, 0),
                    cv2.MARKER_CROSS, 48, 2)
-    inner, outer = row.get("inner"), row.get("outer")
-    source = inner["center"] if inner is not None else (
-        outer["center"] if outer is not None else None)
-    if source is None:
-        return
-    point = matrix @ np.array([source[0], source[1], 1.0])
-    target = tuple(np.round(point[:2] * scale).astype(int))
-    cv2.circle(frame, target, 22, (0, 0, 255), 3, cv2.LINE_AA)
-    cv2.drawMarker(frame, target, (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
-    offset = float(np.hypot(point[0] - width / (2 * scale),
-                            point[1] - height / (2 * scale)) * scale)
-    cv2.putText(frame, f"lock err {offset:5.1f}px", (12, 46),
+    point = (int(round(target[0])), int(round(target[1])))
+    cv2.circle(frame, point, 22, (0, 0, 255), 3, cv2.LINE_AA)
+    cv2.drawMarker(frame, point, (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
+    cv2.putText(frame, f"lock err {error_px:5.1f}px", (12, 46),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 3, cv2.LINE_AA)
 
 
@@ -407,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measure-scale", type=float, default=0.25)
     parser.add_argument("--output-scale", type=float, default=1.0)
     parser.add_argument("--lock-fill", type=float, default=0.72)
+    parser.add_argument("--margin", type=float, default=1.25)
     parser.add_argument("--smooth-sigma", type=float, default=3.0)
     parser.add_argument("--roll-gain", type=float, default=0.0)
     parser.add_argument("--roll-sign", type=float, default=1.0)
@@ -419,12 +450,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    meta = measure_clip(args.input, args.measure_scale, args.max_frames)
+    margin = max(float(args.margin), 1.0)
+    meta = measure_clip(args.input, args.measure_scale, args.max_frames, margin)
     rows = meta["rows"]
     series = state_series(rows)
     matrices, info = lock_matrices(
         series, meta["small_w"], meta["small_h"], args.lock_fill,
-        args.smooth_sigma, args.roll_gain, args.roll_sign, args.max_zoom,
+        args.smooth_sigma, args.roll_gain, args.roll_sign, args.max_zoom, margin,
     )
 
     if args.trace is not None:
@@ -459,14 +491,20 @@ def main() -> None:
 
     out_w = max(2, int(round(meta["raw_w"] * args.output_scale)))
     out_h = max(2, int(round(meta["raw_h"] * args.output_scale)))
-    scale = out_w / meta["small_w"]
+    canvas_w = max(out_w, int(round(out_w * margin)))
+    canvas_h = max(out_h, int(round(out_h * margin)))
+    scale = canvas_w / meta["small_w"]
     capture = cv2.VideoCapture(str(args.input))
-    remap = None if args.no_fisheye else build_remap(out_w, out_h, meta["raw_w"], meta["raw_h"])
+    lens = dict(LENS, crop=LENS["crop"] / margin)
+    remap = None if args.no_fisheye else build_remap(
+        canvas_w, canvas_h, meta["raw_w"], meta["raw_h"], lens)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(args.output), cv2.VideoWriter_fourcc(*"mp4v"),
                              meta["fps"], (out_w, out_h))
     if not writer.isOpened():
         raise RuntimeError(f"cannot write {args.output}")
+    crop_x = (canvas_w - out_w) // 2
+    crop_y = (canvas_h - out_h) // 2
 
     index = 0
     while index < len(rows):
@@ -474,14 +512,23 @@ def main() -> None:
         if not ok:
             break
         base = frame if remap is None else unwarp(frame, remap)
-        if base.shape[1] != out_w or base.shape[0] != out_h:
-            base = cv2.resize(base, (out_w, out_h))
+        if base.shape[1] != canvas_w or base.shape[0] != canvas_h:
+            base = cv2.resize(base, (canvas_w, canvas_h))
         matrix = scale_matrix(matrices[index], scale)
-        locked = cv2.warpAffine(base, matrix, (out_w, out_h), flags=cv2.INTER_LINEAR,
+        locked = cv2.warpAffine(base, matrix, (canvas_w, canvas_h),
+                                flags=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_REFLECT101)
+        locked = locked[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
         if args.draw:
-            _draw_overlay(locked, rows[index], matrices[index],
-                          args.output_scale / args.measure_scale)
+            row = rows[index]
+            source = (row["inner"]["center"] if row["inner"] is not None
+                      else (row["outer"]["center"] if row["outer"] is not None else None))
+            if source is not None:
+                point = matrices[index] @ np.array([source[0], source[1], 1.0])
+                target = (point[0] * scale - crop_x, point[1] * scale - crop_y)
+                error = float(np.hypot(point[0] - meta["small_w"] * 0.5,
+                                       point[1] - meta["small_h"] * 0.5) * scale)
+                _draw_overlay(locked, target, error)
         writer.write(locked)
         index += 1
     capture.release()
