@@ -515,12 +515,19 @@ def fill_nan(values: np.ndarray) -> np.ndarray:
     return np.interp(index, index[good], values[good])
 
 
-def rolling_max(values: np.ndarray, radius: int) -> np.ndarray:
+def rolling_max(values: np.ndarray, radius: int,
+                ahead: bool = False) -> np.ndarray:
+    """Running maximum, centred by default and looking ahead when asked.
+
+    The centred form spreads a peak both ways, so a single tight frame keeps
+    the zoom out long after the operator has backed off.  ``ahead`` only looks
+    forward, which starts the move early and ends it the moment the need does.
+    """
     if radius <= 0:
         return values.copy()
     out = np.empty_like(values)
     for i in range(len(values)):
-        lo = max(0, i - radius)
+        lo = max(0, i - radius) if not ahead else i
         hi = min(len(values), i + radius + 1)
         out[i] = np.max(values[lo:hi])
     return out
@@ -856,7 +863,8 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
                      deadband_frac: float = 0.0,
                      shape_sigma: float | None = None,
                      roll_sigma: float = 2.0, lean_gain: float = 0.0,
-                     lean_series=None, camera_roll=None):
+                     lean_series=None, camera_roll=None,
+                     slide_limit: float = 0.06):
     """Turn the inner play field back into a circle and pin it to the middle.
 
     The screen is a circle on the cabinet face, so its image is an ellipse
@@ -869,6 +877,14 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     ``rectify`` blends between the plain similarity lock (0) and the full
     un-squash (1).  The blend interpolates the *inverse* semi-axes so the
     linear part stays positive definite for every value in between.
+
+    ``slide_limit`` caps how far the machine may walk off the middle before the
+    renderer gives up and zooms instead.  When the phone swings the cabinet
+    near the edge of the fisheye the crop needs pixels that are not there, and
+    the old fallback answered by magnifying the whole picture -- the operator
+    sees the machine jump towards them.  Sliding the crop a few percent of the
+    frame costs a small, brief off-centre instead and keeps the size, so the
+    distance to the machine stops changing while the phone moves.
     """
     count = len(series["size"])
     dt = 1.0 / max(float(fps), 1e-6)
@@ -906,6 +922,10 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     linear = np.zeros((count, 2, 2))
     offset = np.zeros((count, 2))
     need = np.ones(count)
+    slide = np.zeros((count, 2))
+    # The machine may walk this far off the middle, as a fraction of the
+    # delivered width, before the renderer falls back to magnifying.
+    slide_cap = max(float(slide_limit), 0.0) * small_w / margin
     ok = np.zeros(count, dtype=bool)
     for i in range(count):
         if not (np.isfinite(cx[i]) and np.isfinite(cy[i]) and usable[i]):
@@ -937,7 +957,50 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
             upright = np.array([[cos_s, -sin_s], [sin_s, cos_s]]) @ upright
         linear[i] = upright @ m0
         offset[i] = upright @ t0
-        # How far the crop corners reach, expressed as the scale they need.
+
+        # Where the crop lands in the source when the machine is pinned at the
+        # target size.  Whatever hangs over the edge is what the renderer has
+        # to answer for, and it answers by sliding first and zooming last.
+        inverse = np.linalg.inv(linear[i])
+        source = [inverse @ np.array([dx, dy]) / base_k for dx, dy in corners]
+        lo = np.array([centre[0] + min(p[0] for p in source),
+                       centre[1] + min(p[1] for p in source)])
+        hi = np.array([centre[0] + max(p[0] for p in source),
+                       centre[1] + max(p[1] for p in source)])
+        target = np.array([float(small_w), float(small_h)])
+        want = np.zeros(2)
+        for axis in range(2):
+            span = hi[axis] - lo[axis]
+            if span <= target[axis] - 1e-6:
+                if lo[axis] < 0.0:
+                    want[axis] = -lo[axis]
+                elif hi[axis] > target[axis]:
+                    want[axis] = target[axis] - hi[axis]
+            else:
+                # Nothing can fit it; centre the overhang so the zoom that is
+                # left to do comes out as small as it can.
+                want[axis] = 0.5 * (target[axis] - span) - lo[axis]
+        step = base_k * (linear[i] @ want)
+        distance = float(np.hypot(step[0], step[1]))
+        if distance > slide_cap:
+            step = step * (slide_cap / distance) if distance > 1e-9 else step
+        slide[i] = step
+
+    # The slide has to travel with the hand, so it gets the same short window
+    # as the centre.  A frame or two of overhang at the very peak is harmless;
+    # a cabinet that snaps sideways is not.
+    if slide_cap > 0.0:
+        slide = np.column_stack([smooth(slide[:, k], sigma) for k in range(2)])
+
+    for i in range(count):
+        if not ok[i]:
+            continue
+        centre = np.array([cx[i], cy[i]])
+        # Sliding the sampling window by ``d`` moves the machine by the
+        # opposite amount in the delivered frame, so the room it leaves behind
+        # is what the zoom fallback is allowed to look at.
+        if slide_cap > 0.0 and np.isfinite(slide[i]).all():
+            centre = centre + (np.linalg.inv(linear[i]) @ slide[i]) / base_k
         inverse = np.linalg.inv(linear[i])
         for dx, dy in corners:
             reach = inverse @ np.array([dx, dy])
@@ -950,7 +1013,13 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
             elif reach[1] < 0 and centre[1] > 1e-6:
                 need[i] = max(need[i], -reach[1] / centre[1])
 
-    need = rolling_max(need, int(max(2.0 * sigma, 4.0))) * 1.03
+    # How far out the crop reaches is set by where the machine is *going* to
+    # be, not only by where it is: a running maximum over half a second starts
+    # the zoom-out before the source runs dry, so the cabinet eases smaller
+    # instead of snapping.  The maximum still covers every frame, so nothing
+    # ever samples outside the picture.
+    need = rolling_max(need, int(max(0.5 * float(fps), 2.0 * sigma, 4.0)),
+                       ahead=True) * 1.03
     scale = smooth(np.maximum(base_k, need), 2.0)
     scale = np.maximum(scale, np.minimum(need, max_k * base_k))
     scale = np.clip(scale, base_k * 0.25, max_k * base_k)
@@ -959,10 +1028,12 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     matrices = np.zeros((count, 3, 3))
     for i in range(count):
         matrices[i, :2, :2] = scale[i] * linear[i]
-        matrices[i, :2, 2] = scale[i] * offset[i] + centre_small
+        shift = slide[i] if (slide_cap > 0.0 and np.isfinite(slide[i]).all()) \
+            else np.zeros(2)
+        matrices[i, :2, 2] = scale[i] * offset[i] + centre_small - shift
         matrices[i, 2, 2] = 1.0
     return matrices, dict(scale=scale, need=need, usable=ok, cx=cx, cy=cy,
-                          radius=radius, maps=maps)
+                          radius=radius, maps=maps, slide=slide)
 
 
 # ------------------------------------------------------------------------- io
@@ -1295,6 +1366,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roll-region", default="screen",
                         choices=("screen", "ring", "room"),
                         help="which rigid part of the cabinet names the roll")
+    parser.add_argument("--slide-limit", type=float, default=0.06,
+                        help="how far the machine may sit off centre, as a "
+                             "fraction of the delivered width, before the "
+                             "renderer zooms instead; 0 disables the slide")
     return parser
 
 
@@ -1345,7 +1420,7 @@ def main() -> None:
             roll_sigma=float(args.roll_sigma),
             lean_gain=float(args.lean_gain),
             lean_series=read_lean_series(args.lean_series) if args.lean_series else None,
-            camera_roll=camera_roll)
+            camera_roll=camera_roll, slide_limit=float(args.slide_limit))
     matrices = info = None
     if rectified is None:
         matrices, info = lock_matrices(
