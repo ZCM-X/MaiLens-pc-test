@@ -146,6 +146,11 @@ BUTTON_BAND = (0.85, 1.95)
 # The two rings genuinely disagree this much, so it has to be a taste call.
 RING_WEIGHT = 0.5
 
+# How fast the lean tracker follows the play field's barely-elliptical outline.
+# The measurement is noisy, so this stays well under one: it is the fraction
+# of the half-turn error that gets absorbed per frame.
+LEAN_GAIN = 0.12
+
 
 def measure_button_ring(frame: np.ndarray, inner: dict | None = None) -> dict | None:
     height, width = frame.shape[:2]
@@ -298,6 +303,47 @@ def _chol_q(params: np.ndarray) -> np.ndarray:
                      [l1 * off, off * off + l2 * l2]])
 
 
+def upright_hint(q: np.ndarray, blend: float, isotropic: float,
+                 angle: float | None = None) -> np.ndarray:
+    """Rotation that puts the cabinet's own up axis at the top of the frame.
+
+    A circle stays a circle when it spins, so the play field and the button
+    ring say nothing about how far the cabinet is *rotated* inside the frame
+    -- that is the one degree of freedom they leave free, and it is exactly
+    the roll the operator sees as "the machine is leaning".  What names it is
+    the ellipse orientation: its major axis is the cabinet's own horizontal,
+    so it points along the roll.
+
+    Applying ``sqrt(Q)`` alone rectifies the squash but leaves that roll in
+    the picture, which is why a hand-held clip kept arriving tilted.  This
+    measures the up axis the current map would deliver and returns the spin
+    that cancels it.
+
+    ``angle`` is that long axis resolved against the neighbouring frames.  One
+    ellipse cannot tell a cabinet leaning past ninety degrees from one leaning
+    back towards it, so the caller keeps the estimate continuous and passes it
+    in; the fallback here picks the branch that leaves the cabinet the right
+    way up, which is all a single frame can support.
+    """
+    values, vectors = np.linalg.eigh(np.asarray(q, dtype=np.float64))
+    values = np.maximum(values, 1e-12)
+    if angle is None:
+        major = vectors[:, 0]                   # smallest eigenvalue: the long axis
+        # The eigenvector has no sign and the machine does not care: a circle's
+        # long axis is a line, not an arrow.  Keep it in the right half plane.
+        if major[0] < 0.0 or (major[0] == 0.0 and major[1] < 0.0):
+            major = -major
+        angle = math.atan2(major[1], major[0])
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    spin = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    inverse = (vectors * (1.0 / np.sqrt(values))) @ vectors.T
+    forward = blend * np.eye(2) + (1.0 - blend) * isotropic * inverse
+    up = forward @ spin @ np.array([0.0, -1.0])
+    correction = -(math.atan2(up[1], up[0]) + math.pi / 2.0)
+    cos_c, sin_c = math.cos(correction), math.sin(correction)
+    return np.array([[cos_c, -sin_c], [sin_c, cos_c]])
+
+
 def _q_chol_params(q: np.ndarray) -> np.ndarray:
     l1 = math.sqrt(max(float(q[0, 0]), 1e-12))
     off = float(q[0, 1]) / l1
@@ -346,6 +392,35 @@ def matrix_sqrt(q: np.ndarray) -> np.ndarray:
     values, vectors = np.linalg.eigh(np.asarray(q, dtype=np.float64))
     values = np.maximum(values, 1e-12)
     return (vectors * np.sqrt(values)) @ vectors.T
+
+
+def track_lean(raw_q: np.ndarray, usable: np.ndarray, gain: float,
+               sigma: float) -> np.ndarray:
+    """Follow the play field's lean without being fooled by its roundness.
+
+    A nearly round outline has a noisy orientation, and the noise arrives as
+    half-turn flips that any plain average turns into nonsense.  This tracker
+    only ever steps by the *shortest* half turn, so the flips cost nothing, and
+    it keeps the value continuous past ninety degrees -- which matters, because
+    the picture-only estimate is exactly the case where the branch is unclear.
+    """
+    count = len(raw_q)
+    lean = np.full(count, np.nan)
+    phi = None
+    for i in range(count):
+        if not usable[i]:
+            continue
+        values, vectors = np.linalg.eigh(raw_q[i])
+        major = vectors[:, 0]
+        measured = math.atan2(major[1], major[0])
+        if phi is None:
+            phi = measured
+        else:
+            error = measured - phi
+            error -= (math.pi / 2.0) * round(error / (math.pi / 2.0))
+            phi += float(gain) * error
+        lean[i] = phi
+    return smooth(fill_nan(lean), max(float(sigma), 1.0))
 
 
 def fit_two_ring(inner_points, outer_points, inner_weight: float | None = None,
@@ -654,7 +729,8 @@ def joint_position(rows: list[dict]) -> dict:
 
 def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
                lock: dict | None, dt: float, deadband_frac: float,
-               shape_sigma: float | None = None):
+               shape_sigma: float | None = None, roll_sigma: float = 2.0,
+               lean_gain: float = 0.0, lean_series=None):
     """Per-frame centre plus the linear map from measurement to screen metric.
 
     With ``joint`` the shape comes from the two-ring fit, so the button ring
@@ -667,6 +743,15 @@ def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
     barely changes while the operator moves, so it is worth a much longer
     window: that is what stops the cabinet from pulsing and rolling with the
     detector noise.
+
+    ``lean_gain`` turns on the cabinet-lean (roll) correction.  It is off by
+    default because the play field cannot actually name its own lean: it is
+    nearly round, and worse, its long axis is the cabinet's *horizontal* only
+    while the camera tilts up and down -- tilt the phone sideways and the long
+    axis is the cabinet's vertical instead, which is a quarter turn of error.
+    With ``lean_series`` the lean is taken from a real sensor (the phone's
+    attitude) instead of from the picture, which is the only source that can
+    settle it.
     """
     count = len(series["size"])
     cx = np.full(count, np.nan)
@@ -677,13 +762,10 @@ def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
     shape_sigma = float(shape_sigma) if shape_sigma else max(sigma, 12.0)
 
     if joint is not None and np.isfinite(joint["rho"]).any():
-        chol = np.column_stack([
-            stabilise(joint["chol"][:, k], shape_sigma, lock, dt)
-            for k in range(3)
-        ])
         raw = np.array([_chol_q(joint["chol"][i])
                         if np.isfinite(joint["chol"][i]).all() else np.eye(2)
                         for i in range(count)])
+        usable = np.isfinite(joint["chol"]).all(axis=1)
         # Geometric mean screen radius in measured pixels, used to size the
         # deadband in units the operator would recognise.
         spread = np.array([math.sqrt(abs(np.linalg.det(m))) for m in raw])
@@ -691,14 +773,57 @@ def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
         band = np.where(np.isfinite(radius), deadband_frac * radius, 0.0)
         cx = stabilise(joint["cx"], sigma, None, dt, band)
         cy = stabilise(joint["cy"], sigma, None, dt, band)
+
+        if lean_gain <= 0.0 and lean_series is None:
+            # The pictures-only path: keep the shape in its matrix form, which
+            # is what the operator has been watching, and leave the lean alone.
+            chol = np.column_stack([
+                stabilise(joint["chol"][:, k], shape_sigma, lock, dt)
+                for k in range(3)
+            ])
+            for i in range(count):
+                if not usable[i]:
+                    continue
+                m = matrix_sqrt(_chol_q(chol[i]))
+                isotropic = math.sqrt(abs(np.linalg.det(m)))
+                maps[i] = blend * m + (1.0 - blend) * isotropic * np.eye(2)
+            return maps, cx, cy, radius, usable, None
+
+        # With a lean to apply, the shape is filtered as three numbers -- log
+        # size, log squash and the orientation -- because averaging the entries
+        # of a *rotating* ellipse produces a different ellipse.  The
+        # orientation is then taken from the lean source, not from the matrix.
+        logsize = np.full(count, np.nan)
+        logaspect = np.full(count, np.nan)
         for i in range(count):
-            if not np.isfinite(chol[i]).all():
+            if not usable[i]:
                 continue
-            m = matrix_sqrt(_chol_q(chol[i]))
+            values, vectors = np.linalg.eigh(raw[i])
+            values = np.maximum(values, 1e-12)
+            logsize[i] = 0.5 * math.log(values[0] * values[1])
+            logaspect[i] = 0.5 * math.log(values[1] / values[0])
+        logsize = stabilise(logsize, shape_sigma, lock, dt)
+        logaspect = stabilise(logaspect, shape_sigma, lock, dt)
+        if lean_series is not None:
+            lean = np.asarray(lean_series, dtype=np.float64)[:count]
+            lean = smooth(fill_nan(lean), max(float(roll_sigma), 1.0))
+        else:
+            lean = track_lean(raw, usable, lean_gain, float(roll_sigma))
+        hints = np.tile(np.eye(2), (count, 1, 1))
+        for i in range(count):
+            if not usable[i]:
+                continue
+            angle = lean[i]
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+            spin = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            shape = np.diag([math.exp(logsize[i] - logaspect[i]),
+                             math.exp(logsize[i] + logaspect[i])])
+            q = spin @ shape @ spin.T
+            m = matrix_sqrt(q)
             isotropic = math.sqrt(abs(np.linalg.det(m)))
             maps[i] = blend * m + (1.0 - blend) * isotropic * np.eye(2)
-        usable = np.isfinite(chol).all(axis=1)
-        return maps, cx, cy, radius, usable
+            hints[i] = upright_hint(q, blend, isotropic, angle)
+        return maps, cx, cy, radius, usable, hints
 
     a = stabilise(series["size"] * 0.5, shape_sigma, lock, dt,
                   deadband_frac * series["size"] * 0.5)
@@ -720,7 +845,7 @@ def shape_maps(series: dict, joint: dict | None, sigma: float, rectify: float,
         # cv2.fitEllipse: `angle` is the rotation of the width axis.
         rotate = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
         maps[i] = np.diag([inv_a[i], inv_b[i]]) @ rotate
-    return maps, cx, cy, radius, usable
+    return maps, cx, cy, radius, usable, None
 
 
 def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
@@ -729,7 +854,9 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
                      max_k: float = 8.0, joint: dict | None = None,
                      lock: dict | None = None, fps: float = 60.0,
                      deadband_frac: float = 0.0,
-                     shape_sigma: float | None = None):
+                     shape_sigma: float | None = None,
+                     roll_sigma: float = 2.0, lean_gain: float = 0.0,
+                     lean_series=None, camera_roll=None):
     """Turn the inner play field back into a circle and pin it to the middle.
 
     The screen is a circle on the cabinet face, so its image is an ellipse
@@ -745,11 +872,27 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
     """
     count = len(series["size"])
     dt = 1.0 / max(float(fps), 1e-6)
-    maps, cx, cy, radius, usable = shape_maps(
-        series, joint, sigma, rectify, lock, dt, deadband_frac, shape_sigma)
+    maps, cx, cy, radius, usable, hints = shape_maps(
+        series, joint, sigma, rectify, lock, dt, deadband_frac, shape_sigma,
+        roll_sigma, lean_gain, lean_series)
     if not np.isfinite(cx).any():
         return None, None
     roll = smooth_periodic(series["roll"], sigma) if roll_gain else np.zeros(count)
+
+    # The camera's own roll.  This is the degree of freedom the two rings
+    # cannot see: a circle stays a circle when it spins, so the fit is happy to
+    # call the machine upright while the whole picture leans twenty degrees.
+    # It does not turn the delivered picture -- that would drag the squash with
+    # it -- it turns *where the cabinet's down sits inside the picture*, which
+    # is what the upright step below is actually trying to line up.
+    camera_roll_rad = None
+    if camera_roll is not None:
+        cam = np.asarray(camera_roll, dtype=np.float64).ravel()[:count]
+        if cam.size < count:
+            tail = cam[-1] if cam.size else 0.0
+            cam = np.concatenate([cam, np.full(count - cam.size, tail)])
+        cam = smooth(fill_nan(cam), max(float(roll_sigma), 1.0))
+        camera_roll_rad = np.radians(float(roll_sign) * cam)
 
     # Everything here lives in the measured frame's units.  The delivered
     # frame is the centre 1/margin of the canvas, so a lock_fill wide screen
@@ -772,11 +915,22 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
         m0 = maps[i]
         centre = np.array([cx[i], cy[i]])
         t0 = -m0 @ centre
-        down = m0 @ np.array([0.0, 1.0])
-        # Keep the cabinet's own up direction pointing up the delivered frame.
-        phi = math.radians(90.0 - math.degrees(math.atan2(down[1], down[0])))
-        cos_p, sin_p = math.cos(phi), math.sin(phi)
-        upright = np.array([[cos_p, -sin_p], [sin_p, cos_p]])
+        if hints is not None:
+            upright = hints[i]
+        else:
+            # Where the cabinet's own "down" sits *in the picture*.  Hold the
+            # camera level and that is straight down the frame; roll the camera
+            # and the machine turns with the room, so the direction the upright
+            # step has to line up travels with the measured roll.
+            down_image = np.array([0.0, 1.0])
+            if camera_roll_rad is not None:
+                cos_r, sin_r = math.cos(float(camera_roll_rad[i])), math.sin(float(camera_roll_rad[i]))
+                down_image = np.array([-sin_r, cos_r])
+            down = m0 @ down_image
+            # Keep the cabinet's own up direction pointing up the delivered frame.
+            phi = math.radians(90.0 - math.degrees(math.atan2(down[1], down[0])))
+            cos_p, sin_p = math.cos(phi), math.sin(phi)
+            upright = np.array([[cos_p, -sin_p], [sin_p, cos_p]])
         if roll_gain:
             spin = math.radians(-float(roll_gain) * roll_sign * float(roll[i]))
             cos_s, sin_s = math.cos(spin), math.sin(spin)
@@ -812,6 +966,143 @@ def rectify_matrices(series: dict, small_w: int, small_h: int, margin: float,
 
 
 # ------------------------------------------------------------------------- io
+ROLL_CACHE_VERSION = 2
+
+
+def _roll_region_mask(distance: np.ndarray, radius: float,
+                      region: str) -> np.ndarray:
+    """Pixels of the measured frame that belong to the chosen roll source."""
+    if region == "screen":
+        return distance <= radius * 0.72
+    if region == "ring":
+        return (distance > radius * 0.80) & (distance <= radius * 1.65)
+    if region == "room":
+        return distance > radius * 2.30
+    raise ValueError(f"unknown roll region {region!r}")
+
+
+def estimate_camera_roll(path: Path, meta: dict, rows: list[dict],
+                         region: str = "ring", scale: float | None = None,
+                         min_correlation: float = 0.5, progress=None) -> np.ndarray:
+    """How far the camera itself rolled, in degrees, frame by frame.
+
+    The screen and the button ring are bolted to the cabinet, so whatever
+    rotation they show from one frame to the next is the *camera* turning --
+    the world is not moving.  That is the number the delivered frame has to
+    turn back, otherwise the operator sees the machine lean whenever they roll
+    their wrists, which is exactly what a hand held clip used to do.
+
+    The play field is the default source because it is the rigid part closest
+    to the centre, where the lens has the least left to say; pass
+    ``region="ring"`` for footage where the game is repainting the field,
+    since the button ring never changes.
+
+    A step only counts when the correlation behind it is convincing, so a
+    frame where the play field is being repainted holds the previous roll
+    instead of inventing one.
+    """
+    if scale is None:
+        scale = float(meta.get("scale", 0.25))
+    frames = len(rows)
+    cache = Path(str(path) + f".roll-{region}-{scale:g}.json")
+    if cache.exists():
+        try:
+            blob = json.loads(cache.read_text(encoding="utf-8"))
+            if (blob.get("version") == ROLL_CACHE_VERSION
+                    and len(blob.get("degrees", [])) == frames):
+                return np.asarray(blob["degrees"], dtype=np.float64)
+        except (ValueError, KeyError):
+            pass
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"cannot open {path}")
+    w, h = int(meta["small_w"]), int(meta["small_h"])
+    remap = build_remap(w, h, meta["raw_w"], meta["raw_h"], LENS)
+    joint = joint_position(rows)
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    steps = np.zeros(frames)
+    previous = None
+    usable = 0
+    for i in range(frames):
+        ok, frame = capture.read()
+        if not ok:
+            break
+        grey = cv2.cvtColor(unwarp(frame, remap),
+                            cv2.COLOR_BGR2GRAY).astype(np.float32)
+        inner = rows[i].get("inner") if i < len(rows) else None
+        cx = joint["cx"][i] if np.isfinite(joint["cx"][i]) else (
+            float(inner["center"][0]) if inner else w / 2.0)
+        cy = joint["cy"][i] if np.isfinite(joint["cy"][i]) else (
+            float(inner["center"][1]) if inner else h / 2.0)
+        radius = max(float(inner["major"]) * 0.5 if inner else 120.0, 40.0)
+        mask = _roll_region_mask(np.hypot(xx - cx, yy - cy), radius, region)
+        values = grey[mask]
+        if values.size < 64:
+            previous = None
+            continue
+        # Brightness normalisation keeps an exposure change from reading as a
+        # rotation, and the mask keeps the moving play field out of the fit.
+        patch = np.where(mask, (grey - values.mean()) / (values.std() + 1e-6),
+                         0.0).astype(np.float32)
+        if previous is not None:
+            warp = np.eye(2, 3, dtype=np.float32)
+            try:
+                correlation, warp = cv2.findTransformECC(
+                    previous, patch, warp, cv2.MOTION_EUCLIDEAN,
+                    (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-6),
+                    mask.astype(np.uint8), 5)
+                if float(correlation) >= float(min_correlation):
+                    steps[i] = math.degrees(math.atan2(warp[1, 0], warp[0, 0]))
+                    usable += 1
+            except cv2.error:
+                steps[i] = 0.0
+        previous = patch
+        if progress is not None and i % 100 == 0:
+            progress(i, frames)
+    capture.release()
+
+    degrees = np.cumsum(steps)
+    if usable == 0:
+        degrees = np.zeros(frames)
+    else:
+        degrees = smooth(degrees, 1.0)
+    try:
+        cache.write_text(json.dumps({"version": ROLL_CACHE_VERSION,
+                                     "region": region, "scale": scale,
+                                     "usable": usable,
+                                     "degrees": degrees.tolist()}),
+                         encoding="utf-8")
+    except OSError:
+        pass
+    return degrees
+
+
+def read_lean_series(path: Path) -> np.ndarray:
+    """Per-frame cabinet lean in radians, from a plain list or a jsonl dump.
+
+    Both shapes come out of the recorder: ``--lean-series`` on its own is one
+    number per line in degrees, and a pose dump is jsonl with a ``lean`` (or
+    ``roll``) key per line.  Nothing here invents values for the frames the
+    file does not cover, so a short file simply stops the correction.
+    """
+    values: list[float] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("{"):
+            record = json.loads(line)
+            for key in ("lean", "roll", "roll_deg"):
+                if key in record and record[key] is not None:
+                    values.append(float(record[key]))
+                    break
+        else:
+            values.append(float(line))
+    return np.radians(np.asarray(values, dtype=np.float64))
+
+
 def measure_clip(path: Path, measure_scale: float, max_frames: int | None,
                  margin: float = 1.0, ring_weight: float | None = None):
     capture = cv2.VideoCapture(str(path))
@@ -963,6 +1254,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="centre window; keep it short so the cabinet stays put")
     parser.add_argument("--shape-sigma", type=float, default=14.0,
                         help="squash/scale window; long enough to kill the pulse")
+    parser.add_argument("--roll-sigma", type=float, default=2.0,
+                        help="window for the cabinet's lean; it has to keep up "
+                             "with the hand, so it stays short")
+    parser.add_argument("--lean-gain", type=float, default=0.0,
+                        help=">0 turns on the cabinet-lean (roll) correction "
+                             "from the play field itself; see the README for "
+                             "why that estimate is only trustworthy when the "
+                             "phone is held upright")
+    parser.add_argument("--lean-series", type=Path,
+                        help="per-frame lean in degrees, one per line or a "
+                             "jsonl with a 'lean' key (e.g. from the phone's "
+                             "attitude stream); takes precedence over the "
+                             "picture-only estimate")
     parser.add_argument("--world-lock", action="store_true",
                         help="causal anchor for the squash/scale (live-safe)")
     parser.add_argument("--lock-deadband", type=float, default=0.01,
@@ -976,6 +1280,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draw", action="store_true")
     parser.add_argument("--no-fisheye", action="store_true")
     parser.add_argument("--max-frames", type=int)
+    parser.add_argument("--frames", type=int,
+                        help="render only the first N frames (measurement and "
+                             "cache still cover the whole clip)")
+    parser.add_argument("--start", type=int, default=0,
+                        help="first frame to render, for checking one moment")
+    parser.add_argument("--camera-roll", dest="camera_roll",
+                        action="store_true", default=True,
+                        help="turn the picture back against the camera's own "
+                             "roll so the cabinet stays fixed in the room")
+    parser.add_argument("--no-camera-roll", dest="camera_roll",
+                        action="store_false",
+                        help="leave the camera roll in the picture, as before")
+    parser.add_argument("--roll-region", default="screen",
+                        choices=("screen", "ring", "room"),
+                        help="which rigid part of the cabinet names the roll")
     return parser
 
 
@@ -1006,12 +1325,27 @@ def main() -> None:
                  fast_ratio=float(args.lock_fast_ratio))
             if args.world_lock else None)
     if args.rectify > 0.0:
+        camera_roll = None
+        if args.camera_roll:
+            camera_roll = estimate_camera_roll(
+                args.input, meta, rows, str(args.roll_region),
+                float(args.measure_scale),
+                progress=lambda i, n: print(f"  roll {i}/{n}", flush=True)
+                if i and i % 200 == 0 else None)
+            spread = np.ptp(camera_roll) if camera_roll.size else 0.0
+            print(f"camera roll from {args.roll_region}: "
+                  f"{np.nanmin(camera_roll):+.1f}..{np.nanmax(camera_roll):+.1f} deg "
+                  f"(spread {spread:.1f})")
         rectified, rect_info = rectify_matrices(
             series, meta["small_w"], meta["small_h"], margin,
             args.lock_fill, args.smooth_sigma, args.rectify,
             args.roll_gain, args.roll_sign, joint=joint, lock=lock,
             fps=meta["fps"], deadband_frac=float(args.lock_deadband),
-            shape_sigma=float(args.shape_sigma))
+            shape_sigma=float(args.shape_sigma),
+            roll_sigma=float(args.roll_sigma),
+            lean_gain=float(args.lean_gain),
+            lean_series=read_lean_series(args.lean_series) if args.lean_series else None,
+            camera_roll=camera_roll)
     matrices = info = None
     if rectified is None:
         matrices, info = lock_matrices(
@@ -1098,8 +1432,13 @@ def main() -> None:
     if not writer.isOpened():
         raise RuntimeError(f"cannot write {args.output}")
 
-    index = 0
-    while index < len(rows):
+    start = max(0, int(args.start))
+    stop = len(rows) if args.frames is None else min(start + int(args.frames), len(rows))
+    if start:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start)
+    limit = stop
+    index = start
+    while index < limit:
         ok, frame = capture.read()
         if not ok:
             break
@@ -1130,7 +1469,8 @@ def main() -> None:
         index += 1
     capture.release()
     writer.release()
-    print(f"wrote {args.output} ({index} frames, {out_w}x{out_h})")
+    print(f"wrote {args.output} ({index - start} frames {start}..{index - 1}, "
+          f"{out_w}x{out_h})")
     report = lock_report(rows, project, np.array([out_w, out_h], dtype=np.float64) * 0.5)
     print(f"  cabinet off centre : {report['machine']:6.2f}px  (of {out_w}px wide)")
     print(f"  button ring cv     : {report['ring_cv'] * 100:6.2f}%  "
