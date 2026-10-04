@@ -481,30 +481,71 @@ class PlaneDriftAnchorTests(unittest.TestCase):
         )
         return tracker
 
+    @staticmethod
+    def _effective(tracker: PlaneLockTracker) -> np.ndarray:
+        """The transform that actually lands on the output."""
+        return tracker.correction @ tracker.current_to_reference
+
+    def _settle(self, tracker: PlaneLockTracker, box, rounds: int = 400) -> None:
+        for _ in range(rounds):
+            tracker.reanchor(box)
+            tracker.advance_correction()
+
     def test_drift_is_pulled_back_towards_the_reference_box(self):
         tracker = self._tracker(1.4)
         # The machine really is where the reference box says it is.
         box = (100, 200, 300, 500)
         self.assertTrue(tracker.reanchor(box))
-        after_one = float(tracker.current_to_reference[0, 0])
-        self.assertLess(after_one, 1.4)
-        for _ in range(60):
-            tracker.reanchor(box)
-        settled = float(tracker.current_to_reference[0, 0])
-        self.assertAlmostEqual(settled, 1.0, delta=0.08)
+        self._settle(tracker, box)
+        self.assertAlmostEqual(float(self._effective(tracker)[0, 0]), 1.0, delta=0.05)
+
+    def test_a_single_reading_never_moves_the_plane_in_one_frame(self):
+        tracker = self._tracker(1.4)
+        box = (100, 200, 300, 500)
+        self.assertTrue(tracker.reanchor(box))
+        before = self._effective(tracker).copy()
+        tracker.advance_correction()
+        after = self._effective(tracker)
+        # 35% of a correction that is itself capped well below the whole
+        # movement: the visible plane can never be yanked by one reading.
+        self.assertLess(abs(float(after[0, 0]) - float(before[0, 0])), 0.16)
+
+    def test_the_payout_is_spread_over_several_frames(self):
+        tracker = self._tracker(1.4)
+        box = (100, 200, 300, 500)
+        tracker.reanchor(box)
+        steps = []
+        for _ in range(6):
+            tracker.advance_correction()
+            steps.append(float(self._effective(tracker)[0, 0]))
+        self.assertEqual(len(set(round(value, 6) for value in steps)), len(steps))
+        self.assertGreater(steps[0] - steps[1], steps[-2] - steps[-1])
 
     def test_a_single_inflated_box_is_ignored(self):
         tracker = self._tracker(1.0)
-        before = tracker.current_to_reference.copy()
+        before = tracker.correction.copy()
         # Fisheye boxes near the rim map to inflated quadrilaterals; that must
         # not be read as the machine suddenly shrinking.
         inflated = (0, 0, 1280, 1440)
         self.assertFalse(tracker.reanchor(inflated))
-        np.testing.assert_allclose(tracker.current_to_reference, before)
+        np.testing.assert_allclose(tracker.correction, before)
 
     def test_front_back_motion_is_reported_by_the_correction(self):
         tracker = self._tracker(1.0)
         # Twice the reference box means the machine is twice as close as when
         # it was locked, so the transform has to shrink the plane back down.
         self.assertTrue(tracker.reanchor((10, 140, 290, 560)))
-        self.assertLess(float(tracker.current_to_reference[0, 0]), 1.0)
+        self._settle(tracker, (10, 140, 290, 560))
+        self.assertLess(float(self._effective(tracker)[0, 0]), 1.0)
+
+    def test_a_new_reference_drops_the_old_correction(self):
+        tracker = self._tracker(1.4)
+        tracker.reanchor((100, 200, 300, 500))
+        tracker.advance_correction()
+        self.assertFalse(np.allclose(tracker.correction, np.eye(3)))
+        gray = np.zeros((720, 1280), dtype=np.uint8)
+        tracker.initialize(gray, (100, 200, 300, 500), (60, 150, 340, 560), 1280, 720, 0.71)
+        np.testing.assert_allclose(tracker.correction, np.eye(3), atol=1e-6)
+        np.testing.assert_allclose(tracker.current_to_reference, np.eye(3), atol=1e-6)
+
+

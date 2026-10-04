@@ -123,6 +123,35 @@ class LiveProcessorTests(unittest.TestCase):
         self.assertEqual(processor.plane_tracker.age_frames, 0)
         np.testing.assert_allclose(processor.plane_tracker.current_to_reference, np.eye(3), atol=1e-6)
 
+    def test_the_anchor_does_not_wait_for_the_box_trackers_jump_gate(self):
+        class FixedDetector:
+            enabled = True
+            inner = (95, 45, 225, 135)
+            outer = (30, 15, 290, 170)
+
+            def detect(self, _frame):
+                return self.outer, self.inner
+
+        detector = FixedDetector()
+        processor = LiveProcessor(detect_every=1)
+        processor.detector = detector
+        frame = np.random.default_rng(7).integers(0, 256, (360, 640, 3), dtype=np.uint8)
+        metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}
+
+        with patch("pc.live_processor.map_fisheye_box_to_output", side_effect=lambda box, *_args: box):
+            processor.process(frame, metadata)
+            self.assertTrue(processor.plane_tracker.locked)
+            # Still the machine, but far enough from the last box that the
+            # continuity gate keeps the old one.  The absolute anchor is a
+            # measurement of where the machine really is, so it must not be
+            # dropped at exactly the moment the phone moved a long way.
+            detector.inner = (470, 135, 610, 225)
+            detector.outer = (400, 100, 640, 260)
+            _output, debug = processor.process(frame, metadata)
+
+        self.assertGreater(debug["detection_age_frames"], 0)
+        self.assertFalse(np.allclose(processor.plane_tracker.correction_target, np.eye(3)))
+
 
 if __name__ == "__main__":
     unittest.main()

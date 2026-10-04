@@ -1164,8 +1164,14 @@ class PlaneLockTracker:
         max_age_frames: int | None = None,
         feature_region: str = "combined",
         motion_model: str = "homography",
+        correction_gain: float = 0.35,
     ):
         self.detect_every = max(1, int(detect_every))
+        #: Fraction of a measured anchor correction paid out per frame.  The
+        #: detector only runs every ``detect_every`` frames, so applying a
+        #: reading the moment it arrives yanks the plane once every few
+        #: hundred milliseconds.
+        self.correction_gain = float(min(max(correction_gain, 0.0), 1.0))
         # Hold a good transform briefly through a missed frame burst, then
         # reacquire instead of freezing an old plane for several seconds.
         self.max_age_frames = max_age_frames or max(18, self.detect_every * 4)
@@ -1195,9 +1201,12 @@ class PlaneLockTracker:
         self.frames_since_refresh = 0
         # Last accepted machine quad, used to reject wild homographies.
         self.current_quad: np.ndarray | None = None
-        # Drift correction measured from fresh detector boxes: recent sizes
-        # for the median filter, and the correction still being paid out.
-        self.correction_history: list[float] = []
+        # Anchor correction in reference coordinates.  ``correction`` is what
+        # is applied right now, ``correction_target`` the last measured value;
+        # advance_correction() walks the first towards the second so a fresh
+        # detector box never moves the plane in one frame.
+        self.correction = np.eye(3, dtype=np.float32)
+        self.correction_target = np.eye(3, dtype=np.float32)
 
     @property
     def locked(self) -> bool:
@@ -1210,32 +1219,32 @@ class PlaneLockTracker:
         # caller use its detector/affine fallback while LK reacquires.
         if not self.locked or self.age_frames > max(3, self.detect_every // 2):
             return None
-        matrix = self.reference_to_output @ self.current_to_reference
+        matrix = self.reference_to_output @ self.correction @ self.current_to_reference
         return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
 
     def reanchor(
         self,
         box: tuple[int, int, int, int] | None,
         outer_box: tuple[int, int, int, int] | None = None,
-        history: int = 3,
-        deadband: float = 0.04,
-        max_step: float = 0.06,
+        max_scale: float = 2.20,
+        max_step: float = 0.25,
     ) -> bool:
-        """Cancel accumulated drift against a fresh detector box.
+        """Record an absolute correction measured from a fresh detector box.
 
         ``current_to_reference`` is composed frame by frame, so a fraction of
-        a percent of scale error per frame compounds: on real footage the
-        machine drifted to 1.57x its reference size and stayed there after
-        the operator moved back out. The detector box measures the machine in
+        a percent of error per frame compounds: on real footage the machine
+        drifted away from its locked size while the operator moved in and out,
+        and nothing pulled it back. The detector box measures the machine in
         absolute terms, so projecting it through the accumulated transform
-        says exactly how much larger or smaller that transform is than it
-        should be.
+        says exactly how far that transform has walked off the reference box.
 
-        Two guards keep the anchor from becoming a jitter source. A box close
-        to the fisheye rim maps to an inflated quadrilateral, so the last few
-        correction readings are median-filtered; and a single reading only
-        moves the transform by ``max_step``, so drift is removed over a few
-        detections instead of in one visible jump.
+        The reading is not applied to the transform here. It is stored as a
+        correction in reference coordinates and paid out over the following
+        frames by :meth:`advance_correction`. The detector only runs every
+        ``detect_every`` frames, so correcting in one frame moved the plane by
+        up to 6% and 20 px every time the model ran; that step is what the
+        operator sees as the picture being yanked once every few hundred
+        milliseconds even though the transform is right on average.
         """
         if not self.locked or box is None or self.reference_box is None:
             return False
@@ -1253,35 +1262,62 @@ class PlaneLockTracker:
         if mapped_area < 64.0 or reference_area < 64.0:
             return False
         measured = math.sqrt(reference_area / mapped_area)
-        if not 0.55 <= measured <= 1.8:
+        # A box that maps far outside the reference size is either a fisheye
+        # corner near the lens rim or a detector slip, and neither is a
+        # measurement of how far away the machine is.  The gate has to stay
+        # wide: on the recorded push the plane really did walk to 1.8x while
+        # the operator moved in close, and a narrow gate refused to read that
+        # as a correction, so the lock kept the wrong distance for the rest of
+        # the clip.  Anything inside the gate is only ever paid out a fraction
+        # at a time (``max_step`` below, ``correction_gain`` per frame).
+        if not 1.0 / max_scale <= measured <= max_scale:
             return False
-        self.correction_history.append(measured)
-        if len(self.correction_history) > max(1, int(history)):
-            del self.correction_history[0]
-        scale = float(np.median(self.correction_history))
-        if abs(scale - 1.0) < deadband:
-            return False
-        scale = float(np.clip(scale, 1.0 - max_step, 1.0 + max_step))
-        mapped_center = mapped.mean(axis=0)
-        reference_center = reference.mean(axis=0)
-        shift = reference_center - scale * mapped_center
         diagonal = max(float(np.linalg.norm(reference[2] - reference[0])), 8.0)
-        limit = max_step * diagonal
-        shift = np.clip(shift, -limit, limit)
-        correction = np.array([
-            [scale, 0.0, shift[0]],
-            [0.0, scale, shift[1]],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-        candidate = correction @ self.current_to_reference.astype(np.float64)
-        if not np.isfinite(candidate).all() or abs(candidate[2, 2]) < 1e-9:
+        # Cap how far one reading may move the plane, so a single bad box
+        # cannot drag the lock across the picture.
+        applied = _project_points(mapped.astype(np.float32), self.correction)
+        if applied is None:
             return False
-        self.current_to_reference = (candidate / candidate[2, 2]).astype(np.float32)
-        projected = _project_points(_box_points(self.reference_box), self.current_to_reference)
-        if projected is not None:
-            self.current_quad = np.asarray(projected, dtype=np.float32).reshape(4, 2)
+        applied = np.asarray(applied, dtype=np.float64).reshape(4, 2)
+        delta = reference - applied
+        distance = np.linalg.norm(delta, axis=1)
+        limit = float(max_step) * diagonal
+        over = distance > limit
+        if over.any():
+            delta[over] *= (limit / np.maximum(distance[over], 1e-9))[:, None]
+        goal = applied + delta
+        target = cv2.getPerspectiveTransform(
+            mapped.astype(np.float32), goal.astype(np.float32),
+        )
+        if target is None or not np.isfinite(target).all():
+            return False
+        target = np.asarray(target, dtype=np.float64)
+        if abs(float(target[2, 2])) < 1e-9:
+            return False
+        self.correction_target = (target / float(target[2, 2])).astype(np.float32)
         return True
 
+    def advance_correction(self) -> None:
+        """Walk the applied correction towards the last measured one.
+
+        A correction that is applied the instant it is measured shows up as
+        the plane being yanked once every ``detect_every`` frames. Paying the
+        same total movement out as an exponential approach spreads it over the
+        frames in between, which is the difference between the machine looking
+        pinned and the machine stepping every few hundred milliseconds.
+        """
+        gain = float(self.correction_gain)
+        if gain <= 0.0:
+            return
+        applied = self.correction.astype(np.float64)
+        target = self.correction_target.astype(np.float64)
+        if gain >= 1.0:
+            blended = target
+        else:
+            blended = (1.0 - gain) * applied + gain * target
+        if not np.isfinite(blended).all() or abs(float(blended[2, 2])) < 1e-9:
+            return
+        self.correction = (blended / float(blended[2, 2])).astype(np.float32)
 
     def reacquire_if_stale(
         self,
@@ -1423,7 +1459,8 @@ class PlaneLockTracker:
         self.frames_since_refresh = 0
         # A new reference throws away any drift correction measured against
         # the old one; the detector box just re-anchored the target anyway.
-        self.correction_history = []
+        self.correction = np.eye(3, dtype=np.float32)
+        self.correction_target = np.eye(3, dtype=np.float32)
         return True
 
     @staticmethod
@@ -1574,6 +1611,10 @@ class PlaneLockTracker:
             if refreshed is not None:
                 self.points = refreshed
                 self.frames_since_refresh = 0
+        # The anchor correction is paid out on every frame, not only on the
+        # frames the detector runs, so the plane walks to the fresh reading
+        # instead of jumping to it.
+        self.advance_correction()
         return self.locked
 
 
@@ -1833,6 +1874,7 @@ def process(args: argparse.Namespace) -> Path:
                 if not plane_tracker.locked:
                     lock_tracker.update_flow(previous_gray, current_gray)
                 fresh_inner_detection = False
+                anchor_pair = False
                 plane_reacquired = False
                 if args.model and index % args.detect_every == 0:
                     detected_outer_raw, detected_inner_raw = detector.detect(frame)
@@ -1859,6 +1901,12 @@ def process(args: argparse.Namespace) -> Path:
                         and lock_tracker.outer_age_frames == 0
                         and lock_tracker.inner_age_frames == 0
                     )
+                    anchor_pair = (
+                        detected_inner is not None
+                        and detected_outer is not None
+                        and (plausible_geometry_pair(detected_outer, detected_inner)
+                             or soft_geometry_pair(detected_outer, detected_inner))
+                    )
                 outer, inner = lock_tracker.boxes()
                 plane_locked = plane_tracker.update(
                     current_gray,
@@ -1868,7 +1916,7 @@ def process(args: argparse.Namespace) -> Path:
                     height,
                     getattr(args, "lock_fill", 0.71),
                 )
-                if fresh_inner_detection and plane_tracker.locked and detected_inner is not None:
+                if anchor_pair and plane_tracker.locked:
                     plane_tracker.reanchor(detected_inner, detected_outer)
                 plane_reacquired = plane_tracker.reacquire_if_stale(
                     current_gray,

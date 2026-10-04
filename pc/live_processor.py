@@ -25,6 +25,8 @@ try:
         transform_box_homography,
         expand_box,
         geometry_reference,
+        plausible_geometry_pair,
+        soft_geometry_pair,
         update_geometry_lock_state,
         lens_remap,
         rotation_homography,
@@ -46,6 +48,8 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         transform_box_homography,
         expand_box,
         geometry_reference,
+        plausible_geometry_pair,
+        soft_geometry_pair,
         update_geometry_lock_state,
         lens_remap,
         rotation_homography,
@@ -164,6 +168,13 @@ class LiveProcessor:
         fresh_inner_detection = False
         fresh_inner_box = None
         fresh_outer_box = None
+        #: The absolute anchor does not need the continuity check the box
+        #: tracker applies; it needs a detector pair that really is the
+        #: machine.  Gating it on the tracker's jump check threw the reading
+        #: away exactly when the phone moved fast, which is when the
+        #: accumulated transform needed it most.
+        anchor_box = None
+        anchor_outer_box = None
         if self.detector.enabled and self.frame_index % self.detect_every == 0:
             detector_ran = True
             # The model was trained on the raw clip-on-lens geometry. Detect
@@ -196,6 +207,11 @@ class LiveProcessor:
             if fresh_inner_detection:
                 fresh_inner_box = detected_inner
                 fresh_outer_box = detected_outer
+            if (detected_inner is not None and detected_outer is not None
+                    and (plausible_geometry_pair(detected_outer, detected_inner)
+                         or soft_geometry_pair(detected_outer, detected_inner))):
+                anchor_box = detected_inner
+                anchor_outer_box = detected_outer
 
         if not self.detector.enabled:
             self.lock_tracker.reset()
@@ -210,10 +226,10 @@ class LiveProcessor:
             height,
             self.lock_fill,
         )
-        if fresh_inner_detection and self.plane_tracker.locked and fresh_inner_box is not None:
+        if self.plane_tracker.locked and anchor_box is not None:
             # The flow transform is accumulated frame by frame and drifts;
             # this absolute anchor ties it back to the detected machine.
-            self.plane_tracker.reanchor(fresh_inner_box, fresh_outer_box)
+            self.plane_tracker.reanchor(anchor_box, anchor_outer_box)
         plane_reacquired = self.plane_tracker.reacquire_if_stale(
             current_gray,
             inner,
@@ -312,6 +328,10 @@ class LiveProcessor:
             "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
             "plane_lock": plane_matrix is not None,
+            "plane_matrix": (
+                np.asarray(plane_matrix, dtype=np.float64).reshape(-1).round(6).tolist()
+                if plane_matrix is not None else None
+            ),
             "plane_reacquired": plane_reacquired,
             "plane_age_frames": self.plane_tracker.age_frames,
             "plane_inliers": self.plane_tracker.inliers,
