@@ -354,6 +354,16 @@ class ResolveFpsTests(unittest.TestCase):
             rows = [{"timestamp": 100.0 + index / 60.0} for index in range(60)]
             self.assertAlmostEqual(resolve_fps(session, rows, None), 60.0, places=3)
 
+    def test_measured_stamps_beat_a_nominal_fps_of_60(self):
+        # The real bug: the receiver writes nominal_fps=60 from its --fps
+        # default while the phone pushes ~25 fps, which tagged the output at
+        # 60 and made every replay run about 2.4x too fast.
+        with tempfile.TemporaryDirectory() as workspace:
+            session = Path(workspace)
+            (session / "session.json").write_text(json.dumps({"nominal_fps": 60}), encoding="utf-8")
+            rows = [{"timestamp": 500.0 + index / 25.0} for index in range(50)]
+            self.assertAlmostEqual(resolve_fps(session, rows, None), 25.0, places=3)
+
     def test_explicit_override_wins(self):
         with tempfile.TemporaryDirectory() as workspace:
             session = Path(workspace)

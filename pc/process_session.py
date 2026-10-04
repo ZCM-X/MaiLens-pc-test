@@ -1633,32 +1633,48 @@ def load_manifest(session: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def measured_fps(rows: list[dict]) -> float | None:
+    """Frame rate implied by the capture timestamps, or None when unusable.
+
+    The receiver stamps every frame as it lands, so the median interval is the
+    honest record of how fast the phone really pushed.  ``session.json``'s
+    ``nominal_fps`` is only the ``--fps`` default (60), while a real phone push
+    runs at 24-30 fps: trusting the manifest doubles the playback speed and
+    halves the effect of every time-based filter.
+    """
+    timestamps = sorted(float(row["timestamp"]) for row in rows
+                        if isinstance(row.get("timestamp"), (int, float)))
+    deltas = sorted(later - earlier
+                    for earlier, later in zip(timestamps, timestamps[1:])
+                    if later > earlier)
+    if not deltas:
+        return None
+    median = deltas[len(deltas) // 2]
+    if median <= 0:
+        return None
+    return max(1.0, min(240.0, 1.0 / median))
+
+
 def resolve_fps(session: Path,
                 rows: list[dict],
                 override: float | None,
                 container_fps: float | None = None) -> float:
-    """Nominal frame rate without requiring a manifest.
+    """Frame rate for the processed movie, preferring the measured one.
 
     A session stopped with Ctrl+C never got its ``session.json``, so fall back
-    to the file when it exists and to the frame timestamps when it does not.
+    to the file when it exists and to the container when it does not.
     """
     if override:
         return float(override)
+    measured = measured_fps(rows)
+    if measured is not None:
+        return measured
     value = load_manifest(session).get("nominal_fps")
     if value:
         try:
             return float(value)
         except (TypeError, ValueError):
             pass
-    timestamps = [float(row["timestamp"]) for row in rows
-                  if isinstance(row.get("timestamp"), (int, float))]
-    deltas = sorted(later - earlier
-                    for earlier, later in zip(timestamps, timestamps[1:])
-                    if later > earlier)
-    if deltas:
-        median = deltas[len(deltas) // 2]
-        if median > 0:
-            return max(1.0, min(240.0, 1.0 / median))
     if container_fps:
         return max(1.0, min(240.0, float(container_fps)))
     return 60.0
@@ -1817,7 +1833,10 @@ def process(args: argparse.Namespace) -> Path:
     writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():
         raise RuntimeError(f"无法创建输出视频：{output}")
-    debug_path = session / "debug.jsonl"
+    # ``--debug`` used to overwrite the session's own debug.jsonl, so a replay
+    # silently destroyed the record of the live run.  Default to a sidecar
+    # unless the caller names a path.
+    debug_path = Path(args.debug_out) if getattr(args, "debug_out", None) else session / "debug.jsonl"
     detector = GeometryDetector(args.model)
     reference = None
     previous_center = np.array([0.5, 0.5], dtype=np.float32)
@@ -2075,6 +2094,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k2", type=float, default=-0.0174637)
     parser.add_argument("--fps", type=float)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug-out", default=None,
+                        help="调试 jsonl 的输出路径，默认写到会话目录的 debug.jsonl")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--detect-every", type=int, default=12,
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")

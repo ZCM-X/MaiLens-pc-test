@@ -81,11 +81,18 @@ class ReplayLiveTests(unittest.TestCase):
             session = write_session(Path(tmp), count=6, fps=25.0)
             self.assertAlmostEqual(session_fps(session, load_session_rows(session)), 25.0, places=2)
 
-    def test_session_fps_prefers_the_manifest(self):
+    def test_session_fps_ignores_a_nominal_fps_the_stamps_contradict(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = write_session(Path(tmp), count=6, fps=25.0)
             (session / "session.json").write_text(json.dumps({"nominal_fps": 60}), encoding="utf-8")
-            self.assertEqual(session_fps(session, load_session_rows(session)), 60.0)
+            self.assertAlmostEqual(session_fps(session, load_session_rows(session)), 25.0, places=2)
+
+    def test_session_fps_still_uses_the_manifest_without_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = write_session(Path(tmp), count=6, fps=25.0)
+            (session / "session.json").write_text(json.dumps({"nominal_fps": 60}), encoding="utf-8")
+            rows = [{"frame_id": index} for index in range(6)]
+            self.assertEqual(session_fps(session, rows), 60.0)
 
     def test_iter_session_frames_prefers_the_saved_jpegs(self):
         with tempfile.TemporaryDirectory() as tmp:

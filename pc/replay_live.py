@@ -58,7 +58,19 @@ def load_session_rows(session: Path) -> list[dict]:
 
 
 def session_fps(session: Path, rows: list[dict], default: float = 60.0) -> float:
-    """Nominal frame rate of the session, for the output file and the HUD."""
+    """Frame rate of the session, for the output file, the HUD and the pacing.
+
+    Measured first: the manifest's ``nominal_fps`` is the receiver's ``--fps``
+    default rather than a measurement, and a real phone push lands at 24-30 fps,
+    so replaying at the nominal 60 ran the clip about 2.4x too fast.
+    """
+    try:
+        from .process_session import measured_fps
+    except ImportError:  # Running as `python pc/replay_live.py`.
+        from process_session import measured_fps
+    measured = measured_fps(rows)
+    if measured is not None:
+        return float(round(measured, 3))
     manifest = session / "session.json"
     if manifest.exists():
         try:
@@ -67,14 +79,7 @@ def session_fps(session: Path, rows: list[dict], default: float = 60.0) -> float
             nominal = None
         if nominal:
             return float(nominal)
-    stamps = np.array([float(row["timestamp"]) for row in rows if row.get("timestamp") is not None])
-    if stamps.size < 2:
-        return default
-    deltas = np.diff(np.sort(stamps))
-    deltas = deltas[deltas > 1e-4]
-    if not deltas.size:
-        return default
-    return float(round(1.0 / float(np.median(deltas)), 3))
+    return default
 
 
 def frame_path(session: Path, row: dict, index: int) -> Path | None:
