@@ -219,6 +219,18 @@ py -m venv .venv
 sessions/20261001-153012
 ```
 
+### 回放实时预览（不用连手机）
+
+手机上还没重新打包时，可以直接把已经录好的会话喂进接收端同一套实时处理器，按录制时间戳在电脑上边跑边看：
+
+```powershell
+.\.venv\Scripts\python.exe pc\replay_live.py sessions\20261002-035222
+```
+
+省略会话路径时取 `sessions\` 下最新的一次采集。预览窗口里：`空格` 暂停/继续，`.` 暂停时单帧前进，`r` 重头再来，`d` 切换检测框叠加，`q` 退出。默认带 `--machine-lock`（v5 ONNX）和 `--processing-scale 0.5`，和接收端实时链路一致；要高画质预览改 `--processing-scale 1.0`，代价是帧率降到十几帧。想倍速或存档就加 `--speed 2`、`--output work\replay-live.mp4`，`--no-realtime` 表示不等时间戳、尽快跑完。
+
+它和 `pc_receiver.py --process-live` 共用同一个 `LiveProcessor`，所以在电脑上看到的就是手机推流时接收端会处理出的画面；手机上要看到同样的结果，仍需要把这套逻辑移植回 App 再打包。
+
 实时模式会同时保存 `raw.mp4` 和 `processed-live.mp4`。如果先只采集原始数据，之后再离线调参，可以用：
 
 ```powershell

@@ -55,6 +55,69 @@ def make_output_rays(width: int, height: int, crop: float, fov_deg: float) -> np
     return rays
 
 
+# Cached (map_x, map_y) for the fixed fisheye->rectilinear transform. The live
+# path builds these once per stream geometry and reuses them for every frame.
+_LENS_REMAP_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def lens_remap(
+    width: int,
+    height: int,
+    crop: float,
+    fov_deg: float,
+    k1: float,
+    k2: float,
+    center_x: float,
+    center_y: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the fixed fisheye-to-rectilinear map, cached per geometry.
+
+    The lens does not move, so this map only depends on the output size and
+    the calibration. Caching it lets the live path skip ``build_remap`` on
+    every frame and apply the pose as a single perspective warp instead.
+    """
+    key = (int(width), int(height), float(crop), float(fov_deg), float(k1),
+           float(k2), float(center_x), float(center_y))
+    cached = _LENS_REMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    rays = make_output_rays(width, height, crop, fov_deg)
+    result = build_remap(
+        width, height, np.eye(3, dtype=np.float32), crop, fov_deg,
+        k1, k2, center_x, center_y, output_rays=rays,
+    )
+    if len(_LENS_REMAP_CACHE) > 8:
+        _LENS_REMAP_CACHE.clear()
+    _LENS_REMAP_CACHE[key] = result
+    return result
+
+
+def rotation_homography(
+    rotation: np.ndarray,
+    width: int,
+    height: int,
+    crop: float,
+    fov_deg: float,
+) -> np.ndarray:
+    """Perspective warp that rotates an already rectified frame by ``rotation``.
+
+    ``build_remap`` rotates the sampling rays inside the fisheye projection.
+    For a pinhole output that is exactly equivalent to applying the homography
+    ``K @ R @ inv(K)`` to the rectified image, which is far cheaper: one
+    constant remap plus one perspective warp instead of a fresh full-frame map
+    per frame.
+    """
+    focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5)) * crop
+    focal = max(float(focal), 1e-6)
+    intrinsic = np.array([
+        [focal, 0.0, width * 0.5],
+        [0.0, focal, height * 0.5],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    matrix = intrinsic @ np.asarray(rotation, dtype=np.float64) @ np.linalg.inv(intrinsic)
+    return (matrix / matrix[2, 2]).astype(np.float32)
+
+
 def build_remap(
     width: int,
     height: int,
@@ -573,7 +636,33 @@ def apply_plane_lock(
     )
     if target_inner_box is None:
         return warped
-    x0, y0, x1, y1 = target_inner_box
+    # The locked target box is fixed, so the feathered ellipse is identical
+    # on every frame of a lock. Building it once keeps the live path at 60 fps
+    # instead of rebuilding a blurred full-frame mask per frame.
+    alpha = _cached_lock_mask((height, width), target_inner_box)
+    alpha = alpha * (valid_source[..., None].astype(np.float32) / 255.0)
+    warped_f = warped.astype(np.float32)
+    warped_f *= alpha
+    frame_f = frame.astype(np.float32)
+    frame_f *= (1.0 - alpha)
+    warped_f += frame_f
+    return np.clip(warped_f, 0.0, 255.0).astype(np.uint8)
+
+
+_LOCK_MASK_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _cached_lock_mask(
+    shape: tuple[int, int],
+    box: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Feathered ellipse alpha (h, w, 1) for a fixed locked target box."""
+    key = (int(shape[0]), int(shape[1])) + tuple(int(round(v)) for v in box)
+    cached = _LOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    height, width = shape
+    x0, y0, x1, y1 = box
     center = (int(round((x0 + x1) * 0.5)), int(round((y0 + y1) * 0.5)))
     half_width = max((x1 - x0) * 0.5, 8.0)
     half_height = max((y1 - y0) * 0.5, 8.0)
@@ -588,9 +677,11 @@ def apply_plane_lock(
     cv2.ellipse(mask, center, axes, 0.0, 0.0, 360.0, 255, -1)
     feather = max(9, int(round(min(axes) * 0.06)) * 2 + 1)
     mask = cv2.GaussianBlur(mask, (feather, feather), 0)
-    mask = cv2.bitwise_and(mask, valid_source)
     alpha = (mask.astype(np.float32) / 255.0)[..., None]
-    return np.clip(warped.astype(np.float32) * alpha + frame.astype(np.float32) * (1.0 - alpha), 0, 255).astype(np.uint8)
+    if len(_LOCK_MASK_CACHE) > 16:
+        _LOCK_MASK_CACHE.clear()
+    _LOCK_MASK_CACHE[key] = alpha
+    return alpha
 
 
 def _warp_with_valid_source(

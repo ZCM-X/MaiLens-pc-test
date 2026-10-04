@@ -26,6 +26,8 @@ try:
         expand_box,
         geometry_reference,
         update_geometry_lock_state,
+        lens_remap,
+        rotation_homography,
     )
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
@@ -45,6 +47,8 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         expand_box,
         geometry_reference,
         update_geometry_lock_state,
+        lens_remap,
+        rotation_homography,
     )
 
 
@@ -64,6 +68,7 @@ class LiveProcessor:
         detect_every: int = 12,
         lock_fill: float = 0.71,
         debug: bool = False,
+        fast_remap: bool = True,
     ) -> None:
         self.crop = crop
         self.fov = fov
@@ -74,6 +79,12 @@ class LiveProcessor:
         self.detect_every = max(1, detect_every)
         self.lock_fill = float(min(max(lock_fill, 0.35), 0.90))
         self.debug = debug
+        # The lens map is constant, so applying it once and rotating the
+        # rectified frame with a perspective warp is exactly equivalent to
+        # rebuilding the fisheye map every frame, at a fraction of the cost.
+        self.fast_remap = bool(fast_remap)
+        self.lens_map: tuple[np.ndarray, np.ndarray] | None = None
+        self.lens_map_shape: tuple[int, int] | None = None
         self.detector = GeometryDetector(model)
         self.frame_index = 0
         self.reference = None
@@ -103,12 +114,30 @@ class LiveProcessor:
 
         rotation, self.reference = rotation_for_row(metadata, self.reference)
 
-        map_x, map_y = build_remap(
-            width, height, rotation, self.crop, self.fov,
-            self.k1, self.k2, self.center_x, self.center_y,
-            output_rays=self.output_rays,
-        )
-        stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+        if self.fast_remap:
+            if self.lens_map is None or self.lens_map_shape != (width, height):
+                self.lens_map = lens_remap(
+                    width, height, self.crop, self.fov,
+                    self.k1, self.k2, self.center_x, self.center_y,
+                )
+                self.lens_map_shape = (width, height)
+            rectified = cv2.remap(
+                frame, self.lens_map[0], self.lens_map[1],
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101,
+            )
+            homography = rotation_homography(rotation, width, height, self.crop, self.fov)
+            stabilized = cv2.warpPerspective(
+                rectified, homography, (width, height),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        else:
+            map_x, map_y = build_remap(
+                width, height, rotation, self.crop, self.fov,
+                self.k1, self.k2, self.center_x, self.center_y,
+                output_rays=self.output_rays,
+            )
+            stabilized = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
         current_gray = cv2.cvtColor(stabilized, cv2.COLOR_BGR2GRAY)
         # A phone can change capture dimensions when the camera rotates or a
         # sender renegotiates its stream.  Sparse LK flow cannot compare
@@ -116,6 +145,8 @@ class LiveProcessor:
         # reacquire the cabinet on the new geometry instead.
         if self.previous_gray is not None and self.previous_gray.shape != current_gray.shape:
             self.previous_gray = None
+            self.lens_map = None
+            self.lens_map_shape = None
             self.lock_tracker.reset()
             self.previous_center = np.array([0.5, 0.5], dtype=np.float32)
             self.previous_zoom = 1.0
