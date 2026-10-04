@@ -463,3 +463,48 @@ class PoseLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PlaneDriftAnchorTests(unittest.TestCase):
+    """The plane transform is accumulated, so it needs an absolute anchor."""
+
+    @staticmethod
+    def _tracker(scale: float) -> PlaneLockTracker:
+        tracker = PlaneLockTracker(detect_every=12)
+        tracker.reference_box = (100, 200, 300, 500)
+        tracker.reference_outer_box = (60, 150, 340, 560)
+        tracker.reference_to_output = np.eye(3, dtype=np.float32)
+        tracker.reference_gray = np.zeros((720, 1280), dtype=np.uint8)
+        tracker.points = np.zeros((12, 1, 2), dtype=np.float32)
+        tracker.current_to_reference = np.array(
+            [[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        return tracker
+
+    def test_drift_is_pulled_back_towards_the_reference_box(self):
+        tracker = self._tracker(1.4)
+        # The machine really is where the reference box says it is.
+        box = (100, 200, 300, 500)
+        self.assertTrue(tracker.reanchor(box))
+        after_one = float(tracker.current_to_reference[0, 0])
+        self.assertLess(after_one, 1.4)
+        for _ in range(60):
+            tracker.reanchor(box)
+        settled = float(tracker.current_to_reference[0, 0])
+        self.assertAlmostEqual(settled, 1.0, delta=0.08)
+
+    def test_a_single_inflated_box_is_ignored(self):
+        tracker = self._tracker(1.0)
+        before = tracker.current_to_reference.copy()
+        # Fisheye boxes near the rim map to inflated quadrilaterals; that must
+        # not be read as the machine suddenly shrinking.
+        inflated = (0, 0, 1280, 1440)
+        self.assertFalse(tracker.reanchor(inflated))
+        np.testing.assert_allclose(tracker.current_to_reference, before)
+
+    def test_front_back_motion_is_reported_by_the_correction(self):
+        tracker = self._tracker(1.0)
+        # Twice the reference box means the machine is twice as close as when
+        # it was locked, so the transform has to shrink the plane back down.
+        self.assertTrue(tracker.reanchor((10, 140, 290, 560)))
+        self.assertLess(float(tracker.current_to_reference[0, 0]), 1.0)

@@ -1195,6 +1195,9 @@ class PlaneLockTracker:
         self.frames_since_refresh = 0
         # Last accepted machine quad, used to reject wild homographies.
         self.current_quad: np.ndarray | None = None
+        # Drift correction measured from fresh detector boxes: recent sizes
+        # for the median filter, and the correction still being paid out.
+        self.correction_history: list[float] = []
 
     @property
     def locked(self) -> bool:
@@ -1209,6 +1212,76 @@ class PlaneLockTracker:
             return None
         matrix = self.reference_to_output @ self.current_to_reference
         return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
+
+    def reanchor(
+        self,
+        box: tuple[int, int, int, int] | None,
+        outer_box: tuple[int, int, int, int] | None = None,
+        history: int = 3,
+        deadband: float = 0.04,
+        max_step: float = 0.06,
+    ) -> bool:
+        """Cancel accumulated drift against a fresh detector box.
+
+        ``current_to_reference`` is composed frame by frame, so a fraction of
+        a percent of scale error per frame compounds: on real footage the
+        machine drifted to 1.57x its reference size and stayed there after
+        the operator moved back out. The detector box measures the machine in
+        absolute terms, so projecting it through the accumulated transform
+        says exactly how much larger or smaller that transform is than it
+        should be.
+
+        Two guards keep the anchor from becoming a jitter source. A box close
+        to the fisheye rim maps to an inflated quadrilateral, so the last few
+        correction readings are median-filtered; and a single reading only
+        moves the transform by ``max_step``, so drift is removed over a few
+        detections instead of in one visible jump.
+        """
+        if not self.locked or box is None or self.reference_box is None:
+            return False
+        reference = _box_points(self.reference_box)
+        current = _box_points(box)
+        if reference is None or current is None:
+            return False
+        mapped = _project_points(np.asarray(current, dtype=np.float32), self.current_to_reference)
+        if mapped is None or len(mapped) != 4 or not np.isfinite(mapped).all():
+            return False
+        mapped = np.asarray(mapped, dtype=np.float64).reshape(4, 2)
+        reference = np.asarray(reference, dtype=np.float64).reshape(4, 2)
+        mapped_area = abs(float(cv2.contourArea(mapped.astype(np.float32))))
+        reference_area = abs(float(cv2.contourArea(reference.astype(np.float32))))
+        if mapped_area < 64.0 or reference_area < 64.0:
+            return False
+        measured = math.sqrt(reference_area / mapped_area)
+        if not 0.55 <= measured <= 1.8:
+            return False
+        self.correction_history.append(measured)
+        if len(self.correction_history) > max(1, int(history)):
+            del self.correction_history[0]
+        scale = float(np.median(self.correction_history))
+        if abs(scale - 1.0) < deadband:
+            return False
+        scale = float(np.clip(scale, 1.0 - max_step, 1.0 + max_step))
+        mapped_center = mapped.mean(axis=0)
+        reference_center = reference.mean(axis=0)
+        shift = reference_center - scale * mapped_center
+        diagonal = max(float(np.linalg.norm(reference[2] - reference[0])), 8.0)
+        limit = max_step * diagonal
+        shift = np.clip(shift, -limit, limit)
+        correction = np.array([
+            [scale, 0.0, shift[0]],
+            [0.0, scale, shift[1]],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        candidate = correction @ self.current_to_reference.astype(np.float64)
+        if not np.isfinite(candidate).all() or abs(candidate[2, 2]) < 1e-9:
+            return False
+        self.current_to_reference = (candidate / candidate[2, 2]).astype(np.float32)
+        projected = _project_points(_box_points(self.reference_box), self.current_to_reference)
+        if projected is not None:
+            self.current_quad = np.asarray(projected, dtype=np.float32).reshape(4, 2)
+        return True
+
 
     def reacquire_if_stale(
         self,
@@ -1348,6 +1421,9 @@ class PlaneLockTracker:
         self.last_success = True
         self.frame_shape = gray.shape[:2]
         self.frames_since_refresh = 0
+        # A new reference throws away any drift correction measured against
+        # the old one; the detector box just re-anchored the target anyway.
+        self.correction_history = []
         return True
 
     @staticmethod
@@ -1792,6 +1868,8 @@ def process(args: argparse.Namespace) -> Path:
                     height,
                     getattr(args, "lock_fill", 0.71),
                 )
+                if fresh_inner_detection and plane_tracker.locked and detected_inner is not None:
+                    plane_tracker.reanchor(detected_inner, detected_outer)
                 plane_reacquired = plane_tracker.reacquire_if_stale(
                     current_gray,
                     inner,

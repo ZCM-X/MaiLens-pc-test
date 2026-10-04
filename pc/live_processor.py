@@ -162,6 +162,8 @@ class LiveProcessor:
 
         detector_ran = False
         fresh_inner_detection = False
+        fresh_inner_box = None
+        fresh_outer_box = None
         if self.detector.enabled and self.frame_index % self.detect_every == 0:
             detector_ran = True
             # The model was trained on the raw clip-on-lens geometry. Detect
@@ -191,6 +193,9 @@ class LiveProcessor:
                 and self.lock_tracker.outer_age_frames == 0
                 and self.lock_tracker.inner_age_frames == 0
             )
+            if fresh_inner_detection:
+                fresh_inner_box = detected_inner
+                fresh_outer_box = detected_outer
 
         if not self.detector.enabled:
             self.lock_tracker.reset()
@@ -205,6 +210,10 @@ class LiveProcessor:
             height,
             self.lock_fill,
         )
+        if fresh_inner_detection and self.plane_tracker.locked and fresh_inner_box is not None:
+            # The flow transform is accumulated frame by frame and drifts;
+            # this absolute anchor ties it back to the detected machine.
+            self.plane_tracker.reanchor(fresh_inner_box, fresh_outer_box)
         plane_reacquired = self.plane_tracker.reacquire_if_stale(
             current_gray,
             inner,
