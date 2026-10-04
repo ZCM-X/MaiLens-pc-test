@@ -253,7 +253,7 @@ sessions/20261001-153012
 
 处理器默认载入当前 MaiLens 的鱼眼参数（中心 `0.501753869, 0.499423644`、`k1=0.0893163`、`k2=-0.0174637`、输出视场角 `106.4583°`），所以电脑生成的结果会先做鱼眼反变换，再做姿态稳定。参数可以直接用 `--center-x`、`--center-y`、`--k1`、`--k2` 和 `--fov` 覆盖。
 
-如果要让实时模式同时做机台外框/内屏锁定，直接使用仓库内的 ONNX 模型。实时接收端和标注工具预标注默认都使用 v4；它们在 App 中处理的是手机送来的原始鱼眼帧，普通照片上看起来正确的框不代表鱼眼帧也能识别。电脑端优先用 OpenCV DNN 推理，不需要安装 PyTorch：
+如果要让实时模式同时做机台外框/内屏锁定，直接使用仓库内的 ONNX 模型。实时接收端默认使用 v5（`--model` 可回退到 v4）；标注工具预标注没有默认模型，要显式传 `--model`；它们在 App 中处理的是手机送来的原始鱼眼帧，普通照片上看起来正确的框不代表鱼眼帧也能识别。电脑端优先用 OpenCV DNN 推理，不需要安装 PyTorch：
 
 ```powershell
 .\.venv\Scripts\python.exe pc\pc_receiver.py --port 8765 `
@@ -367,9 +367,7 @@ iPhone 的 `.HEIC/.HEIF` 照片也可以直接读取。照片目录建议每张�
   --name geometry-live-phone-v5 --disable-amp --export onnx
 ```
 
-如果要把模型用在离线处理上：
-
-如果要把模型用在离线处理上（下面都用新模型 v4）：
+如果要把模型用在离线处理上（下面都用 v5）：
 
 ```powershell
 .\.venv\Scripts\python.exe pc\process_session.py sessions\20261001-153012 `
