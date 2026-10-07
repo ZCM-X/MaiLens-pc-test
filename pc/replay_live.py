@@ -351,6 +351,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detect-every", type=int, default=12,
                         help="模型每隔多少帧检测一次，默认 12")
     parser.add_argument("--lock-fill", type=float, default=0.71)
+    parser.add_argument("--plane-smooth", type=float, default=0.35,
+                        help="锁定四角的时间平滑系数，默认 0.35；越大画面越静，跟随越迟")
+    parser.add_argument("--correction-gain", type=float, default=0.15,
+                        help="每帧付清多少测量到的锚点修正，默认 0.15")
+    parser.add_argument("--ring-round", action=argparse.BooleanOptionalAction, default=True,
+                        help="把八个按键槽拉回同一个圆，使外键与内屏的四条边距相等（默认开）")
+    parser.add_argument("--ring-gain", type=float, default=1.8,
+                        help="等距修正强度，默认 1.8；1.0 只消掉约一半误差")
+    parser.add_argument("--ring-order", type=int, default=3,
+                        help="按键圈半径的方向谐波阶数，默认 3")
+    parser.add_argument("--ring-ratio", type=float, default=0.0,
+                        help="按键中心半径 / 内屏半径的绝对目标；默认 0 = 只把八个槽拉成同一个圆，"
+                             "保持锁定已经选定的大小")
+    parser.add_argument("--ring-blend", type=float, default=0.35,
+                        help="按键圈形状的逐帧平滑系数，默认 0.35")
     parser.add_argument("--lock-shift", type=float, default=0.30,
                         help="机台锁定能拖动的最大位移（短边比例）；超出后画面跟随手机")
     parser.add_argument("--lock-min-zoom", type=float, default=0.62,
@@ -411,6 +426,13 @@ def main() -> None:
             model=model,
             detect_every=args.detect_every,
             lock_fill=args.lock_fill,
+            plane_smooth=args.plane_smooth,
+            correction_gain=args.correction_gain,
+            ring_round=args.ring_round,
+            ring_gain=args.ring_gain,
+            ring_order=args.ring_order,
+            ring_ratio=args.ring_ratio,
+            ring_blend=args.ring_blend,
             debug=args.debug,
             lock_authority=AuthorityLimits(
                 max_shift=args.lock_shift,

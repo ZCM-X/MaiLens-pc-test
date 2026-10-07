@@ -601,6 +601,29 @@ def _project_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray | None
     return projected
 
 
+def _quad_area(points: np.ndarray) -> float:
+    """Shoelace area of a projected quad."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    x, y = points[:, 0], points[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _quad_folded(points: np.ndarray) -> bool:
+    """True when a quad has turned inside out.
+
+    Perspective motion can slide, squash and rotate a plane, but it can never
+    pull one corner past its neighbour.  A folded quad is therefore not a
+    viewpoint of the machine; it is a lost lock wearing a transform.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(4, 2)
+    cross = []
+    for index in range(4):
+        first = points[(index + 1) % 4] - points[index]
+        second = points[(index + 2) % 4] - points[(index + 1) % 4]
+        cross.append(float(first[0] * second[1] - first[1] * second[0]))
+    return not (all(value > 0 for value in cross) or all(value < 0 for value in cross))
+
+
 def transform_box_homography(
     box: tuple[int, int, int, int] | None,
     matrix: np.ndarray,
@@ -1292,6 +1315,16 @@ class PlaneLockTracker:
     move together into one fixed, front-facing target.
     """
 
+    #: How far the composed transform may move the machine off its locked
+    #: size before the lock is treated as lost rather than as a viewpoint.
+    #: The band is deliberately wider than the authority's own zoom budget
+    #: (1.75): ordinary walking in and out stays well inside it, while the
+    #: failure it exists for moved the machine's box ~4x across one frame.
+    PLAUSIBLE_SCALE = (0.45, 2.20)
+    #: The same idea for the residual the lens cannot take out, which is what
+    #: :meth:`lock_travel` reports.
+    PLAUSIBLE_ZOOM = (0.38, 2.60)
+
     def __init__(
         self,
         detect_every: int = 12,
@@ -1299,6 +1332,8 @@ class PlaneLockTracker:
         feature_region: str = "combined",
         motion_model: str = "homography",
         correction_gain: float = 0.35,
+        plausible_scale: tuple[float, float] | None = None,
+        plausible_zoom: tuple[float, float] | None = None,
     ):
         self.detect_every = max(1, int(detect_every))
         #: Fraction of a measured anchor correction paid out per frame.  The
@@ -1314,7 +1349,14 @@ class PlaneLockTracker:
         # screen; it is used by DualPlaneLockTracker for the raised buttons.
         self.feature_region = str(feature_region)
         self.motion_model = "similarity" if str(motion_model).lower() == "similarity" else "homography"
+        self.plausible_scale = tuple(plausible_scale or self.PLAUSIBLE_SCALE)
+        self.plausible_zoom = tuple(plausible_zoom or self.PLAUSIBLE_ZOOM)
+        #: Composed transforms refused as lost locks.  Survives ``reset`` so
+        #: the count describes the take, not the current lock.
+        self.rejections = 0
+        self.travel_rejections = 0
         self.reset()
+        self.lock_reason = "searching"
 
     def reset(self) -> None:
         self.reference_gray: np.ndarray | None = None
@@ -1341,6 +1383,8 @@ class PlaneLockTracker:
         # detector box never moves the plane in one frame.
         self.correction = np.eye(3, dtype=np.float32)
         self.correction_target = np.eye(3, dtype=np.float32)
+        #: Why the last delivered transform was accepted or refused.
+        self.lock_reason = "searching"
 
     @property
     def locked(self) -> bool:
@@ -1354,7 +1398,60 @@ class PlaneLockTracker:
         if not self.locked or self.age_frames > max(3, self.detect_every // 2):
             return None
         matrix = self.reference_to_output @ self.correction @ self.current_to_reference
-        return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
+        if not np.isfinite(matrix).all():
+            self._reject_lock("nonfinite")
+            return None
+        if not self._plausible(matrix):
+            self._reject_lock("implausible")
+            return None
+        self.lock_reason = "ok"
+        return matrix.astype(np.float32)
+
+    def _plausible(self, matrix: np.ndarray) -> bool:
+        """Does the composed transform still describe a viewpoint of the plane?
+
+        ``current_to_reference`` is composed one frame at a time, so a single
+        bad optical-flow estimate is absorbed rather than rejected and the
+        product then walks somewhere no lens could go: on a recorded take the
+        determinant swung from 4.7 to 0.0008 and the machine's box grew
+        eight-fold while the tracker still reported full inliers.  Nine
+        delivered frames tore themselves apart before either number recovered.
+        The check is on the composed product because that product, not the
+        frame-to-frame estimate, is what the operator sees.
+        """
+        if self.reference_box is None or self.reference_to_output is None:
+            return False
+        reference = _box_points(self.reference_box)
+        if reference is None:
+            return False
+        mapped = _project_points(reference, matrix)
+        target = _project_points(reference, self.reference_to_output)
+        if mapped is None or target is None:
+            return False
+        mapped_area = _quad_area(mapped)
+        target_area = _quad_area(target)
+        if min(mapped_area, target_area) < 1.0:
+            return False
+        low, high = self.plausible_scale
+        if not low <= math.sqrt(mapped_area / target_area) <= high:
+            return False
+        # A mirror keeps the area and can still be convex, so neither the size
+        # band nor the fold test sees it; the sign of the determinant does.
+        if float(np.linalg.det(matrix)) * float(np.linalg.det(self.reference_to_output)) <= 0.0:
+            return False
+        return not (_quad_folded(mapped) or _quad_folded(target))
+
+    def _reject_lock(self, reason: str) -> None:
+        """Drop a lock whose transform stopped describing a viewpoint.
+
+        Freezing the last good plane is wrong here: the accumulated transform
+        is the broken part, so every later frame would inherit it.  Releasing
+        the lock hands the picture back to the detector fallback until a fresh
+        box re-anchors it, which is what ``reacquire_if_stale`` waits for.
+        """
+        self.rejections += 1
+        self.reset()
+        self.lock_reason = reason
 
     def lock_travel(self, width: int, height: int) -> dict | None:
         """How much picture the lock is dragging around to hold the machine.
@@ -1400,9 +1497,17 @@ class PlaneLockTracker:
             return None
         current_area, mapped_area, reference_area, target_area = areas
         centre = current_points.mean(axis=0)
+        shift = mapped_points.mean(axis=0) - centre
+        zoom = float(np.sqrt(current_area / mapped_area))
+        zoom_low, zoom_high = self.plausible_zoom
+        if not np.isfinite(shift).all() or not zoom_low <= zoom <= zoom_high:
+            # The residual budget decides between holding and following, so a
+            # reading no lens could have produced must not spend it.
+            self.travel_rejections += 1
+            return None
         return {
-            "shift": mapped_points.mean(axis=0) - centre,
-            "zoom": float(np.sqrt(current_area / mapped_area)),
+            "shift": shift,
+            "zoom": zoom,
             "output_scale": float(np.sqrt(target_area / reference_area)),
             "target_centre": target_points.mean(axis=0),
         }

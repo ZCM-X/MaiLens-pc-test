@@ -92,6 +92,77 @@ def slot_ratios(centre, radius: float, points, tolerance: float = 22.5,
     return out
 
 
+#: The button tiles are the only large purple patches in a delivered frame.
+PURPLE_LOW = np.array([120, 60, 60], dtype=np.uint8)
+PURPLE_HIGH = np.array([170, 255, 255], dtype=np.uint8)
+
+
+def purple_points(image: np.ndarray) -> np.ndarray:
+    """Centroids of the button-sized purple blobs in a delivered frame.
+
+    This lives here rather than in the measuring tool because the live path
+    has to find the same eight points on the same pixels; a second copy would
+    be free to drift away from the one the acceptance test uses.
+    """
+    import cv2
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, PURPLE_LOW, PURPLE_HIGH)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    min_area = image.shape[0] * image.shape[1] * 2e-4
+    return np.array([centroids[i] for i in range(1, count)
+                     if stats[i, cv2.CC_STAT_AREA] >= min_area], dtype=np.float64)
+
+
+#: The cyan play field.  The same pixels ``pc/machine_lock.py`` calls the
+#: screen, and the same ones the trained detector boxes, so a radius taken from
+#: here is already in the space ``tools/check_margins.py`` measures in.
+SCREEN_LOW = np.array([70, 60, 40], dtype=np.uint8)
+SCREEN_HIGH = np.array([115, 255, 255], dtype=np.uint8)
+
+#: Blobs smaller than this fraction of the frame are artwork, not the screen.
+MIN_BLOB_FRACTION = 2e-4
+
+
+def screen_blob(image: np.ndarray, low=SCREEN_LOW, high=SCREEN_HIGH):
+    """Centre, mean half-size and box of the cyan play field, or None.
+
+    A blob that reaches the frame border is two regions that merged -- the
+    field plus a lit panel, or the field running off the picture -- and its box
+    would drag both the centre and the radius with it, so it is refused rather
+    than smoothed.
+    """
+    import cv2
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, low, high)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    height, width = image.shape[:2]
+    floor = height * width * MIN_BLOB_FRACTION
+    best = None
+    for index in range(1, count):
+        area = stats[index, cv2.CC_STAT_AREA]
+        if area < floor:
+            continue
+        if best is None or area > stats[best, cv2.CC_STAT_AREA]:
+            best = index
+    if best is None:
+        return None
+    x = int(stats[best, cv2.CC_STAT_LEFT])
+    y = int(stats[best, cv2.CC_STAT_TOP])
+    w = int(stats[best, cv2.CC_STAT_WIDTH])
+    h = int(stats[best, cv2.CC_STAT_HEIGHT])
+    if x <= 0 or y <= 0 or x + w >= width or y + h >= height:
+        return None
+    return (np.asarray(centroids[best], dtype=np.float64),
+            0.25 * float(w + h),
+            (x, y, x + w, y + h))
+
+
 def _basis(angles: np.ndarray, order: int) -> np.ndarray:
     """Constant, then cos/sin of every harmonic up to ``order``."""
     columns = [np.ones_like(angles)]

@@ -689,3 +689,78 @@ class PlaneDriftAnchorTests(unittest.TestCase):
         np.testing.assert_allclose(tracker.current_to_reference, np.eye(3), atol=1e-6)
 
 
+
+class PlaneLockGuardTest(unittest.TestCase):
+    """The composed transform has to keep describing a viewpoint.
+
+    On a recorded take the accumulated transform walked to a determinant of
+    0.0008 and a machine eight times its locked size while the tracker still
+    reported full inliers, and the delivered picture tore itself apart for
+    nine frames.  These pin the refusal and, just as important, that ordinary
+    walking in and out is not refused.
+    """
+
+    WIDTH, HEIGHT = 320, 240
+
+    def _tracker(self) -> PlaneLockTracker:
+        frame = np.zeros((self.HEIGHT, self.WIDTH), dtype=np.uint8)
+        cv2.rectangle(frame, (60, 40), (260, 200), 180, 3)
+        for y in range(45, 200, 10):
+            for x in range(65, 260, 10):
+                cv2.circle(frame, (x, y), 1, 120 + (x * y) % 100, -1)
+        tracker = PlaneLockTracker(detect_every=12)
+        self.assertTrue(tracker.initialize(frame, (60, 40, 260, 200),
+                                           (45, 25, 275, 215),
+                                           self.WIDTH, self.HEIGHT, 0.64))
+        return tracker
+
+    @staticmethod
+    def _scale(factor: float) -> np.ndarray:
+        return np.array([[factor, 0.0, 0.0], [0.0, factor, 0.0], [0.0, 0.0, 1.0]],
+                        dtype=np.float32)
+
+    def test_a_walk_to_the_zoom_budget_is_still_a_viewpoint(self):
+        tracker = self._tracker()
+        tracker.current_to_reference = self._scale(1.0 / 1.6)
+        self.assertIsNotNone(tracker.output_homography)
+        self.assertEqual(tracker.rejections, 0)
+        self.assertEqual(tracker.lock_reason, "ok")
+
+    def test_a_transform_that_shrank_the_machine_is_refused(self):
+        tracker = self._tracker()
+        tracker.current_to_reference = self._scale(8.0)
+        self.assertIsNone(tracker.output_homography)
+        self.assertEqual(tracker.lock_reason, "implausible")
+        self.assertEqual(tracker.rejections, 1)
+        # Holding the broken plane would only delay the fault; the lock has to
+        # be released so a fresh detector box can re-anchor it.
+        self.assertFalse(tracker.locked)
+
+    def test_a_mirrored_transform_is_refused(self):
+        tracker = self._tracker()
+        tracker.current_to_reference = np.array(
+            [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.assertIsNone(tracker.output_homography)
+        self.assertEqual(tracker.lock_reason, "implausible")
+
+    def test_a_nonfinite_transform_is_refused(self):
+        tracker = self._tracker()
+        tracker.current_to_reference = np.array(
+            [[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.assertIsNone(tracker.output_homography)
+        self.assertEqual(tracker.lock_reason, "nonfinite")
+
+    def test_a_travel_reading_no_lens_could_produce_is_dropped(self):
+        tracker = self._tracker()
+        tracker.current_box = (60, 40, 260, 200)
+        self.assertIsNotNone(tracker.lock_travel(self.WIDTH, self.HEIGHT))
+        # A residual no lens could have produced: the correction would be
+        # reading the machine as eight times smaller than it placed it, and
+        # that reading is what spends the travel budget.
+        tracker.correction = self._scale(8.0)
+        self.assertIsNone(tracker.lock_travel(self.WIDTH, self.HEIGHT))
+        self.assertEqual(tracker.travel_rejections, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

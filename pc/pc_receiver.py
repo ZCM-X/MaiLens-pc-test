@@ -16,10 +16,12 @@ import numpy as np
 try:
     from .protocol import TYPE_FRAME, TYPE_HELLO, recv_packet
     from .live_processor import LiveProcessor
+    from .mp4_retime import retime_video
     from .shot_authority import AuthorityLimits
 except ImportError:  # Running as `python pc/pc_receiver.py` from the repo root.
     from protocol import TYPE_FRAME, TYPE_HELLO, recv_packet
     from live_processor import LiveProcessor
+    from mp4_retime import retime_video
     from shot_authority import AuthorityLimits
 
 
@@ -68,6 +70,11 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             full_warp=not bool(getattr(args, "plane_patch", False)),
             plane_smooth=getattr(args, "plane_smooth", 0.35),
             correction_gain=getattr(args, "correction_gain", 0.15),
+            ring_round=bool(getattr(args, "ring_round", True)),
+            ring_gain=getattr(args, "ring_gain", 1.8),
+            ring_order=getattr(args, "ring_order", 3),
+            ring_ratio=getattr(args, "ring_ratio", 0.0),
+            ring_blend=getattr(args, "ring_blend", 0.35),
             debug=args.debug,
             lock_authority=AuthorityLimits(
                 max_shift=getattr(args, "lock_shift", 0.30),
@@ -201,11 +208,27 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             processed_writer.release()
         if args.preview:
             cv2.destroyAllWindows()
+        # The writers stamped every frame with the nominal rate, but the phone
+        # sends at whatever the link and the encoder allow.  Patch the two
+        # recordings to the rate the frames really arrived at, before anyone
+        # opens them and mistakes the speed change for stutter.
+        timing = {}
+        for name in ("raw.mp4", "processed-live.mp4"):
+            target = session / name
+            if target.exists() and target.stat().st_size:
+                timing[name] = retime_video(target, session / "capture.jsonl", args.fps)
+                detail = timing[name]
+                if detail.get("status") == "retimed":
+                    print(f"{name} 已按实测 {detail['measured_fps']:.2f} fps 重定时"
+                          f"（{detail['duration_seconds']:.2f} 秒）")
+                elif detail.get("status") == "failed":
+                    print(f"{name} 重定时失败：{detail.get('error')}")
         # Also written here, so a session stopped with Ctrl+C still carries the
         # manifest the offline processor reads its nominal frame rate from.
         manifest = {
             "frame_count": frame_count,
             "nominal_fps": args.fps,
+            "measured_fps": (timing.get("raw.mp4") or {}).get("measured_fps"),
             "video": "raw.mp4",
             "metadata": "capture.jsonl",
             "live_processed_video": "processed-live.mp4" if live_processor is not None else None,
@@ -226,8 +249,9 @@ def main() -> None:
     parser.add_argument("--preview", action="store_true", help="显示接收画面，按 q 结束")
     parser.add_argument("--process-live", action="store_true",
                         help="收到每帧后立即做鱼眼矫正和姿态稳定，并实时预览/保存")
-    parser.add_argument("--processing-scale", type=float, default=0.5,
-                        help="实时鱼眼处理比例，默认 0.5 以接近 60 fps；原始帧仍保存全分辨率")
+    parser.add_argument("--processing-scale", type=float, default=1.0,
+                        help="实时鱼眼处理比例，默认 1.0（全分辨率）。全分辨率实测约 59 fps；"
+                             "机器吃力时再降到 0.75/0.5，原始帧始终按全分辨率保存")
     parser.add_argument("--model", type=Path, help="可选外框/内屏模型；与 --process-live 一起使用")
     parser.add_argument("--machine-lock", action="store_true",
                         help="启用机台检测居中；默认使用 models/frame-geometry-yolo11n-v5.onnx")
@@ -256,6 +280,17 @@ def main() -> None:
     parser.add_argument("--center-y", type=float, default=0.499423644)
     parser.add_argument("--k1", type=float, default=0.0893163)
     parser.add_argument("--k2", type=float, default=-0.0174637)
+    parser.add_argument("--ring-round", action=argparse.BooleanOptionalAction, default=True,
+                        help="把八个按键槽拉回同一个圆，使外键与内屏的四条边距相等（默认开）")
+    parser.add_argument("--ring-gain", type=float, default=1.8,
+                        help="等距修正强度，默认 1.8；1.0 只消掉约一半误差")
+    parser.add_argument("--ring-order", type=int, default=3,
+                        help="按键圈半径的方向谐波阶数，默认 3")
+    parser.add_argument("--ring-ratio", type=float, default=0.0,
+                        help="按键中心半径 / 内屏半径的绝对目标；默认 0 = 只把八个槽拉成同一个圆，"
+                             "保持锁定已经选定的大小")
+    parser.add_argument("--ring-blend", type=float, default=0.35,
+                        help="按键圈形状的逐帧平滑系数，默认 0.35")
     parser.add_argument("--detect-every", type=int, default=12,
                         help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪。修正量按 --correction-gain 摊到各帧")
     args = parser.parse_args()

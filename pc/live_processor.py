@@ -35,6 +35,7 @@ try:
         lens_remap,
         rotation_homography,
     )
+    from . import canonical
     from .shot_authority import AuthorityGovernor, AuthorityLimits
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
@@ -63,7 +64,15 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         lens_remap,
         rotation_homography,
     )
+    import canonical
     from shot_authority import AuthorityGovernor, AuthorityLimits
+
+
+def screen_circle(box) -> tuple[np.ndarray, float]:
+    """Centre and mean half-size of a screen box, in the frame it arrives in."""
+    x0, y0, x1, y1 = (float(value) for value in box)
+    return (np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5], dtype=np.float64),
+            0.25 * ((x1 - x0) + (y1 - y0)))
 
 
 class LiveProcessor:
@@ -87,6 +96,13 @@ class LiveProcessor:
         full_warp: bool = True,
         plane_smooth: float = 0.35,
         correction_gain: float = 0.15,
+        ring_round: bool = True,
+        ring_gain: float = 1.8,
+        ring_order: int = 3,
+        ring_ratio: float = 0.0,
+        ring_coarse: int = 8,
+        ring_blend: float = 0.35,
+        ring_hold: int = 12,
     ) -> None:
         self.crop = crop
         self.fov = fov
@@ -121,6 +137,32 @@ class LiveProcessor:
         self.previous_zoom = 1.0
         self.reference_target_size: float | None = None
         self.reference_zoom: float | None = None
+        # The plane lock puts the machine in the middle at the size it was
+        # locked at, but it cannot know the screen and the raised buttons are
+        # at different depths.  ``pull_back_maps`` walks the eight button slots
+        # onto one circle around the delivered screen, so the four side gaps
+        # come out equal; that is the correction ``docs/margin-spec.md``
+        # measures.  It runs on the delivered frame, using the delivered
+        # screen box for the radius, because a radius from any other space
+        # scales the ramp and turns the pull into a global zoom.
+        self.ring_round = bool(ring_round)
+        self.ring_gain = float(min(max(ring_gain, 0.0), 4.0))
+        self.ring_order = max(1, int(ring_order))
+        #: Absolute radius ratio to target, or 0 to even the ring out around
+        #: the mean it already has.  The lock, not this correction, owns the
+        #: size; this one owns the equality of the four gaps.
+        self.ring_ratio = float(ring_ratio)
+        self.ring_blend = float(min(max(ring_blend, 0.05), 1.0))
+        self.ring_hold = max(0, int(ring_hold))
+        self.ring_coarse = max(1, int(ring_coarse))
+        self.ring_coefficients: np.ndarray | None = None
+        self.ring_centre = np.array([0.5, 0.5], dtype=np.float64)
+        self.ring_screen: tuple[np.ndarray, float] | None = None
+        self.ring_radius = 0.0
+        self.ring_missing = 0
+        self.ring_margins = 0.0
+        self.lock_zoom_ratio = 1.0
+        self.lock_reason = "none"
         self.lock_tracker = GeometryLockTracker(self.detect_every)
         self.plane_tracker = PlaneLockTracker(
             self.detect_every,
@@ -142,6 +184,96 @@ class LiveProcessor:
         self.lock_mode = "none"
         self.lock_travel = 0.0
         self.lock_limit = 0.0
+
+    #: Radius band around the median that decides which purple blobs are the
+    #: button ring.  Loose enough that a lit or partly hidden button still
+    #: counts, tight enough to drop the artwork fragments floating around it.
+    RING_BAND = 0.25
+
+    def _measure_ring(self, frame: np.ndarray, screen_box):
+        """Ring centre, radius scale and shape coefficients for one frame.
+
+        The radius only sets the band that selects ring blobs and the point
+        where the correction ramp starts, so the screen box the lock placed is
+        good enough for both.  The *centre* is not: on a delivered frame that
+        box sits 20-30 px off the button ring, and at a ring radius of ~300 px
+        that offset alone reads as 8-10% of spread -- the same size as the
+        defect being corrected.  The ring is therefore centred on its own
+        blobs, and its shape is described relative to the mean radius it
+        already has, so no radius borrowed from another space can turn the
+        pull into a global zoom.
+        """
+        blob = canonical.screen_blob(frame)
+        if blob is not None:
+            centre0, radius = blob[0], blob[1]
+            if self.ring_screen is not None:
+                last_centre, last_radius = self.ring_screen
+                if not 0.6 * last_radius <= radius <= 1.7 * last_radius:
+                    blob = None
+                else:
+                    centre0 = 0.5 * (centre0 + last_centre)
+                    radius = 0.5 * (radius + last_radius)
+            if blob is not None:
+                self.ring_screen = (centre0, radius)
+        if blob is None:
+            # No clean play field on this frame: fall back to the box the lock
+            # placed, which at least keeps the ramp in delivered pixels.
+            centre0, radius = screen_circle(screen_box)
+        if not np.isfinite(radius) or radius <= 5.0:
+            return None
+        points = canonical.purple_points(frame)
+        if points.shape[0] < 4:
+            return None
+        span = np.hypot(points[:, 0] - centre0[0], points[:, 1] - centre0[1]) / radius
+        rough = float(np.median(span))
+        if rough <= 0.0:
+            return None
+        ring = points[np.abs(span - rough) <= self.RING_BAND * rough]
+        if ring.shape[0] < 4:
+            return None
+        centre = centre0 if blob is not None else ring.mean(axis=0)
+        ratios = canonical.slot_ratios(centre, radius, ring)
+        fitted = canonical.ring_profile(ratios, self.ring_order)
+        if fitted is None or not np.isfinite(fitted).all() or fitted[0] <= 0.0:
+            return None
+        return centre, float(radius), fitted, canonical.ring_error(ratios)
+
+    def _pull_margins_back(self, frame: np.ndarray, screen_box):
+        """Even out the four side gaps on the delivered frame.
+
+        A button is a finite patch, so the ramp moves its near half further
+        than its far half and the blob centroid follows only part of the way;
+        that is why the same correction is worth running above unity gain.  The
+        knob that matters is ``ring_gain``, and the shape it targets is the
+        mean radius the ring already has, which keeps the size the lock chose.
+        """
+        if not self.ring_round:
+            return frame
+        measured = self._measure_ring(frame, screen_box)
+        if measured is None:
+            self.ring_missing += 1
+        else:
+            centre, radius, fitted, spread = measured
+            self.ring_centre = centre
+            self.ring_radius = radius
+            if self.ring_coefficients is None:
+                self.ring_coefficients = fitted
+            else:
+                self.ring_coefficients = ((1.0 - self.ring_blend) * self.ring_coefficients
+                                          + self.ring_blend * fitted)
+            self.ring_missing = 0
+            self.ring_margins = spread or 0.0
+        if self.ring_coefficients is None or self.ring_missing > self.ring_hold:
+            return frame
+        target = float(self.ring_ratio) if self.ring_ratio > 0.0 else float(self.ring_coefficients[0])
+        if target <= 0.0:
+            return frame
+        maps = canonical.pull_back_maps(
+            frame.shape[1], frame.shape[0], self.ring_centre, self.ring_radius,
+            self.ring_coefficients, strength=self.ring_gain,
+            order=self.ring_order, target=target, coarse=self.ring_coarse,
+        )
+        return canonical.apply(frame, maps)
 
     def process(self, frame: np.ndarray, metadata: dict) -> tuple[np.ndarray, dict]:
         height, width = frame.shape[:2]
@@ -360,6 +492,8 @@ class LiveProcessor:
             self.lock_mode = decision.mode
             self.lock_travel = decision.travelled
             self.lock_limit = decision.limit
+            self.lock_zoom_ratio = decision.zoom_ratio
+            self.lock_reason = decision.reason
             stabilized = apply_plane_lock(
                 stabilized, plane_matrix, fixed_inner, full_warp=self.full_warp,
             )
@@ -377,6 +511,8 @@ class LiveProcessor:
             stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
             outer = transform_box(outer, geometry_matrix)
             inner = transform_box(inner, geometry_matrix)
+        if self.ring_round and plane_matrix is not None and inner is not None:
+            stabilized = self._pull_margins_back(stabilized, inner)
         self.previous_gray = current_gray
         self.frame_index += 1
 
@@ -396,6 +532,10 @@ class LiveProcessor:
             "lock_mode": self.lock_mode,
             "lock_travel_px": round(float(self.lock_travel), 2),
             "lock_travel_limit_px": round(float(self.lock_limit), 2),
+            "lock_zoom_ratio": round(float(self.lock_zoom_ratio), 4),
+            "lock_reason": self.lock_reason,
+            "ring_round": self.ring_round,
+            "ring_margin_spread": round(float(self.ring_margins), 4),
             "plane_matrix": (
                 np.asarray(plane_matrix, dtype=np.float64).reshape(-1).round(6).tolist()
                 if plane_matrix is not None else None
