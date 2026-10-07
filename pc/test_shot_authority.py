@@ -69,6 +69,68 @@ class AuthorityGovernorTests(unittest.TestCase):
         self.assertEqual(walked_back.mode, "follow")
         self.assertAlmostEqual(walked_back.residual_zoom, 0.5)
 
+    def test_the_limit_is_latched_so_the_boundary_cannot_chatter(self):
+        # The measured zoom of a hand-held lock swings across the limit every
+        # few frames.  Without a dead band and a smoothed leftover that reads
+        # as the picture breathing in and out.
+        limits = AuthorityLimits(min_zoom=0.62, max_zoom=1.75, hysteresis=0.15,
+                                 smooth_seconds=0.25)
+        governor = AuthorityGovernor(limits)
+        zooms = (1.90, 1.70, 1.90, 1.70, 1.80, 1.68, 1.92, 1.72) * 4
+        modes, residuals = [], []
+        for zoom in zooms:
+            decision = governor.decide(travel((0.0, 0.0), zoom=zoom), 320, 180, dt=1.0 / 30.0)
+            modes.append(decision.mode)
+            residuals.append(float(decision.residual_zoom))
+        self.assertEqual(set(modes), {"follow"})
+        steps = [abs(b - a) for a, b in zip(residuals, residuals[1:])]
+        self.assertLess(max(steps), 0.02)
+
+    def test_without_the_dead_band_the_same_input_flaps(self):
+        governor = AuthorityGovernor(
+            AuthorityLimits(min_zoom=0.62, max_zoom=1.75, hysteresis=0.0)
+        )
+        modes = [governor.decide(travel((0.0, 0.0), zoom=zoom), 320, 180).mode
+                 for zoom in (1.90, 1.70, 1.90, 1.70)]
+        self.assertEqual(modes, ["follow", "lock", "follow", "lock"])
+
+    def test_the_leftover_is_smoothed_instead_of_stepping(self):
+        limits = AuthorityLimits(max_shift=0.25, min_zoom=1.0, max_zoom=1.0,
+                                 smooth_seconds=0.25)
+        governor = AuthorityGovernor(limits)
+        first = governor.decide(travel((-60.0, 0.0)), 320, 180, dt=1.0 / 30.0)
+        # One frame is roughly an eighth of a 0.25 s time constant, so the
+        # leftover must arrive well short of its final 15 px.
+        self.assertEqual(first.mode, "follow")
+        self.assertLess(float(first.residual_shift[0]), 4.0)
+        previous = float(first.residual_shift[0])
+        for _ in range(60):
+            decision = governor.decide(travel((-60.0, 0.0)), 320, 180, dt=1.0 / 30.0)
+            current = float(decision.residual_shift[0])
+            self.assertLessEqual(abs(current - previous), 3.0)
+            previous = current
+        self.assertAlmostEqual(previous, 15.0, delta=0.5)
+
+    def test_the_leftover_decays_back_to_a_plain_lock(self):
+        limits = AuthorityLimits(max_shift=0.25, min_zoom=1.0, max_zoom=1.0,
+                                 smooth_seconds=0.2)
+        governor = AuthorityGovernor(limits)
+        for _ in range(40):
+            governor.decide(travel((-60.0, 0.0)), 320, 180, dt=1.0 / 30.0)
+        self.assertEqual(governor.last_mode, "follow")
+        last = None
+        for _ in range(120):
+            last = governor.decide(travel((-10.0, 0.0)), 320, 180, dt=1.0 / 30.0)
+        self.assertEqual(last.mode, "lock")
+        self.assertAlmostEqual(float(last.residual_shift[0]), 0.0, places=4)
+
+    def test_without_a_clock_the_decisions_stay_immediate(self):
+        # Callers that pass no dt (and every existing test) must keep the old
+        # "what fits is taken out this frame" behaviour.
+        governor = AuthorityGovernor(AuthorityLimits(max_shift=0.25, min_zoom=1.0, max_zoom=1.0))
+        decision = governor.decide(travel((-60.0, 0.0)), 320, 180)
+        self.assertAlmostEqual(float(decision.residual_shift[0]), 15.0, places=4)
+
     def test_an_unknown_travel_trusts_the_lock(self):
         governor = AuthorityGovernor()
         decision = governor.decide(None, 320, 180)

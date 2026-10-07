@@ -10,6 +10,7 @@ import numpy as np
 
 try:
     from .process_session import (
+        FrameClock,
         GeometryDetector,
         GeometryLockTracker,
         PlaneLockTracker,
@@ -34,6 +35,7 @@ try:
     from .shot_authority import AuthorityGovernor, AuthorityLimits
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
+        FrameClock,
         GeometryDetector,
         GeometryLockTracker,
         PlaneLockTracker,
@@ -115,6 +117,7 @@ class LiveProcessor:
         # Bounded lens travel: inside the range the machine is pinned, past it
         # the picture rides along with the phone again.  See shot_authority.
         self.authority = AuthorityGovernor(lock_authority)
+        self.clock = FrameClock()
         self.lock_mode = "none"
         self.lock_travel = 0.0
         self.lock_limit = 0.0
@@ -317,6 +320,7 @@ class LiveProcessor:
             # reaching for a machine that is no longer there.
             decision = self.authority.decide(
                 self.plane_tracker.lock_travel(width, height), width, height,
+                dt=self.clock.dt(metadata),
             )
             plane_matrix = decision.apply(plane_matrix)
             fixed_inner = decision.move_box(fixed_inner)

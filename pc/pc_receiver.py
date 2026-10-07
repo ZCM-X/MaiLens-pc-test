@@ -68,6 +68,8 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
                 max_shift=getattr(args, "lock_shift", 0.30),
                 min_zoom=getattr(args, "lock_min_zoom", 0.62),
                 max_zoom=getattr(args, "lock_max_zoom", 1.75),
+                hysteresis=getattr(args, "lock_hysteresis", 0.15),
+                smooth_seconds=getattr(args, "lock_smooth", 0.25),
             ),
         )
         print("实时处理：鱼眼矫正 + 姿态云台已开启" + (" + 机台检测" if args.model else ""))
@@ -233,6 +235,10 @@ def main() -> None:
                         help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
     parser.add_argument("--lock-max-zoom", type=float, default=1.75,
                         help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
+    parser.add_argument("--lock-hysteresis", type=float, default=0.15,
+                        help="回到锁定需要退出的余量（占行程比例），防止在限位上反复横跳")
+    parser.add_argument("--lock-smooth", type=float, default=0.25,
+                        help="跟随残差的时间常数（秒），平滑掉测量噪声")
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
     parser.add_argument("--center-x", type=float, default=0.501753869)

@@ -22,6 +22,7 @@ renderer and the iOS port share a single definition of the range.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,6 +42,14 @@ class AuthorityLimits:
     max_shift: float = 0.30
     min_zoom: float = 0.62
     max_zoom: float = 1.75
+    #: Dead band kept when the picture comes back in range, as a fraction of
+    #: the travel.  Without it a machine sitting on the limit flips between
+    #: lock and follow every few frames and the clamp reads as chatter.
+    hysteresis: float = 0.15
+    #: Seconds of smoothing on the leftover correction.  The measured zoom of
+    #: a hand-held fisheye lock wobbles several percent per frame; an
+    #: unsmoothed clamp turns that into the picture breathing.
+    smooth_seconds: float = 0.25
 
     def shift_limit(self, width: int, height: int) -> float:
         return max(float(self.max_shift), 0.0) * float(min(int(width), int(height)))
@@ -128,16 +137,44 @@ class AuthorityDecision:
 
 
 class AuthorityGovernor:
-    """Turn a lock measurement into the part of it the lens can honour."""
+    """Turn a lock measurement into the part of it the lens can honour.
+
+    The limit is latched and the leftover is smoothed, because an honest clamp
+    on a noisy measurement is its own jitter source.  Once the travel runs out
+    the lock stays in follow until the picture comes back comfortably inside
+    the range, so a machine parked on the boundary cannot flip modes every few
+    frames.  The leftover itself is low-passed, because the zoom a hand-held
+    fisheye lock reports swings by several percent from frame to frame.
+    """
 
     def __init__(self, limits: AuthorityLimits | None = None) -> None:
         self.limits = limits or AuthorityLimits()
         self.last_mode = "none"
+        self.engaged = False
+        self._shift_state = np.zeros(2, dtype=np.float64)
+        self._zoom_state = 1.0
 
-    def decide(self, travel: dict | None, width: int, height: int) -> AuthorityDecision:
+    def reset(self) -> None:
+        """Drop the latch and the smoothing, e.g. once the lock is lost."""
+        self.last_mode = "none"
+        self.engaged = False
+        self._shift_state = np.zeros(2, dtype=np.float64)
+        self._zoom_state = 1.0
+
+    def _alpha(self, dt: float | None) -> float:
+        tau = float(getattr(self.limits, "smooth_seconds", 0.0) or 0.0)
+        if dt is None or tau <= 0.0:
+            return 1.0
+        step = float(dt)
+        if not step > 0.0:
+            return 1.0
+        return float(1.0 - math.exp(-min(step, 1.0) / tau))
+
+    def decide(self, travel: dict | None, width: int, height: int,
+               dt: float | None = None) -> AuthorityDecision:
         limit = self.limits.shift_limit(width, height)
         if not travel:
-            self.last_mode = "lock"
+            self.reset()
             return AuthorityDecision(
                 mode="lock",
                 travelled=0.0,
@@ -149,21 +186,43 @@ class AuthorityGovernor:
             )
         shift = np.asarray(travel.get("shift", NO_TRAVEL["shift"]), dtype=np.float64).reshape(2)
         travelled = float(np.hypot(shift[0], shift[1]))
-        if travelled > limit > 0.0:
-            # ``shift`` is the correction the crop asks for at the machine, so
-            # the part the lens cannot pay is ``clamp(shift) - shift``: the
-            # machine keeps the direction its own motion had.  Taking it the
-            # other way round would flip the follow drift left-right.
-            residual_source = shift * ((limit - travelled) / travelled)
-        else:
-            residual_source = np.zeros(2, dtype=np.float64)
         output_scale = float(travel.get("output_scale", 1.0) or 1.0)
         zoom_ratio = float(travel.get("zoom", 1.0) or 1.0)
-        zoom_clamped = self.limits.clamp_zoom(zoom_ratio)
-        residual_zoom = zoom_ratio / zoom_clamped if zoom_clamped > 1e-6 else 1.0
         centre = np.asarray(travel.get("target_centre", NO_TRAVEL["target_centre"]),
                             dtype=np.float64).reshape(2)
-        residual_shift = (residual_source * output_scale).astype(np.float32)
+        hysteresis = float(min(max(float(getattr(self.limits, "hysteresis", 0.0) or 0.0), 0.0), 0.6))
+        low = min(float(self.limits.min_zoom), float(self.limits.max_zoom))
+        high = max(float(self.limits.min_zoom), float(self.limits.max_zoom))
+        if not self.engaged:
+            if (limit > 0.0 and travelled > limit) or zoom_ratio > high or zoom_ratio < low:
+                self.engaged = True
+        else:
+            back_inside = limit <= 0.0 or travelled <= limit * (1.0 - hysteresis)
+            zoom_inside = low * (1.0 + hysteresis) <= zoom_ratio <= high * (1.0 - hysteresis)
+            if back_inside and zoom_inside:
+                self.engaged = False
+        if self.engaged:
+            if travelled > limit > 0.0:
+                # ``shift`` is the correction the crop asks for at the machine,
+                # so the part the lens cannot pay is ``clamp(shift) - shift``:
+                # the machine keeps the direction its own motion had.  Taking
+                # it the other way round would flip the follow drift.
+                residual = shift * ((limit - travelled) / travelled)
+            else:
+                residual = np.zeros(2, dtype=np.float64)
+            zoom_clamped = self.limits.clamp_zoom(zoom_ratio)
+            raw_zoom = zoom_ratio / zoom_clamped if zoom_clamped > 1e-6 else 1.0
+            raw_shift = residual * output_scale
+        else:
+            raw_shift = np.zeros(2, dtype=np.float64)
+            raw_zoom = 1.0
+        alpha = self._alpha(dt)
+        # Geometric smoothing for the scale, since it is a ratio, and linear
+        # for the shift, so one time constant reads the same in both.
+        self._zoom_state = float(self._zoom_state ** (1.0 - alpha) * raw_zoom ** alpha)
+        self._shift_state = self._shift_state * (1.0 - alpha) + raw_shift * alpha
+        residual_shift = self._shift_state.astype(np.float32)
+        residual_zoom = float(self._zoom_state)
         limited = bool(np.any(np.abs(residual_shift) > 1e-6) or abs(residual_zoom - 1.0) > 1e-6)
         mode = "follow" if limited else "lock"
         self.last_mode = mode
@@ -173,6 +232,6 @@ class AuthorityGovernor:
             limit=limit,
             zoom_ratio=zoom_ratio,
             residual_shift=residual_shift,
-            residual_zoom=float(residual_zoom),
+            residual_zoom=residual_zoom,
             target_centre=centre.astype(np.float32),
         )

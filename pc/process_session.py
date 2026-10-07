@@ -17,6 +17,30 @@ except ImportError:  # Running from inside pc/.
     from shot_authority import AuthorityGovernor, AuthorityLimits
 
 
+class FrameClock:
+    """Seconds between the frames a session delivers, for time-based filters.
+
+    ``nominal_fps`` is the receiver's flag default rather than a measurement,
+    so smoothing has to read the real timestamps or its time constant is off by
+    whatever the phone actually managed.
+    """
+
+    def __init__(self) -> None:
+        self._last: float | None = None
+
+    def dt(self, row: dict) -> float | None:
+        stamp = row.get("timestamp")
+        if not isinstance(stamp, (int, float)):
+            return None
+        value = float(stamp)
+        previous = self._last
+        self._last = value
+        if previous is None:
+            return None
+        delta = value - previous
+        return delta if 0.0 < delta < 1.0 else None
+
+
 def quat_to_matrix(q: dict[str, float]) -> np.ndarray:
     """Return a camera-space rotation matrix for x/y/z/w quaternion data."""
     x, y, z, w = (float(q.get(key, 0.0)) for key in ("x", "y", "z", "w"))
@@ -1919,12 +1943,15 @@ def process(args: argparse.Namespace) -> Path:
         max_shift=getattr(args, "lock_shift", 0.30),
         min_zoom=getattr(args, "lock_min_zoom", 0.62),
         max_zoom=getattr(args, "lock_max_zoom", 1.75),
+        hysteresis=getattr(args, "lock_hysteresis", 0.15),
+        smooth_seconds=getattr(args, "lock_smooth", 0.25),
     ))
     lock_mode = "none"
     lock_travel = 0.0
     # The limit is a property of the lens and the frame, not of whether a lock
     # has been taken yet, so report it even while nothing is locked.
     lock_limit = authority.limits.shift_limit(width, height)
+    clock = FrameClock()
     previous_gray = None
     previous_lock_source = "none"
     pose_track = load_pose_track(session)
@@ -1944,6 +1971,7 @@ def process(args: argparse.Namespace) -> Path:
                 if max_frames and index >= max_frames:
                     break
                 row = pose_for_row(row, pose_track)
+                frame_dt = clock.dt(row)
                 if lens_fix:
                     rotation, reference = rotation_for_row(row, reference)
                     map_x, map_y = build_remap(
@@ -2099,6 +2127,7 @@ def process(args: argparse.Namespace) -> Path:
                 if matrix is not None and fixed_inner is not None:
                     decision = authority.decide(
                         plane_tracker.lock_travel(width, height), width, height,
+                        dt=frame_dt,
                     )
                     matrix = decision.apply(matrix)
                     fixed_inner = decision.move_box(fixed_inner)
@@ -2210,6 +2239,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
     parser.add_argument("--lock-max-zoom", type=float, default=1.75,
                         help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
+    parser.add_argument("--lock-hysteresis", type=float, default=0.15,
+                        help="回到锁定需要退出的余量（占行程比例），防止在限位上反复横跳")
+    parser.add_argument("--lock-smooth", type=float, default=0.25,
+                        help="跟随残差的时间常数（秒），平滑掉测量噪声")
     return parser
 
 
@@ -2230,6 +2263,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--lock-shift 不能为负数")
     if not 0.0 < args.lock_min_zoom <= args.lock_max_zoom:
         parser.error("--lock-min-zoom / --lock-max-zoom 需要 0 < min <= max")
+    if not 0.0 <= getattr(args, "lock_hysteresis", 0.0) <= 0.6:
+        parser.error("--lock-hysteresis 需要在 0~0.6 之间")
+    if getattr(args, "lock_smooth", 0.0) < 0.0:
+        parser.error("--lock-smooth 不能为负数")
     return args
 
 

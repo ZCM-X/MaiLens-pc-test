@@ -357,6 +357,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
     parser.add_argument("--lock-max-zoom", type=float, default=1.75,
                         help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
+    parser.add_argument("--lock-hysteresis", type=float, default=0.15,
+                        help="回到锁定需要退出的余量（占行程比例），防止在限位上反复横跳")
+    parser.add_argument("--lock-smooth", type=float, default=0.25,
+                        help="跟随残差的时间常数（秒），平滑掉测量噪声")
     parser.add_argument("--debug", action="store_true", help="叠加检测框和锁定状态")
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
@@ -412,6 +416,8 @@ def main() -> None:
                 max_shift=args.lock_shift,
                 min_zoom=args.lock_min_zoom,
                 max_zoom=args.lock_max_zoom,
+                hysteresis=args.lock_hysteresis,
+                smooth_seconds=args.lock_smooth,
             ),
         )
 
