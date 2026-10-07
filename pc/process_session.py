@@ -1947,7 +1947,9 @@ def process(args: argparse.Namespace) -> Path:
         smooth_seconds=getattr(args, "lock_smooth", 0.25),
     ))
     lock_mode = "none"
+    lock_reason = "none"
     lock_travel = 0.0
+    lock_zoom_ratio = 1.0
     # The limit is a property of the lens and the frame, not of whether a lock
     # has been taken yet, so report it even while nothing is locked.
     lock_limit = authority.limits.shift_limit(width, height)
@@ -2132,7 +2134,9 @@ def process(args: argparse.Namespace) -> Path:
                     matrix = decision.apply(matrix)
                     fixed_inner = decision.move_box(fixed_inner)
                     lock_mode = decision.mode
+                    lock_reason = decision.reason
                     lock_travel = decision.travelled
+                    lock_zoom_ratio = decision.zoom_ratio
                     lock_limit = decision.limit
                 if matrix is not None and fixed_inner is not None:
                     if plane_full:
@@ -2155,6 +2159,7 @@ def process(args: argparse.Namespace) -> Path:
                     previous_lock_source = lock_source
                 else:
                     lock_mode = "geometry"
+                    lock_reason = "none"
                     stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                     outer = transform_box(outer, geometry_matrix)
                     inner = transform_box(inner, geometry_matrix)
@@ -2182,6 +2187,8 @@ def process(args: argparse.Namespace) -> Path:
                     "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
                     "plane_lock": plane_matrix is not None,
                     "lock_mode": lock_mode,
+                    "lock_reason": lock_reason,
+                    "lock_zoom_ratio": round(float(lock_zoom_ratio), 4),
                     "lock_travel_px": round(float(lock_travel), 2),
                     "lock_travel_limit_px": round(float(lock_limit), 2),
                     "plane_reacquired": plane_reacquired,

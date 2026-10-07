@@ -124,6 +124,41 @@ class AuthorityGovernorTests(unittest.TestCase):
         self.assertEqual(last.mode, "lock")
         self.assertAlmostEqual(float(last.residual_shift[0]), 0.0, places=4)
 
+    def test_the_reason_names_the_budget_that_ran_out(self):
+        # Travel and zoom are separate budgets and only one is usually spent,
+        # so the debug log has to say which, otherwise a follow stretch cannot
+        # be tuned.
+        governor = AuthorityGovernor(
+            AuthorityLimits(max_shift=0.25, min_zoom=0.62, max_zoom=1.75)
+        )
+        inside = governor.decide(travel((0.0, 0.0), zoom=1.10), 320, 180)
+        self.assertEqual((inside.mode, inside.reason), ("lock", "lock"))
+        far = governor.decide(travel((-90.0, 0.0), zoom=1.10), 320, 180)
+        self.assertEqual((far.mode, far.reason), ("follow", "travel"))
+        governor.reset()
+        big = governor.decide(travel((0.0, 0.0), zoom=2.40), 320, 180)
+        self.assertEqual((big.mode, big.reason), ("follow", "zoom"))
+        governor.reset()
+        both = governor.decide(travel((-90.0, 0.0), zoom=2.40), 320, 180)
+        self.assertEqual((both.mode, both.reason), ("follow", "travel+zoom"))
+
+    def test_a_latched_frame_says_so_instead_of_claiming_a_lock(self):
+        # While the leftover drains the frame is neither a clean lock nor a
+        # fresh excursion, and the log should not pretend otherwise.
+        governor = AuthorityGovernor(
+            AuthorityLimits(max_shift=0.25, min_zoom=0.62, max_zoom=1.75,
+                            hysteresis=0.15, smooth_seconds=0.25)
+        )
+        step = 1.0 / 30.0
+        for _ in range(30):
+            governor.decide(travel((0.0, 0.0), zoom=1.90), 320, 180, dt=step)
+        held = governor.decide(travel((0.0, 0.0), zoom=1.70), 320, 180, dt=step)
+        self.assertEqual((held.mode, held.reason), ("follow", "latched"))
+        released = None
+        for _ in range(90):
+            released = governor.decide(travel((0.0, 0.0), zoom=1.40), 320, 180, dt=step)
+        self.assertEqual((released.mode, released.reason), ("lock", "lock"))
+
     def test_without_a_clock_the_decisions_stay_immediate(self):
         # Callers that pass no dt (and every existing test) must keep the old
         # "what fits is taken out this frame" behaviour.

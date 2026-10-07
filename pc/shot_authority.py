@@ -85,6 +85,10 @@ class AuthorityDecision:
     residual_shift: np.ndarray
     residual_zoom: float
     target_centre: np.ndarray
+    #: Which budget ran out: ``travel``, ``zoom``, ``travel+zoom`` or none.
+    #: The two are separate budgets and only one of them is usually to blame,
+    #: so the debug log records which one so a follow stretch can be tuned.
+    reason: str = "lock"
 
     @property
     def limited(self) -> bool:
@@ -226,6 +230,24 @@ class AuthorityGovernor:
         limited = bool(np.any(np.abs(residual_shift) > 1e-6) or abs(residual_zoom - 1.0) > 1e-6)
         mode = "follow" if limited else "lock"
         self.last_mode = mode
+        # Travel and zoom are separate budgets; saying which one ran out turns
+        # a follow stretch into something that can be tuned.
+        zoom_clamped_reason = self.limits.clamp_zoom(zoom_ratio)
+        travel_limited = bool(limit > 0.0 and travelled > limit)
+        zoom_limited = bool(abs(zoom_ratio - zoom_clamped_reason) > 1e-6)
+        if travel_limited and zoom_limited:
+            reason = "travel+zoom"
+        elif travel_limited:
+            reason = "travel"
+        elif zoom_limited:
+            reason = "zoom"
+        elif limited:
+            # Neither budget is out, but a leftover from the last excursion is
+            # still draining through the smoothing, so the picture is neither
+            # a clean lock nor a fresh follow.
+            reason = "latched"
+        else:
+            reason = "lock"
         return AuthorityDecision(
             mode=mode,
             travelled=travelled,
@@ -234,4 +256,5 @@ class AuthorityGovernor:
             residual_shift=residual_shift,
             residual_zoom=residual_zoom,
             target_centre=centre.astype(np.float32),
+            reason=reason,
         )
