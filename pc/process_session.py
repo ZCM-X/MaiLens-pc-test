@@ -11,6 +11,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:  # Running as `python pc/process_session.py`.
+    from .shot_authority import AuthorityGovernor, AuthorityLimits
+except ImportError:  # Running from inside pc/.
+    from shot_authority import AuthorityGovernor, AuthorityLimits
+
 
 def quat_to_matrix(q: dict[str, float]) -> np.ndarray:
     """Return a camera-space rotation matrix for x/y/z/w quaternion data."""
@@ -1908,6 +1913,18 @@ def process(args: argparse.Namespace) -> Path:
         args.detect_every,
         motion_model=getattr(args, "plane_model", "homography"),
     )
+    # Same finite travel the live path uses: inside the range the machine is
+    # pinned, past it the picture rides along with the phone.
+    authority = AuthorityGovernor(AuthorityLimits(
+        max_shift=getattr(args, "lock_shift", 0.30),
+        min_zoom=getattr(args, "lock_min_zoom", 0.62),
+        max_zoom=getattr(args, "lock_max_zoom", 1.75),
+    ))
+    lock_mode = "none"
+    lock_travel = 0.0
+    # The limit is a property of the lens and the frame, not of whether a lock
+    # has been taken yet, so report it even while nothing is locked.
+    lock_limit = authority.limits.shift_limit(width, height)
     previous_gray = None
     previous_lock_source = "none"
     pose_track = load_pose_track(session)
@@ -2080,6 +2097,15 @@ def process(args: argparse.Namespace) -> Path:
                     plane_hold_frames = 0
 
                 if matrix is not None and fixed_inner is not None:
+                    decision = authority.decide(
+                        plane_tracker.lock_travel(width, height), width, height,
+                    )
+                    matrix = decision.apply(matrix)
+                    fixed_inner = decision.move_box(fixed_inner)
+                    lock_mode = decision.mode
+                    lock_travel = decision.travelled
+                    lock_limit = decision.limit
+                if matrix is not None and fixed_inner is not None:
                     if plane_full:
                         # Warp the complete frame with the same machine-plane
                         # transform.  No feathered seam, and the background moves
@@ -2099,6 +2125,7 @@ def process(args: argparse.Namespace) -> Path:
                     zoom = 1.0
                     previous_lock_source = lock_source
                 else:
+                    lock_mode = "geometry"
                     stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
                     outer = transform_box(outer, geometry_matrix)
                     inner = transform_box(inner, geometry_matrix)
@@ -2125,6 +2152,9 @@ def process(args: argparse.Namespace) -> Path:
                     "lock_source": lock_source,
                     "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
                     "plane_lock": plane_matrix is not None,
+                    "lock_mode": lock_mode,
+                    "lock_travel_px": round(float(lock_travel), 2),
+                    "lock_travel_limit_px": round(float(lock_limit), 2),
                     "plane_reacquired": plane_reacquired,
                     "plane_age_frames": plane_tracker.age_frames,
                     "plane_inliers": plane_tracker.inliers,
@@ -2174,6 +2204,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="整帧都按机台平面 warp，而不是只在中间合成机台区域")
     parser.add_argument("--plane-hold", type=int, default=12,
                         help="机台被手或手臂挡住时，保持上一帧变换的帧数，默认 12")
+    parser.add_argument("--lock-shift", type=float, default=0.30,
+                        help="机台锁定能拖动的最大位移（短边比例）；超出后画面跟随手机")
+    parser.add_argument("--lock-min-zoom", type=float, default=0.62,
+                        help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
+    parser.add_argument("--lock-max-zoom", type=float, default=1.75,
+                        help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
     return parser
 
 
@@ -2190,6 +2226,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--plane-smooth 应在 0 到 1 之间")
     if args.plane_hold < 0:
         parser.error("--plane-hold 不能为负数")
+    if args.lock_shift < 0.0:
+        parser.error("--lock-shift 不能为负数")
+    if not 0.0 < args.lock_min_zoom <= args.lock_max_zoom:
+        parser.error("--lock-min-zoom / --lock-max-zoom 需要 0 < min <= max")
     return args
 
 

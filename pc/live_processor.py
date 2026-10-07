@@ -124,6 +124,7 @@ class LiveProcessor:
         if self.output_shape != (width, height):
             self.output_shape = (width, height)
             self.output_rays = make_output_rays(width, height, self.crop, self.fov)
+            self.lock_limit = self.authority.limits.shift_limit(width, height)
 
         rotation, self.reference = rotation_for_row(metadata, self.reference)
 
@@ -169,7 +170,7 @@ class LiveProcessor:
             self.plane_tracker.reset()
             self.lock_mode = "none"
             self.lock_travel = 0.0
-            self.lock_limit = 0.0
+            self.lock_limit = self.authority.limits.shift_limit(width, height)
         # Once the plane lock is active it owns the LK pass.  Keeping the old
         # box tracker only during acquisition avoids doing two optical-flow
         # solves for every 60-fps frame.

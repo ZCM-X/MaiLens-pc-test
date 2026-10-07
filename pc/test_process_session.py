@@ -404,6 +404,30 @@ class VideoBackedSessionTests(unittest.TestCase):
                      (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(len(debug), 12)
 
+    def test_the_render_reports_the_lock_travel_it_is_allowed(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            session = write_phone_session(Path(workspace) / "authority", frames=6)
+            process(parse_args([str(session), "--max-frames", "4"]))
+
+            debug = [json.loads(line) for line in
+                     (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(debug), 4)
+            for row in debug:
+                self.assertIn("lock_mode", row)
+                self.assertIn("lock_travel_px", row)
+                self.assertIn("lock_travel_limit_px", row)
+            # Nobody is locked in a session without a model, and the travel
+            # limit is still the one the operator asked for: 0.30 of the
+            # short side of the 96x64 synthetic frames.
+            self.assertEqual(debug[-1]["lock_mode"], "geometry")
+            self.assertEqual(debug[-1]["lock_travel_px"], 0.0)
+            self.assertEqual(debug[-1]["lock_travel_limit_px"], 0.30 * 64)
+
+            process(parse_args([str(session), "--max-frames", "4", "--lock-shift", "0.5"]))
+            debug = [json.loads(line) for line in
+                     (session / "debug.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(debug[-1]["lock_travel_limit_px"], 0.5 * 64)
+
     def test_no_fisheye_and_max_frames_lock_the_raw_geometry(self):
         # An already-rectified clip must not go through the fisheye model again.
         with tempfile.TemporaryDirectory() as workspace:
