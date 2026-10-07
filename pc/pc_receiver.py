@@ -16,9 +16,11 @@ import numpy as np
 try:
     from .protocol import TYPE_FRAME, TYPE_HELLO, recv_packet
     from .live_processor import LiveProcessor
+    from .shot_authority import AuthorityLimits
 except ImportError:  # Running as `python pc/pc_receiver.py` from the repo root.
     from protocol import TYPE_FRAME, TYPE_HELLO, recv_packet
     from live_processor import LiveProcessor
+    from shot_authority import AuthorityLimits
 
 
 def create_session(root: Path) -> Path:
@@ -62,6 +64,11 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             detect_every=args.detect_every,
             lock_fill=getattr(args, "lock_fill", 0.71),
             debug=args.debug,
+            lock_authority=AuthorityLimits(
+                max_shift=getattr(args, "lock_shift", 0.30),
+                min_zoom=getattr(args, "lock_min_zoom", 0.62),
+                max_zoom=getattr(args, "lock_max_zoom", 1.75),
+            ),
         )
         print("实时处理：鱼眼矫正 + 姿态云台已开启" + (" + 机台检测" if args.model else ""))
     frame_count = 0
@@ -220,6 +227,12 @@ def main() -> None:
     parser.add_argument("--lock-fill", type=float, default=0.71,
                         help="内屏锁定后占画面短边的比例，默认 0.71（按近景校准参考）")
     parser.add_argument("--debug", action="store_true", help="实时画面叠加检测框、中心和缩放")
+    parser.add_argument("--lock-shift", type=float, default=0.30,
+                        help="机台锁定能拖动的最大位移（短边比例）；超出后画面跟随手机")
+    parser.add_argument("--lock-min-zoom", type=float, default=0.62,
+                        help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
+    parser.add_argument("--lock-max-zoom", type=float, default=1.75,
+                        help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
     parser.add_argument("--center-x", type=float, default=0.501753869)

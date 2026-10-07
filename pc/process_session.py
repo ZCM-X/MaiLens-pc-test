@@ -650,6 +650,13 @@ def apply_plane_lock(
 
 
 _LOCK_MASK_CACHE: dict[tuple, np.ndarray] = {}
+#: The mask box is snapped to this lattice before it is cached.  While the
+#: follow mode slides the foreground every frame the box changes every frame,
+#: and rebuilding a blurred full-frame mask each time costs more than the
+#: whole rest of the pipeline.  The ellipse is feathered over tens of pixels,
+#: so an 8 px lattice is invisible.
+_LOCK_MASK_QUANTUM = 8
+_LOCK_MASK_CACHE_LIMIT = 96
 
 
 def _cached_lock_mask(
@@ -657,7 +664,9 @@ def _cached_lock_mask(
     box: tuple[int, int, int, int],
 ) -> np.ndarray:
     """Feathered ellipse alpha (h, w, 1) for a fixed locked target box."""
-    key = (int(shape[0]), int(shape[1])) + tuple(int(round(v)) for v in box)
+    quantum = _LOCK_MASK_QUANTUM
+    box = tuple(int(round(float(value) / quantum)) * quantum for value in box)
+    key = (int(shape[0]), int(shape[1])) + box
     cached = _LOCK_MASK_CACHE.get(key)
     if cached is not None:
         return cached
@@ -678,7 +687,7 @@ def _cached_lock_mask(
     feather = max(9, int(round(min(axes) * 0.06)) * 2 + 1)
     mask = cv2.GaussianBlur(mask, (feather, feather), 0)
     alpha = (mask.astype(np.float32) / 255.0)[..., None]
-    if len(_LOCK_MASK_CACHE) > 16:
+    if len(_LOCK_MASK_CACHE) > _LOCK_MASK_CACHE_LIMIT:
         _LOCK_MASK_CACHE.clear()
     _LOCK_MASK_CACHE[key] = alpha
     return alpha
@@ -1221,6 +1230,57 @@ class PlaneLockTracker:
             return None
         matrix = self.reference_to_output @ self.correction @ self.current_to_reference
         return matrix.astype(np.float32) if np.isfinite(matrix).all() else None
+
+    def lock_travel(self, width: int, height: int) -> dict | None:
+        """How much picture the lock is dragging around to hold the machine.
+
+        The crop transform ``correction @ current_to_reference`` is exactly
+        what the lens is being asked to do, so moving the machine's current
+        centre through it and taking the difference says how far the picture
+        had to travel to keep the cabinet on its locked spot.  A lens with
+        finite travel can pay that off only up to a limit; the rest of the
+        picture stays where it is and the cabinet goes with the phone.
+
+        ``zoom`` is the ratio of the machine's apparent size now to its size
+        when the lock was taken, ``output_scale`` converts a source pixel into
+        an output pixel at the locked target, and ``target_centre`` is the
+        output point the lock pins the machine to.
+        """
+        if not self.locked or self.current_box is None or self.reference_box is None:
+            return None
+        if self.reference_to_output is None:
+            return None
+        current = _box_points(self.current_box)
+        reference = _box_points(self.reference_box)
+        if current is None or reference is None:
+            return None
+        current_points = np.asarray(current, dtype=np.float64).reshape(4, 2)
+        reference_points = np.asarray(reference, dtype=np.float64).reshape(4, 2)
+        crop = np.asarray(self.correction, dtype=np.float64) @ np.asarray(
+            self.current_to_reference, dtype=np.float64,
+        )
+        if not np.isfinite(crop).all():
+            return None
+        mapped = _project_points(current_points.astype(np.float32), crop.astype(np.float32))
+        target = _project_points(reference_points.astype(np.float32), self.reference_to_output)
+        if mapped is None or target is None:
+            return None
+        mapped_points = np.asarray(mapped, dtype=np.float64).reshape(4, 2)
+        target_points = np.asarray(target, dtype=np.float64).reshape(4, 2)
+        areas = [
+            abs(float(cv2.contourArea(points.astype(np.float32))))
+            for points in (current_points, mapped_points, reference_points, target_points)
+        ]
+        if min(areas) < 1.0:
+            return None
+        current_area, mapped_area, reference_area, target_area = areas
+        centre = current_points.mean(axis=0)
+        return {
+            "shift": mapped_points.mean(axis=0) - centre,
+            "zoom": float(np.sqrt(current_area / mapped_area)),
+            "output_scale": float(np.sqrt(target_area / reference_area)),
+            "target_centre": target_points.mean(axis=0),
+        }
 
     def reanchor(
         self,

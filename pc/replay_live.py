@@ -29,8 +29,10 @@ import numpy as np
 
 try:
     from .live_processor import LiveProcessor
+    from .shot_authority import AuthorityLimits
 except ImportError:  # Running as `python pc/replay_live.py` from the repo root.
     from live_processor import LiveProcessor
+    from shot_authority import AuthorityLimits
 
 
 VIDEO_NAMES = ("raw.mp4", "video.mp4", "video.mov", "video.m4v")
@@ -349,6 +351,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detect-every", type=int, default=12,
                         help="模型每隔多少帧检测一次，默认 12")
     parser.add_argument("--lock-fill", type=float, default=0.71)
+    parser.add_argument("--lock-shift", type=float, default=0.30,
+                        help="机台锁定能拖动的最大位移（短边比例）；超出后画面跟随手机")
+    parser.add_argument("--lock-min-zoom", type=float, default=0.62,
+                        help="锁定能补偿的最小尺寸比；比这更远时画面跟随手机")
+    parser.add_argument("--lock-max-zoom", type=float, default=1.75,
+                        help="锁定能补偿的最大尺寸比；比这更近时画面跟随手机")
     parser.add_argument("--debug", action="store_true", help="叠加检测框和锁定状态")
     parser.add_argument("--crop", type=float, default=0.74)
     parser.add_argument("--fov", type=float, default=106.4583)
@@ -400,6 +408,11 @@ def main() -> None:
             detect_every=args.detect_every,
             lock_fill=args.lock_fill,
             debug=args.debug,
+            lock_authority=AuthorityLimits(
+                max_shift=args.lock_shift,
+                min_zoom=args.lock_min_zoom,
+                max_zoom=args.lock_max_zoom,
+            ),
         )
 
     try:

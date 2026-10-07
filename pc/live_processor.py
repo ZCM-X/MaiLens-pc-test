@@ -31,6 +31,7 @@ try:
         lens_remap,
         rotation_homography,
     )
+    from .shot_authority import AuthorityGovernor, AuthorityLimits
 except ImportError:  # Running from `python pc/pc_receiver.py`.
     from process_session import (
         GeometryDetector,
@@ -54,6 +55,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         lens_remap,
         rotation_homography,
     )
+    from shot_authority import AuthorityGovernor, AuthorityLimits
 
 
 class LiveProcessor:
@@ -73,6 +75,7 @@ class LiveProcessor:
         lock_fill: float = 0.71,
         debug: bool = False,
         fast_remap: bool = True,
+        lock_authority: AuthorityLimits | None = None,
     ) -> None:
         self.crop = crop
         self.fov = fov
@@ -109,6 +112,12 @@ class LiveProcessor:
         self.plane_hold: np.ndarray | None = None
         self.plane_hold_frames = 0
         self.plane_hold_limit = 12
+        # Bounded lens travel: inside the range the machine is pinned, past it
+        # the picture rides along with the phone again.  See shot_authority.
+        self.authority = AuthorityGovernor(lock_authority)
+        self.lock_mode = "none"
+        self.lock_travel = 0.0
+        self.lock_limit = 0.0
 
     def process(self, frame: np.ndarray, metadata: dict) -> tuple[np.ndarray, dict]:
         height, width = frame.shape[:2]
@@ -158,6 +167,9 @@ class LiveProcessor:
             self.reference_zoom = None
             self.lock_source = "searching"
             self.plane_tracker.reset()
+            self.lock_mode = "none"
+            self.lock_travel = 0.0
+            self.lock_limit = 0.0
         # Once the plane lock is active it owns the LK pass.  Keeping the old
         # box tracker only during acquisition avoids doing two optical-flow
         # solves for every 60-fps frame.
@@ -298,6 +310,18 @@ class LiveProcessor:
             self.plane_hold_frames = 0
 
         if plane_matrix is not None and fixed_inner is not None:
+            # The lock is only allowed the travel a real lens has.  Whatever it
+            # cannot take out stays visible, so the machine follows the phone
+            # past the range instead of the picture tearing itself apart
+            # reaching for a machine that is no longer there.
+            decision = self.authority.decide(
+                self.plane_tracker.lock_travel(width, height), width, height,
+            )
+            plane_matrix = decision.apply(plane_matrix)
+            fixed_inner = decision.move_box(fixed_inner)
+            self.lock_mode = decision.mode
+            self.lock_travel = decision.travelled
+            self.lock_limit = decision.limit
             stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
             outer = expand_box(fixed_inner, 1.45)
             # The current detector rectangle is allowed to jitter.  The
@@ -309,6 +333,7 @@ class LiveProcessor:
             center = np.array([0.5, 0.5], dtype=np.float32)
             zoom = 1.0
         else:
+            self.lock_mode = "geometry"
             stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
             outer = transform_box(outer, geometry_matrix)
             inner = transform_box(inner, geometry_matrix)
@@ -328,6 +353,9 @@ class LiveProcessor:
             "lock_anchor": "outer_buttons" if outer is not None else ("inner_screen" if inner is not None else "none"),
             "detection_age_frames": self.detection_age,
             "plane_lock": plane_matrix is not None,
+            "lock_mode": self.lock_mode,
+            "lock_travel_px": round(float(self.lock_travel), 2),
+            "lock_travel_limit_px": round(float(self.lock_limit), 2),
             "plane_matrix": (
                 np.asarray(plane_matrix, dtype=np.float64).reshape(-1).round(6).tolist()
                 if plane_matrix is not None else None
@@ -344,7 +372,7 @@ class LiveProcessor:
                 stabilized,
                 outer,
                 inner,
-                f"{self.frame_index}  lock={self.lock_source}  anchor={anchor}  zoom={zoom:.2f}",
+                f"{self.frame_index}  lock={self.lock_source}  {self.lock_mode}  anchor={anchor}  zoom={zoom:.2f}",
             )
         return stabilized, debug
 

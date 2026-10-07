@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from .live_processor import LiveProcessor
+from .shot_authority import AuthorityLimits
 
 
 class LiveProcessorTests(unittest.TestCase):
@@ -151,6 +152,37 @@ class LiveProcessorTests(unittest.TestCase):
 
         self.assertGreater(debug["detection_age_frames"], 0)
         self.assertFalse(np.allclose(processor.plane_tracker.correction_target, np.eye(3)))
+
+
+    def test_the_plane_lock_gives_up_once_the_travel_runs_out(self):
+        class JumpingDetector:
+            enabled = True
+            inner = (95, 45, 225, 135)
+            outer = (30, 15, 290, 170)
+
+            def detect(self, _frame):
+                return self.outer, self.inner
+
+        detector = JumpingDetector()
+        processor = LiveProcessor(detect_every=1, lock_authority=AuthorityLimits(max_shift=0.05))
+        processor.detector = detector
+        frame = np.random.default_rng(11).integers(0, 256, (360, 640, 3), dtype=np.uint8)
+        metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}
+
+        with patch("pc.live_processor.map_fisheye_box_to_output", side_effect=lambda box, *_args: box):
+            _output, first = processor.process(frame, metadata)
+            self.assertEqual(first["lock_mode"], "lock")
+            # The phone pan right off the machine: the correction the lock
+            # wants is far past the 0.05 * 360 = 18 px this lens can travel.
+            detector.inner = (470, 135, 610, 225)
+            detector.outer = (400, 100, 640, 260)
+            modes = [processor.process(frame, metadata)[1] for _ in range(4)]
+
+        last = modes[-1]
+        self.assertEqual(last["lock_mode"], "follow")
+        self.assertGreater(last["lock_travel_px"], last["lock_travel_limit_px"])
+        # Inside the range the very same pipeline still reports a lock.
+        self.assertEqual(first["lock_mode"], "lock")
 
 
 if __name__ == "__main__":
