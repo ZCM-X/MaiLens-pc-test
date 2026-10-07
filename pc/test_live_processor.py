@@ -164,7 +164,10 @@ class LiveProcessorTests(unittest.TestCase):
                 return self.outer, self.inner
 
         detector = JumpingDetector()
-        processor = LiveProcessor(detect_every=1, lock_authority=AuthorityLimits(max_shift=0.05))
+        # The payout rate is not what this test is about, so pin it to the
+        # historical value and keep the timing of the four frames below.
+        processor = LiveProcessor(detect_every=1, correction_gain=0.35,
+                                  lock_authority=AuthorityLimits(max_shift=0.05))
         processor.detector = detector
         frame = np.random.default_rng(11).integers(0, 256, (360, 640, 3), dtype=np.uint8)
         metadata = {"timestamp": 10.0, "pose": {"timestamp": 10.0}}

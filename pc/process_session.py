@@ -633,20 +633,117 @@ def expand_box(box: tuple[int, int, int, int] | None, scale: float) -> tuple[int
     )
 
 
+#: Feather width for the full-frame warp, as a fraction of the short side.
+#: The warp runs out of source near the frame edge; a hard line there reads as
+#: a tear, so the handover back to the plain rectified view is softened.
+_FULL_WARP_FEATHER = 0.02
+
+
+def _feather_validity(valid: np.ndarray) -> np.ndarray:
+    """Blur a 0..1 source mask so the warp handover is not a hard line."""
+    height, width = valid.shape[:2]
+    if float(valid.min()) >= 1.0:
+        return valid
+    radius = int(round(min(height, width) * _FULL_WARP_FEATHER))
+    if radius >= 2:
+        size = radius * 2 + 1
+        valid = cv2.GaussianBlur(valid.astype(np.float32), (size, size), 0)
+    return valid
+
+
+def _composite_masked(
+    fg: np.ndarray,
+    bg: np.ndarray,
+    alpha: np.ndarray,
+) -> np.ndarray:
+    """``fg`` over ``bg`` with a per-pixel 0..1 alpha, in float precision."""
+    if alpha.ndim == 2:
+        alpha = alpha[..., None]
+    foreground = fg.astype(np.float32) * alpha
+    foreground += bg.astype(np.float32) * (1.0 - alpha)
+    return np.clip(foreground, 0.0, 255.0).astype(np.uint8)
+
+
+#: Blend factors below were tuned per frame on 30 fps footage.  Scaling them
+#: by the real frame interval keeps a 60 fps phone feed and a 30 fps render
+#: behaving the same, instead of the faster feed passing twice the jitter.
+_GAIN_REFERENCE_DT = 1.0 / 30.0
+
+
+def frame_gain(gain: float, dt: float | None) -> float:
+    """Rescale a per-frame blend factor for this frame's interval."""
+    gain = float(min(max(float(gain), 0.0), 1.0))
+    if dt is None:
+        return gain
+    step = float(dt)
+    if not step > 0.0:
+        return gain
+    if gain >= 1.0:
+        return 1.0
+    if gain <= 0.0:
+        return 0.0
+    tau = _GAIN_REFERENCE_DT / -math.log(1.0 - gain)
+    return float(1.0 - math.exp(-min(step, 1.0) / tau))
+
+
+class PlaneCornersSmoother:
+    """Exponential smoothing of the locked machine quad.
+
+    The tracker rebuilds its homography from optical flow every frame, so the
+    corners carry per-frame noise.  Averaging whole matrices is scale
+    ambiguous, so the blend happens in corner space and the matrix is rebuilt
+    from the smoothed quad: the transform stays projective while the twitch
+    goes away.
+    """
+
+    def __init__(self, gain: float = 0.35, reference_dt: float | None = None):
+        self.gain = float(min(max(float(gain), 0.0), 1.0))
+        self.corners: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self.corners = None
+
+    def update(
+        self,
+        corners: np.ndarray | None,
+        dt: float | None = None,
+    ) -> np.ndarray | None:
+        if corners is None:
+            return self.corners
+        corners = np.asarray(corners, dtype=np.float64)
+        if self.corners is None or self.corners.shape != corners.shape:
+            self.corners = corners
+            return self.corners
+        alpha = frame_gain(self.gain, dt)
+        self.corners = alpha * corners + (1.0 - alpha) * self.corners
+        return self.corners
+
+
 def apply_plane_lock(
     frame: np.ndarray,
     matrix: np.ndarray,
     target_inner_box: tuple[int, int, int, int] | None,
+    full_warp: bool = True,
 ) -> np.ndarray:
-    """Composite the locked machine plane over the live background.
+    """Put the frame onto the locked viewpoint.
 
-    Warping the complete fisheye frame and reflecting its borders duplicates
-    walls and tables around the machine. The desired effect is an anchored
-    machine foreground, so only a feathered ellipse around the fixed screen
-    and button ring is taken from the projective warp; the current background
-    remains untouched and can move naturally behind it.
+    ``full_warp`` puts the whole frame through the same projective transform,
+    so every part of the picture shares one viewpoint and the machine keeps its
+    real shape.  The transform can run out of source near the border, and those
+    pixels fall back to the plain rectified frame so the warp never smears an
+    edge inward.
+
+    ``full_warp=False`` is the older composite: a feathered ellipse around the
+    machine is taken from the warp and the live background stays behind it.
+    That keeps the background unprocessed, at the cost of a visible boundary
+    around the machine, which is not what the reference app shows.
     """
     height, width = frame.shape[:2]
+    if full_warp:
+        warped, valid = _warp_with_valid_source(frame, matrix)
+        if float(valid.min()) >= 1.0:
+            return warped
+        return _composite_masked(warped, frame, _feather_validity(valid))
     warped = cv2.warpPerspective(
         frame,
         np.asarray(matrix, dtype=np.float32),
@@ -670,12 +767,7 @@ def apply_plane_lock(
     # instead of rebuilding a blurred full-frame mask per frame.
     alpha = _cached_lock_mask((height, width), target_inner_box)
     alpha = alpha * (valid_source[..., None].astype(np.float32) / 255.0)
-    warped_f = warped.astype(np.float32)
-    warped_f *= alpha
-    frame_f = frame.astype(np.float32)
-    frame_f *= (1.0 - alpha)
-    warped_f += frame_f
-    return np.clip(warped_f, 0.0, 255.0).astype(np.uint8)
+    return _composite_masked(warped, frame, alpha)
 
 
 _LOCK_MASK_CACHE: dict[tuple, np.ndarray] = {}
@@ -1045,7 +1137,8 @@ class GeometryLockTracker:
         values = np.asarray(previous, dtype=np.float32) * (1.0 - alpha) + np.asarray(candidate, dtype=np.float32) * alpha
         return tuple(int(round(value)) for value in values)
 
-    def update_flow(self, previous_gray: np.ndarray | None, current_gray: np.ndarray | None) -> None:
+    def update_flow(self, previous_gray: np.ndarray | None, current_gray: np.ndarray | None,
+                    dt: float | None = None) -> None:
         """Follow the locked machine with sparse optical flow between detections."""
         if (self.outer_box is None and self.inner_box is None) or previous_gray is None or current_gray is None:
             return
@@ -1124,7 +1217,8 @@ class GeometryLockTracker:
             if tx1 <= tx0 or ty1 <= ty0:
                 continue
             if self._compatible(previous, transformed, width, height):
-                setattr(self, attribute, self._blend_box(previous, transformed, 0.80))
+                setattr(self, attribute, self._blend_box(
+                    previous, transformed, frame_gain(0.80, dt)))
         if self.outer_box is not None and self.inner_box is not None and not plausible_geometry_pair(self.outer_box, self.inner_box):
             # Optical flow is allowed to move both boxes, but never allowed to
             # turn them into two overlapping copies of the same rectangle.
@@ -1138,6 +1232,7 @@ class GeometryLockTracker:
         width: int,
         height: int,
         allow_soft_pair: bool = False,
+        dt: float | None = None,
     ) -> None:
         """Accept each detector result independently after jump checks."""
         # Validate the pair before updating state.  An inner-screen-only
@@ -1165,7 +1260,8 @@ class GeometryLockTracker:
                 setattr(self, age_attribute, 0)
                 continue
             if self._compatible(previous, candidate, width, height):
-                setattr(self, attribute, self._blend_box(previous, candidate, 0.22))
+                setattr(self, attribute, self._blend_box(
+                    previous, candidate, frame_gain(0.22, dt)))
                 setattr(self, age_attribute, 0)
             else:
                 # A far-away detector result is almost always a false match;
@@ -1386,7 +1482,7 @@ class PlaneLockTracker:
         self.correction_target = (target / float(target[2, 2])).astype(np.float32)
         return True
 
-    def advance_correction(self) -> None:
+    def advance_correction(self, dt: float | None = None) -> None:
         """Walk the applied correction towards the last measured one.
 
         A correction that is applied the instant it is measured shows up as
@@ -1395,7 +1491,7 @@ class PlaneLockTracker:
         frames in between, which is the difference between the machine looking
         pinned and the machine stepping every few hundred milliseconds.
         """
-        gain = float(self.correction_gain)
+        gain = frame_gain(self.correction_gain, dt)
         if gain <= 0.0:
             return
         applied = self.correction.astype(np.float64)
@@ -1616,6 +1712,7 @@ class PlaneLockTracker:
         width: int,
         height: int,
         lock_fill: float,
+        dt: float | None = None,
     ) -> bool:
         if self.frame_shape != gray.shape[:2]:
             self.reset()
@@ -1703,7 +1800,7 @@ class PlaneLockTracker:
         # The anchor correction is paid out on every frame, not only on the
         # frames the detector runs, so the plane walks to the fresh reading
         # instead of jumping to it.
-        self.advance_correction()
+        self.advance_correction(dt)
         return self.locked
 
 
@@ -1723,25 +1820,38 @@ def load_manifest(session: Path) -> dict:
 
 
 def measured_fps(rows: list[dict]) -> float | None:
-    """Frame rate implied by the capture timestamps, or None when unusable.
+    """Frame rate the delivered frames really represent, or None when unusable.
 
-    The receiver stamps every frame as it lands, so the median interval is the
-    honest record of how fast the phone really pushed.  ``session.json``'s
-    ``nominal_fps`` is only the ``--fps`` default (60), while a real phone push
-    runs at 24-30 fps: trusting the manifest doubles the playback speed and
-    halves the effect of every time-based filter.
+    The receiver stamps every frame as it lands, and the phone drops some: on
+    a recorded session 19 percent of the frames never arrived, so the *median*
+    interval still said 30 fps while the clip really spanned 28.1 s.  Averaging
+    by the total span is what keeps the output from playing 1.23x fast, which
+    showed up as a jump every time a gap was crossed.  ``session.json``'s
+    ``nominal_fps`` is only the ``--fps`` default (60), so it is no better.
+
+    The median is kept as a sanity rail: a span wildly longer than the typical
+    interval means the capture stalled, and stretching the whole clip to cover
+    a stall would be worse than the speed change.
     """
     timestamps = sorted(float(row["timestamp"]) for row in rows
                         if isinstance(row.get("timestamp"), (int, float)))
+    if len(timestamps) < 2:
+        return None
+    span = timestamps[-1] - timestamps[0]
+    if not span > 0:
+        return None
     deltas = sorted(later - earlier
                     for earlier, later in zip(timestamps, timestamps[1:])
                     if later > earlier)
-    if not deltas:
-        return None
-    median = deltas[len(deltas) // 2]
+    median = deltas[len(deltas) // 2] if deltas else span / (len(timestamps) - 1)
     if median <= 0:
         return None
-    return max(1.0, min(240.0, 1.0 / median))
+    by_span = (len(timestamps) - 1) / span
+    # A stall longer than this many typical frames is a capture failure, not a
+    # frame interval, so do not stretch the clip to swallow it.
+    if span > median * (len(timestamps) - 1) * 4.0:
+        return max(1.0, min(240.0, 1.0 / median))
+    return max(1.0, min(240.0, by_span))
 
 
 def resolve_fps(session: Path,
@@ -1936,6 +2046,7 @@ def process(args: argparse.Namespace) -> Path:
     plane_tracker = PlaneLockTracker(
         args.detect_every,
         motion_model=getattr(args, "plane_model", "homography"),
+        correction_gain=getattr(args, "correction_gain", 0.15),
     )
     # Same finite travel the live path uses: inside the range the machine is
     # pinned, past it the picture rides along with the phone.
@@ -1960,8 +2071,11 @@ def process(args: argparse.Namespace) -> Path:
     lens_fix = not getattr(args, "no_fisheye", False)
     max_frames = getattr(args, "max_frames", None)
     plane_smooth = float(getattr(args, "plane_smooth", 0.35))
-    plane_full = bool(getattr(args, "plane_full", False))
-    plane_smooth_corners: np.ndarray | None = None
+    corner_smoother = PlaneCornersSmoother(plane_smooth)
+    # The locked viewpoint is a whole-frame transform: one viewpoint for the
+    # machine and the room around it, which is what the reference app shows.
+    # ``--plane-patch`` restores the older ellipse composite.
+    full_warp = not bool(getattr(args, "plane_patch", False))
     plane_hold_limit = max(0, int(getattr(args, "plane_hold", 12)))
     plane_hold_matrix: np.ndarray | None = None
     plane_hold_frames = 0
@@ -1998,7 +2112,7 @@ def process(args: argparse.Namespace) -> Path:
                     reference_zoom = None
                     previous_lock_source = "searching"
                 if not plane_tracker.locked:
-                    lock_tracker.update_flow(previous_gray, current_gray)
+                    lock_tracker.update_flow(previous_gray, current_gray, dt=frame_dt)
                 fresh_inner_detection = False
                 anchor_pair = False
                 plane_reacquired = False
@@ -2021,6 +2135,7 @@ def process(args: argparse.Namespace) -> Path:
                         width,
                         height,
                         allow_soft_pair=True,
+                        dt=frame_dt,
                     )
                     fresh_inner_detection = (
                         detected_inner is not None
@@ -2041,6 +2156,7 @@ def process(args: argparse.Namespace) -> Path:
                     width,
                     height,
                     getattr(args, "lock_fill", 0.71),
+                    dt=frame_dt,
                 )
                 if anchor_pair and plane_tracker.locked:
                     plane_tracker.reanchor(detected_inner, detected_outer)
@@ -2055,7 +2171,7 @@ def process(args: argparse.Namespace) -> Path:
                 )
                 if plane_reacquired:
                     plane_locked = True
-                    plane_smooth_corners = None
+                    corner_smoother.reset()
                     plane_hold_matrix = None
                     plane_hold_frames = 0
                 if lock_tracker.box is None:
@@ -2092,17 +2208,7 @@ def process(args: argparse.Namespace) -> Path:
                 if plane_matrix is not None and fixed_inner is not None:
                     reference_corners = _box_points(plane_tracker.reference_box)
                     raw_corners = _project_points(reference_corners, plane_matrix)
-                    if plane_smooth_corners is None or raw_corners is None:
-                        plane_smooth_corners = raw_corners
-                    else:
-                        # Smooth in corner space instead of averaging a
-                        # scale-ambiguous matrix.  This removes the per-frame
-                        # projective jitter that showed up as a squashed,
-                        # twitching machine patch.
-                        plane_smooth_corners = (
-                            plane_smooth * raw_corners
-                            + (1.0 - plane_smooth) * plane_smooth_corners
-                        )
+                    plane_smooth_corners = corner_smoother.update(raw_corners, dt=frame_dt)
                     if reference_corners is not None and plane_smooth_corners is not None:
                         matrix = cv2.getPerspectiveTransform(
                             reference_corners,
@@ -2122,7 +2228,7 @@ def process(args: argparse.Namespace) -> Path:
                     plane_hold_frames += 1
                     lock_source = "plane_hold"
                 else:
-                    plane_smooth_corners = None
+                    corner_smoother.reset()
                     plane_hold_matrix = None
                     plane_hold_frames = 0
 
@@ -2139,19 +2245,9 @@ def process(args: argparse.Namespace) -> Path:
                     lock_zoom_ratio = decision.zoom_ratio
                     lock_limit = decision.limit
                 if matrix is not None and fixed_inner is not None:
-                    if plane_full:
-                        # Warp the complete frame with the same machine-plane
-                        # transform.  No feathered seam, and the background moves
-                        # with the machine instead of staying live behind it.
-                        stabilized = cv2.warpPerspective(
-                            stabilized,
-                            np.asarray(matrix, dtype=np.float32),
-                            (width, height),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_REPLICATE,
-                        )
-                    else:
-                        stabilized = apply_plane_lock(stabilized, matrix, fixed_inner)
+                    stabilized = apply_plane_lock(
+                        stabilized, matrix, fixed_inner, full_warp=full_warp,
+                    )
                     outer = expand_box(fixed_inner, 1.45)
                     inner = fixed_inner
                     center = np.array([0.5, 0.5], dtype=np.float32)
@@ -2224,7 +2320,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="调试 jsonl 的输出路径，默认写到会话目录的 debug.jsonl")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--detect-every", type=int, default=12,
-                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
+                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪。修正量按 --correction-gain 摊到各帧")
     parser.add_argument("--lock-fill", type=float, default=0.71,
                         help="内屏锁定后占画面短边的比例，默认 0.71（按近景校准参考）")
     parser.add_argument("--no-fisheye", action="store_true",
@@ -2236,6 +2332,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plane-model", choices=("homography", "similarity"),
                         default="homography",
                         help="机台运动模型：homography 允许透视，similarity 只做旋转/等比缩放/平移，后者更不容易显扁")
+    parser.add_argument("--correction-gain", type=float, default=0.15,
+                        help="每次检测出的绝对修正按每帧多大比例付出（0-1，默认 0.15）。\n"
+                             "越小画面越平顺，但机台回到正确位置越慢")
+    parser.add_argument("--plane-patch", action="store_true",
+                        help="旧做法：只把机台那块羽化椭圆贴上，外面留实时原图（画面里会有一圈边界）")
     parser.add_argument("--plane-full", action="store_true",
                         help="整帧都按机台平面 warp，而不是只在中间合成机台区域")
     parser.add_argument("--plane-hold", type=int, default=12,
@@ -2262,6 +2363,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--detect-every 必须大于 0")
     if not 0.35 <= args.lock_fill <= 0.90:
         parser.error("--lock-fill 应在 0.35 到 0.90 之间")
+    if not 0.0 <= getattr(args, "correction_gain", 0.15) <= 1.0:
+        parser.error("--correction-gain 必须在 0 到 1 之间")
     if not 0.0 <= args.plane_smooth <= 1.0:
         parser.error("--plane-smooth 应在 0 到 1 之间")
     if args.plane_hold < 0:

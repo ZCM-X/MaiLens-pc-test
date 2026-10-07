@@ -9,8 +9,11 @@ import numpy as np
 from .process_session import (
     GeometryDetector,
     GeometryLockTracker,
+    PlaneCornersSmoother,
     PlaneLockTracker,
+    frame_gain,
     apply_geometry_lock,
+    apply_plane_lock,
     build_remap,
     geometry_margins,
     geometry_reference,
@@ -193,6 +196,88 @@ class ProcessSessionTests(unittest.TestCase):
         )[0, 0]
         np.testing.assert_allclose(transformed, [200.0, 150.0], atol=1e-4)
 
+    def test_frame_gain_leaves_the_reference_rate_alone(self):
+        self.assertAlmostEqual(frame_gain(0.35, None), 0.35)
+        self.assertAlmostEqual(frame_gain(0.35, 1.0 / 30.0), 0.35, places=6)
+
+    def test_frame_gain_keeps_the_time_constant_across_rates(self):
+        # Two 60 fps steps have to land where one 30 fps step does, otherwise
+        # the phone feed passes twice the jitter the render shows.
+        fast = frame_gain(0.35, 1.0 / 60.0)
+        self.assertLess(fast, 0.35)
+        self.assertAlmostEqual((1.0 - fast) ** 2, 0.65, places=3)
+        self.assertGreater(frame_gain(0.35, 1.0 / 15.0), 0.35)
+
+    def test_frame_gain_keeps_the_extremes(self):
+        self.assertEqual(frame_gain(1.0, 1.0 / 60.0), 1.0)
+        self.assertEqual(frame_gain(0.0, 1.0 / 60.0), 0.0)
+        self.assertEqual(frame_gain(0.35, 0.0), 0.35)
+
+    def test_the_first_quad_is_adopted_whole(self):
+        smoother = PlaneCornersSmoother(0.35)
+        quad = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float64)
+        np.testing.assert_allclose(smoother.update(quad), quad)
+
+    def test_a_quad_jump_is_blended_instead_of_applied(self):
+        smoother = PlaneCornersSmoother(0.35)
+        smoother.update(np.zeros((4, 2)))
+        np.testing.assert_allclose(smoother.update(np.full((4, 2), 100.0)), 35.0)
+
+    def test_two_fast_quads_match_one_reference_quad(self):
+        fast = PlaneCornersSmoother(0.35)
+        slow = PlaneCornersSmoother(0.35)
+        fast.update(np.zeros((4, 2)))
+        slow.update(np.zeros((4, 2)))
+        quad = np.full((4, 2), 100.0)
+        fast.update(quad, dt=1.0 / 60.0)
+        fast.update(quad, dt=1.0 / 60.0)
+        slow.update(quad, dt=1.0 / 30.0)
+        np.testing.assert_allclose(fast.corners, slow.corners, atol=0.6)
+
+    def test_resetting_the_smoother_forgets_the_old_quad(self):
+        smoother = PlaneCornersSmoother(0.35)
+        smoother.update(np.full((4, 2), 100.0))
+        smoother.reset()
+        zeros = np.zeros((4, 2))
+        np.testing.assert_allclose(smoother.update(zeros), zeros)
+
+    def test_ingest_blends_a_new_box_by_the_frame_interval(self):
+        fast = GeometryLockTracker(detect_every=12)
+        slow = GeometryLockTracker(detect_every=12)
+        for tracker in (fast, slow):
+            tracker.ingest((100, 100, 500, 500), None, 720, 1280)
+        candidate = (120, 120, 520, 520)
+        fast.ingest(candidate, None, 720, 1280, dt=1.0 / 60.0)
+        slow.ingest(candidate, None, 720, 1280, dt=1.0 / 30.0)
+        self.assertGreater(fast.outer_box[0], 100)
+        self.assertGreater(slow.outer_box[0], fast.outer_box[0])
+
+    def test_full_warp_puts_every_pixel_on_one_viewpoint(self):
+        # A uniform translation must move the whole picture: the machine and
+        # the room around it share one viewpoint, which is what stops the
+        # cabinet from reading as an oval pasted onto a live background.
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        frame[40:80, 60:100] = 255
+        matrix = np.float32([[1, 0, 6], [0, 1, 4], [0, 0, 1]])
+        locked = apply_plane_lock(frame, matrix, (60, 40, 100, 80), full_warp=True)
+        shifted = cv2.warpAffine(frame, matrix[:2], (160, 120))
+        np.testing.assert_allclose(locked, shifted, atol=1)
+
+    def test_full_warp_keeps_the_rectified_view_where_the_warp_runs_out(self):
+        # Sampling past the source border must not smear an edge inward: those
+        # pixels fall back to the plain rectified frame instead.
+        frame = np.random.RandomState(4).randint(0, 256, (120, 160, 3)).astype(np.uint8)
+        matrix = np.float32([[1, 0, 40], [0, 1, 0], [0, 0, 1]])
+        locked = apply_plane_lock(frame, matrix, (60, 40, 100, 80), full_warp=True)
+        self.assertFalse(np.array_equal(locked[:, :40], frame[:, :40]))
+        np.testing.assert_allclose(locked[:, :24], frame[:, :24], atol=2)
+
+    def test_the_old_patch_path_still_leaves_the_far_background_alone(self):
+        frame = np.random.RandomState(7).randint(0, 256, (120, 160, 3)).astype(np.uint8)
+        matrix = np.float32([[1, 0, 20], [0, 1, 0], [0, 0, 1]])
+        patched = apply_plane_lock(frame, matrix, (60, 40, 100, 80), full_warp=False)
+        np.testing.assert_allclose(patched[:, 150:], frame[:, 150:], atol=2)
+
     def test_geometry_detector_selects_labeled_outer_and_inner_boxes(self):
         outer, inner = GeometryDetector._pick_geometry_boxes([
             ("outer_buttons", 0.90, (20, 20, 380, 280)),
@@ -363,6 +448,27 @@ class ResolveFpsTests(unittest.TestCase):
             (session / "session.json").write_text(json.dumps({"nominal_fps": 60}), encoding="utf-8")
             rows = [{"timestamp": 500.0 + index / 25.0} for index in range(50)]
             self.assertAlmostEqual(resolve_fps(session, rows, None), 25.0, places=3)
+
+    def test_dropped_frames_do_not_speed_up_the_output(self):
+        # Every fifth frame never reached the PC.  The clip still spans the
+        # same wall-clock time, so tagging it at the nominal 30 fps played
+        # everything 1.2x fast and turned each gap into a jump.
+        rows = []
+        stamp = 700.0
+        for index in range(100):
+            rows.append({"timestamp": stamp})
+            stamp += 1.0 / 30.0 if index % 5 != 4 else 2.0 / 30.0
+        with tempfile.TemporaryDirectory() as workspace:
+            fps = resolve_fps(Path(workspace), rows, None)
+        self.assertAlmostEqual(fps, 99 * 30.0 / 118.0, places=2)
+
+    def test_a_capture_stall_does_not_stretch_the_whole_clip(self):
+        # A ten second freeze is a capture failure, not a frame interval.
+        rows = [{"timestamp": index / 30.0} for index in range(30)]
+        rows.append({"timestamp": 400.0})
+        with tempfile.TemporaryDirectory() as workspace:
+            fps = resolve_fps(Path(workspace), rows, None)
+        self.assertAlmostEqual(fps, 30.0, places=3)
 
     def test_explicit_override_wins(self):
         with tempfile.TemporaryDirectory() as workspace:

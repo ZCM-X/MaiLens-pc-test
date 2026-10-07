@@ -306,7 +306,9 @@ def main() -> None:
     parser.add_argument("--plane-model", choices=("homography", "similarity"),
                         help="plane motion model; uses processor default when omitted")
     parser.add_argument("--plane-full", action="store_true",
-                        help="warp the full frame onto the detected machine plane")
+                        help="deprecated; the full-frame warp is the default now")
+    parser.add_argument("--plane-patch", action="store_true",
+                        help="old composite: a feathered ellipse over the live background")
     parser.add_argument("--plane-hold", type=int,
                         help="hold the last plane transform for this many missed frames")
     parser.add_argument("--sessions-root", type=Path, default=Path("sessions"),
@@ -330,6 +332,8 @@ def main() -> None:
             extra_args.extend((option, str(value)))
     if args.plane_full:
         extra_args.append("--plane-full")
+    if args.plane_patch:
+        extra_args.append("--plane-patch")
     serve(args.host, args.port, args.output_dir,
           run_import=args.run_import,
           run_process=args.run_process,

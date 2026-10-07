@@ -63,6 +63,11 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
             model=args.model,
             detect_every=args.detect_every,
             lock_fill=getattr(args, "lock_fill", 0.71),
+            # One viewpoint for the whole frame; --plane-patch restores the
+            # older ellipse composite that left a visible boundary.
+            full_warp=not bool(getattr(args, "plane_patch", False)),
+            plane_smooth=getattr(args, "plane_smooth", 0.35),
+            correction_gain=getattr(args, "correction_gain", 0.15),
             debug=args.debug,
             lock_authority=AuthorityLimits(
                 max_shift=getattr(args, "lock_shift", 0.30),
@@ -229,6 +234,12 @@ def main() -> None:
     parser.add_argument("--lock-fill", type=float, default=0.71,
                         help="内屏锁定后占画面短边的比例，默认 0.71（按近景校准参考）")
     parser.add_argument("--debug", action="store_true", help="实时画面叠加检测框、中心和缩放")
+    parser.add_argument("--plane-patch", action="store_true",
+                        help="旧做法：只把机台那块羽化椭圆贴上，外面留实时原图")
+    parser.add_argument("--plane-smooth", type=float, default=0.35,
+                        help="锁定四角的平滑量（0-1，按 30fps 的每帧系数解释）")
+    parser.add_argument("--correction-gain", type=float, default=0.15,
+                        help="每次检测出的绝对修正按每帧多大比例付出（0-1）；越小越平顺")
     parser.add_argument("--lock-shift", type=float, default=0.30,
                         help="机台锁定能拖动的最大位移（短边比例）；超出后画面跟随手机")
     parser.add_argument("--lock-min-zoom", type=float, default=0.62,
@@ -246,7 +257,7 @@ def main() -> None:
     parser.add_argument("--k1", type=float, default=0.0893163)
     parser.add_argument("--k2", type=float, default=-0.0174637)
     parser.add_argument("--detect-every", type=int, default=12,
-                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪")
+                        help="模型每隔多少帧检测一次，默认 12；中间帧使用光流跟踪。修正量按 --correction-gain 摊到各帧")
     args = parser.parse_args()
     if args.machine_lock and args.model is None:
         # Use the phone-fisheye fine-tune for live camera input by default.

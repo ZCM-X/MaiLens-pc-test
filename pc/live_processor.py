@@ -13,7 +13,10 @@ try:
         FrameClock,
         GeometryDetector,
         GeometryLockTracker,
+        PlaneCornersSmoother,
         PlaneLockTracker,
+        _box_points,
+        _project_points,
         apply_geometry_lock,
         apply_plane_lock,
         build_remap,
@@ -38,7 +41,10 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         FrameClock,
         GeometryDetector,
         GeometryLockTracker,
+        PlaneCornersSmoother,
         PlaneLockTracker,
+        _box_points,
+        _project_points,
         apply_geometry_lock,
         apply_plane_lock,
         build_remap,
@@ -78,6 +84,9 @@ class LiveProcessor:
         debug: bool = False,
         fast_remap: bool = True,
         lock_authority: AuthorityLimits | None = None,
+        full_warp: bool = True,
+        plane_smooth: float = 0.35,
+        correction_gain: float = 0.15,
     ) -> None:
         self.crop = crop
         self.fov = fov
@@ -92,6 +101,15 @@ class LiveProcessor:
         # rectified frame with a perspective warp is exactly equivalent to
         # rebuilding the fisheye map every frame, at a fraction of the cost.
         self.fast_remap = bool(fast_remap)
+        # One viewpoint for the whole frame.  The older path pasted a
+        # feathered ellipse of the machine over the live background, which
+        # put a visible boundary around the cabinet.
+        self.full_warp = bool(full_warp)
+        # The tracker rebuilds its homography every frame, so the corners
+        # carry that noise straight to the picture unless they are blended
+        # over time.  The offline render already did this; the live preview
+        # did not, which is why the same lock looked twitchier on screen.
+        self.corner_smoother = PlaneCornersSmoother(plane_smooth)
         self.lens_map: tuple[np.ndarray, np.ndarray] | None = None
         self.lens_map_shape: tuple[int, int] | None = None
         self.detector = GeometryDetector(model)
@@ -104,7 +122,10 @@ class LiveProcessor:
         self.reference_target_size: float | None = None
         self.reference_zoom: float | None = None
         self.lock_tracker = GeometryLockTracker(self.detect_every)
-        self.plane_tracker = PlaneLockTracker(self.detect_every)
+        self.plane_tracker = PlaneLockTracker(
+            self.detect_every,
+            correction_gain=float(min(max(correction_gain, 0.0), 1.0)),
+        )
         self.previous_gray: np.ndarray | None = None
         self.detection_age = 0
         self.lock_source = "none"
@@ -130,6 +151,7 @@ class LiveProcessor:
             self.lock_limit = self.authority.limits.shift_limit(width, height)
 
         rotation, self.reference = rotation_for_row(metadata, self.reference)
+        frame_dt = self.clock.dt(metadata)
 
         if self.fast_remap:
             if self.lens_map is None or self.lens_map_shape != (width, height):
@@ -178,7 +200,7 @@ class LiveProcessor:
         # box tracker only during acquisition avoids doing two optical-flow
         # solves for every 60-fps frame.
         if not self.plane_tracker.locked:
-            self.lock_tracker.update_flow(self.previous_gray, current_gray)
+            self.lock_tracker.update_flow(self.previous_gray, current_gray, dt=frame_dt)
 
         detector_ran = False
         fresh_inner_detection = False
@@ -214,6 +236,7 @@ class LiveProcessor:
                 width,
                 height,
                 allow_soft_pair=True,
+                dt=frame_dt,
             )
             fresh_inner_detection = (
                 detected_inner is not None
@@ -241,6 +264,7 @@ class LiveProcessor:
             width,
             height,
             self.lock_fill,
+            dt=frame_dt,
         )
         if self.plane_tracker.locked and anchor_box is not None:
             # The flow transform is accumulated frame by frame and drifts;
@@ -259,6 +283,7 @@ class LiveProcessor:
             plane_locked = True
             self.plane_hold = None
             self.plane_hold_frames = 0
+            self.corner_smoother.reset()
         if self.lock_tracker.box is None:
             # Keep the last displayed transform until a new target is found,
             # but do not carry its distance reference to a different target.
@@ -300,6 +325,13 @@ class LiveProcessor:
             if self.plane_tracker.locked else None
         )
         if plane_matrix is not None and fixed_inner is not None:
+            reference_corners = _box_points(self.plane_tracker.reference_box)
+            raw_corners = _project_points(reference_corners, plane_matrix)
+            smoothed = self.corner_smoother.update(raw_corners, dt=frame_dt)
+            if reference_corners is not None and smoothed is not None:
+                plane_matrix = cv2.getPerspectiveTransform(
+                    reference_corners, smoothed.astype(np.float32),
+                )
             self.plane_hold = plane_matrix
             self.plane_hold_frames = 0
             self.lock_source = "plane_homography"
@@ -312,6 +344,7 @@ class LiveProcessor:
             plane_matrix = None
             self.plane_hold = None
             self.plane_hold_frames = 0
+            self.corner_smoother.reset()
 
         if plane_matrix is not None and fixed_inner is not None:
             # The lock is only allowed the travel a real lens has.  Whatever it
@@ -320,14 +353,16 @@ class LiveProcessor:
             # reaching for a machine that is no longer there.
             decision = self.authority.decide(
                 self.plane_tracker.lock_travel(width, height), width, height,
-                dt=self.clock.dt(metadata),
+                dt=frame_dt,
             )
             plane_matrix = decision.apply(plane_matrix)
             fixed_inner = decision.move_box(fixed_inner)
             self.lock_mode = decision.mode
             self.lock_travel = decision.travelled
             self.lock_limit = decision.limit
-            stabilized = apply_plane_lock(stabilized, plane_matrix, fixed_inner)
+            stabilized = apply_plane_lock(
+                stabilized, plane_matrix, fixed_inner, full_warp=self.full_warp,
+            )
             outer = expand_box(fixed_inner, 1.45)
             # The current detector rectangle is allowed to jitter.  The
             # green debug frame represents the latched output plane instead,
