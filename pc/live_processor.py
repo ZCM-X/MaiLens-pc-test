@@ -19,6 +19,7 @@ try:
         _project_points,
         apply_geometry_lock,
         apply_plane_lock,
+        ease_to_source,
         build_remap,
         draw_debug,
         geometry_margins,
@@ -48,6 +49,7 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
         _project_points,
         apply_geometry_lock,
         apply_plane_lock,
+        ease_to_source,
         build_remap,
         draw_debug,
         geometry_margins,
@@ -66,13 +68,6 @@ except ImportError:  # Running from `python pc/pc_receiver.py`.
     )
     import canonical
     from shot_authority import AuthorityGovernor, AuthorityLimits
-
-
-def screen_circle(box) -> tuple[np.ndarray, float]:
-    """Centre and mean half-size of a screen box, in the frame it arrives in."""
-    x0, y0, x1, y1 = (float(value) for value in box)
-    return (np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5], dtype=np.float64),
-            0.25 * ((x1 - x0) + (y1 - y0)))
 
 
 class LiveProcessor:
@@ -162,6 +157,9 @@ class LiveProcessor:
         self.ring_missing = 0
         self.ring_margins = 0.0
         self.lock_zoom_ratio = 1.0
+        #: Fraction of the plane lock that survived the fit check; below 1.0
+        #: the transform was eased back so the frame keeps one viewpoint.
+        self.plane_source_scale = 1.0
         self.lock_reason = "none"
         self.lock_tracker = GeometryLockTracker(self.detect_every)
         self.plane_tracker = PlaneLockTracker(
@@ -190,18 +188,19 @@ class LiveProcessor:
     #: counts, tight enough to drop the artwork fragments floating around it.
     RING_BAND = 0.25
 
-    def _measure_ring(self, frame: np.ndarray, screen_box):
+    def _measure_ring(self, frame: np.ndarray):
         """Ring centre, radius scale and shape coefficients for one frame.
 
-        The radius only sets the band that selects ring blobs and the point
-        where the correction ramp starts, so the screen box the lock placed is
-        good enough for both.  The *centre* is not: on a delivered frame that
-        box sits 20-30 px off the button ring, and at a ring radius of ~300 px
-        that offset alone reads as 8-10% of spread -- the same size as the
-        defect being corrected.  The ring is therefore centred on its own
-        blobs, and its shape is described relative to the mean radius it
-        already has, so no radius borrowed from another space can turn the
-        pull into a global zoom.
+        The screen is measured on the delivered pixels themselves (the cyan
+        play field), because a radius borrowed from the lock's own screen box
+        is 22% larger and turns the pull into a global zoom.  When that
+        measurement is unavailable -- the cabinet has run off the edge, or the
+        field merged with a lit panel -- the last good reading is reused: the
+        lock is holding the machine still, so the screen moves far more slowly
+        than the buttons the ramp is there to even out.  The ring is centred on
+        its own blobs and its shape is described relative to the mean radius it
+        already has, so no radius from another space can move the machine's
+        size.
         """
         blob = canonical.screen_blob(frame)
         if blob is not None:
@@ -215,10 +214,16 @@ class LiveProcessor:
                     radius = 0.5 * (radius + last_radius)
             if blob is not None:
                 self.ring_screen = (centre0, radius)
-        if blob is None:
-            # No clean play field on this frame: fall back to the box the lock
-            # placed, which at least keeps the ramp in delivered pixels.
-            centre0, radius = screen_circle(screen_box)
+        if blob is None and self.ring_screen is not None:
+            # The play field is not measurable on this frame -- the cabinet has
+            # run off the edge, or a lit panel merged into it.  The lock is
+            # holding the machine in place, so the last good screen is a better
+            # guess than the box the lock placed, which is 22% larger and would
+            # turn the pull into the global zoom this correction exists to
+            # avoid.  Screen geometry changes far slower than the buttons.
+            centre0, radius = self.ring_screen
+        if blob is None and self.ring_screen is None:
+            return None
         if not np.isfinite(radius) or radius <= 5.0:
             return None
         points = canonical.purple_points(frame)
@@ -231,14 +236,14 @@ class LiveProcessor:
         ring = points[np.abs(span - rough) <= self.RING_BAND * rough]
         if ring.shape[0] < 4:
             return None
-        centre = centre0 if blob is not None else ring.mean(axis=0)
+        centre = centre0 if blob is not None else 0.5 * (centre0 + ring.mean(axis=0))
         ratios = canonical.slot_ratios(centre, radius, ring)
         fitted = canonical.ring_profile(ratios, self.ring_order)
         if fitted is None or not np.isfinite(fitted).all() or fitted[0] <= 0.0:
             return None
         return centre, float(radius), fitted, canonical.ring_error(ratios)
 
-    def _pull_margins_back(self, frame: np.ndarray, screen_box):
+    def _pull_margins_back(self, frame: np.ndarray):
         """Even out the four side gaps on the delivered frame.
 
         A button is a finite patch, so the ramp moves its near half further
@@ -249,7 +254,7 @@ class LiveProcessor:
         """
         if not self.ring_round:
             return frame
-        measured = self._measure_ring(frame, screen_box)
+        measured = self._measure_ring(frame)
         if measured is None:
             self.ring_missing += 1
         else:
@@ -488,6 +493,16 @@ class LiveProcessor:
                 dt=frame_dt,
             )
             plane_matrix = decision.apply(plane_matrix)
+            # Never render two viewpoints at once.  The renderer fills any
+            # pixel the warp cannot fetch with the plain rectified frame, so a
+            # transform that reaches past the picture leaves a second, smeared
+            # copy of the machine in the corner it ran off.  Easing the whole
+            # matrix keeps the machine moving with the phone instead.
+            footprint = outer if outer is not None else inner
+            plane_matrix, self.plane_source_scale = ease_to_source(
+                plane_matrix, width, height,
+                region=expand_box(footprint, 1.05),
+            )
             fixed_inner = decision.move_box(fixed_inner)
             self.lock_mode = decision.mode
             self.lock_travel = decision.travelled
@@ -508,11 +523,12 @@ class LiveProcessor:
             zoom = 1.0
         else:
             self.lock_mode = "geometry"
+            self.plane_source_scale = 1.0
             stabilized, geometry_matrix = apply_geometry_lock(stabilized, center, zoom)
             outer = transform_box(outer, geometry_matrix)
             inner = transform_box(inner, geometry_matrix)
         if self.ring_round and plane_matrix is not None and inner is not None:
-            stabilized = self._pull_margins_back(stabilized, inner)
+            stabilized = self._pull_margins_back(stabilized)
         self.previous_gray = current_gray
         self.frame_index += 1
 
@@ -533,6 +549,8 @@ class LiveProcessor:
             "lock_travel_px": round(float(self.lock_travel), 2),
             "lock_travel_limit_px": round(float(self.lock_limit), 2),
             "lock_zoom_ratio": round(float(self.lock_zoom_ratio), 4),
+            "plane_source_scale": round(float(self.plane_source_scale), 4),
+            "plane_eased": bool(self.plane_source_scale < 0.999),
             "lock_reason": self.lock_reason,
             "ring_round": self.ring_round,
             "ring_margin_spread": round(float(self.ring_margins), 4),

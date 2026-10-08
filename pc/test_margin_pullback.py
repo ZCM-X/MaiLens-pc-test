@@ -65,7 +65,7 @@ class MarginPullBackTests(unittest.TestCase):
     def test_the_ring_is_measured_against_the_delivered_screen(self):
         frame = machine_frame()
         processor = LiveProcessor(ring_round=True)
-        measured = processor._measure_ring(frame, (160, 440, 560, 840))
+        measured = processor._measure_ring(frame)
         self.assertIsNotNone(measured)
         centre, radius, _fitted, spread = measured
         np.testing.assert_allclose(centre, (360.0, 640.0), atol=3.0)
@@ -77,7 +77,7 @@ class MarginPullBackTests(unittest.TestCase):
         before, before_spread = spreads(frame, (360.0, 640.0), 200.0)
         self.assertGreater(before_spread, 0.05)
         processor = LiveProcessor(ring_round=True)
-        fixed = processor._pull_margins_back(frame, (160, 440, 560, 840))
+        fixed = processor._pull_margins_back(frame)
         after, after_spread = spreads(fixed, (360.0, 640.0), 200.0)
         self.assertLess(after_spread, before_spread * 0.5,
                         f"不等距没有明显改善：{before_spread:.3f} -> {after_spread:.3f}")
@@ -89,18 +89,33 @@ class MarginPullBackTests(unittest.TestCase):
         for x, y in button_centres((360.0, 640.0), 200.0, 1.22, 0.80):
             cv2.circle(frame, (int(round(x)), int(round(y))), 26, (0, 0, 0), -1)
         processor = LiveProcessor(ring_round=True)
-        self.assertIsNone(processor._measure_ring(frame, (160, 440, 560, 840)))
-        np.testing.assert_array_equal(processor._pull_margins_back(frame, (160, 440, 560, 840)), frame)
+        self.assertIsNone(processor._measure_ring(frame))
+        np.testing.assert_array_equal(processor._pull_margins_back(frame), frame)
 
     def test_the_correction_holds_its_hand_when_the_screen_disappears(self):
         processor = LiveProcessor(ring_round=True, ring_hold=0)
         blank = np.zeros((1280, 720, 3), dtype=np.uint8)
-        np.testing.assert_array_equal(processor._pull_margins_back(blank, (160, 440, 560, 840)), blank)
+        np.testing.assert_array_equal(processor._pull_margins_back(blank), blank)
+
+    def test_a_frame_whose_screen_left_the_edge_reuses_the_last_reading(self):
+        frame = machine_frame()
+        processor = LiveProcessor(ring_round=True)
+        first = processor._measure_ring(frame)
+        self.assertIsNotNone(first)
+        # The cabinet runs off the bottom of the picture, so the play field
+        # merges with the lit panel below it and cannot be measured on its own.
+        cropped = frame.copy()
+        cropped[780:, 350:372] = (255, 255, 0)   # the lit panel below, running off the frame
+        cropped[-8:, :] = (255, 255, 0)
+        self.assertIsNone(canonical.screen_blob(cropped))
+        second = processor._measure_ring(cropped)
+        self.assertIsNotNone(second, "上一帧的屏幕依然是更好的基准")
+        np.testing.assert_allclose(second[1], first[1], rtol=0.02)
 
     def test_the_correction_can_be_switched_off(self):
         frame = machine_frame()
         processor = LiveProcessor(ring_round=False)
-        np.testing.assert_array_equal(processor._pull_margins_back(frame, (160, 440, 560, 840)), frame)
+        np.testing.assert_array_equal(processor._pull_margins_back(frame), frame)
 
 
 if __name__ == "__main__":

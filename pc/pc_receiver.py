@@ -191,6 +191,19 @@ def client_loop(client: socket.socket, address: tuple[str, int], args: argparse.
                     mode = "LIVE" if live_processor is not None else "RAW"
                     cv2.putText(shown, f"{mode}  {display_fps:.1f}/{args.fps:.0f} fps", (14, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 255, 190), 2, cv2.LINE_AA)
+                    # The lock gives up part of its travel when the machine
+                    # would otherwise land in the hole the warp leaves at the
+                    # border; say so, because that is the moment the picture
+                    # starts following the phone instead of pinning it.
+                    if processed_row is not None:
+                        try:
+                            kept = float(processed_row.get("plane_source_scale", 1.0))
+                        except (TypeError, ValueError):
+                            kept = 1.0
+                        if kept < 0.999:
+                            cv2.putText(shown, f"机台贴合画面边缘 · 跟随 {kept * 100:.0f}%",
+                                        (14, shown.shape[0] - 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (90, 205, 255), 2, cv2.LINE_AA)
                     cv2.imshow("MaiLens PC receiver", shown)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break

@@ -793,6 +793,122 @@ def apply_plane_lock(
     return _composite_masked(warped, frame, alpha)
 
 
+def source_coverage(
+    matrix: np.ndarray | None,
+    width: int,
+    height: int,
+    region: tuple[float, float, float, float] | None = None,
+    margin: float = 0.0,
+) -> bool:
+    """Can the renderer fetch ``region`` from inside the picture?
+
+    ``warpPerspective`` reads ``src = M^-1 dst``.  A destination pixel with no
+    source is filled with the plain rectified frame, so whatever is not covered
+    shows a *second viewpoint* of the same scene -- and when the machine's own
+    footprint lands in that hole the machine appears twice, once pinned and
+    once wherever it stood before the lock picked it up.
+
+    Two things have to hold.  The denominator of ``M^-1`` may not change sign
+    inside the delivered frame: that is the fold which tore the picture into
+    fans.  And every corner of ``region`` must land inside the source; with no
+    fold the preimage of a rectangle is the convex hull of its corners, so four
+    point tests decide it.  ``region=None`` means the whole frame.
+    """
+    if matrix is None:
+        return False
+    try:
+        inverse = np.linalg.inv(np.asarray(matrix, dtype=np.float64).reshape(3, 3))
+    except np.linalg.LinAlgError:
+        return False
+    if not np.isfinite(inverse).all():
+        return False
+    corners = (
+        (0.0, 0.0),
+        (float(width - 1), 0.0),
+        (float(width - 1), float(height - 1)),
+        (0.0, float(height - 1)),
+    )
+    denominators = [
+        float(inverse[2, 0] * x + inverse[2, 1] * y + inverse[2, 2])
+        for x, y in corners
+    ]
+    if min(denominators) <= 1e-6:
+        return False
+    if region is None:
+        region = (0.0, 0.0, float(width - 1), float(height - 1))
+    x0, y0, x1, y1 = (float(value) for value in region)
+    # Only the part of the footprint that is really inside the picture can be
+    # shown twice, so clamp before testing corners.
+    x0 = min(max(x0, 0.0), float(width - 1))
+    x1 = min(max(x1, 0.0), float(width - 1))
+    y0 = min(max(y0, 0.0), float(height - 1))
+    y1 = min(max(y1, 0.0), float(height - 1))
+    if x1 < x0 or y1 < y0:
+        return True
+    for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        projected = inverse @ np.array([x, y, 1.0], dtype=np.float64)
+        denominator = float(projected[2])
+        if denominator <= 1e-6:
+            return False
+        source_x = float(projected[0]) / denominator
+        source_y = float(projected[1]) / denominator
+        if not (margin <= source_x <= width - 1.0 - margin):
+            return False
+        if not (margin <= source_y <= height - 1.0 - margin):
+            return False
+    return True
+
+
+def ease_to_source(
+    matrix: np.ndarray | None,
+    width: int,
+    height: int,
+    region: tuple[float, float, float, float] | None = None,
+    margin: float = 0.0,
+    steps: int = 14,
+) -> tuple[np.ndarray | None, float]:
+    """Ease a lock transform towards identity until ``region`` has a source.
+
+    The renderer fills every pixel the warp cannot fetch with the plain
+    rectified frame.  That put two viewpoints in one picture: the machine sat
+    pinned in the middle *and* a smeared second copy of it -- rainbow marquee
+    and all -- stayed in the corner it came from.  On the 08:49 take that copy
+    sat in the top-left corner for 43 frames running, which is the "extra
+    cabinet" the operator sees.
+
+    ``region`` is the machine's footprint in the delivered frame, so the easing
+    only gives up lock travel when the machine itself would land in the hole.
+    Border holes that only expose room are left alone: the lock keeps its
+    strength and the machine still appears exactly once.
+
+    Returns the matrix to render with and the fraction of the lock that
+    survived (1.0 = untouched).
+    """
+    if matrix is None:
+        return None, 0.0
+    composed = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(composed).all():
+        return None, 0.0
+    # Projective matrices are scale free, so pin the bottom-right corner before
+    # interpolating: otherwise the easing would depend on how the caller
+    # happened to normalise the matrix.
+    if abs(float(composed[2, 2])) > 1e-9:
+        composed = composed / float(composed[2, 2])
+    if source_coverage(composed, width, height, region, margin):
+        return composed.astype(np.float32), 1.0
+    identity = np.eye(3, dtype=np.float64)
+    low, high = 0.0, 1.0
+    for _ in range(max(1, int(steps))):
+        middle = 0.5 * (low + high)
+        candidate = (1.0 - middle) * identity + middle * composed
+        if source_coverage(candidate, width, height, region, margin):
+            low = middle
+        else:
+            high = middle
+    eased = (1.0 - low) * identity + low * composed
+    return eased.astype(np.float32), float(low)
+
+
 _LOCK_MASK_CACHE: dict[tuple, np.ndarray] = {}
 #: The mask box is snapped to this lattice before it is cached.  While the
 #: follow mode slides the foreground every frame the box changes every frame,
@@ -2164,6 +2280,7 @@ def process(args: argparse.Namespace) -> Path:
     ))
     lock_mode = "none"
     lock_reason = "none"
+    plane_source_scale = 1.0
     lock_travel = 0.0
     lock_zoom_ratio = 1.0
     # The limit is a property of the lens and the frame, not of whether a lock
@@ -2343,6 +2460,14 @@ def process(args: argparse.Namespace) -> Path:
                         dt=frame_dt,
                     )
                     matrix = decision.apply(matrix)
+                    # One viewpoint per frame: easing the transform keeps the
+                    # machine whole instead of pasting the rectified frame
+                    # back where the warp ran out of picture.
+                    footprint = outer if outer is not None else inner
+                    matrix, plane_source_scale = ease_to_source(
+                        matrix, width, height,
+                        region=expand_box(footprint, 1.05),
+                    )
                     fixed_inner = decision.move_box(fixed_inner)
                     lock_mode = decision.mode
                     lock_reason = decision.reason
@@ -2390,6 +2515,7 @@ def process(args: argparse.Namespace) -> Path:
                     "lock_mode": lock_mode,
                     "lock_reason": lock_reason,
                     "lock_zoom_ratio": round(float(lock_zoom_ratio), 4),
+                    "plane_source_scale": round(float(plane_source_scale), 4),
                     "lock_travel_px": round(float(lock_travel), 2),
                     "lock_travel_limit_px": round(float(lock_limit), 2),
                     "plane_reacquired": plane_reacquired,
